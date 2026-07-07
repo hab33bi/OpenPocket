@@ -20,10 +20,11 @@ use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::{Duration, Instant, Rate};
-use esp_hal::Blocking;
 use esp_println::println;
 
-use openpocket::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
+use openpocket::board::{LCD_COL_OFFSET, LCD_HEIGHT, LCD_WIDTH};
+use openpocket::display::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
+use openpocket::drivers::axp2101;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -33,11 +34,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
-
-const LCD_WIDTH: u16 = 466;
-const LCD_HEIGHT: u16 = 466;
-const LCD_COL_OFFSET: u16 = 6;
-const AXP2101_ADDR: u8 = 0x34;
 
 #[allow(clippy::large_stack_frames)]
 #[main]
@@ -61,7 +57,7 @@ fn main() -> ! {
     .with_sda(peripherals.GPIO15)
     .with_scl(peripherals.GPIO14);
 
-    match axp2101_enable_display_power(&mut i2c) {
+    match axp2101::enable_display_power(&mut i2c) {
         Ok(()) => println!("AXP2101: OK"),
         Err(()) => println!("AXP2101: FAIL"),
     }
@@ -130,8 +126,8 @@ fn main() -> ! {
 
     println!("Lock screen init...");
     let init_start = Instant::now();
-    let mut wfb = openpocket::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
-    let mut clock = openpocket::clock::Clock::new();
+    let mut wfb = openpocket::display::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
+    let mut clock = openpocket::scenes::lock::Clock::new();
     println!(
         "Clock ready {} ms | bezel anim={} full={} offsets | retained FB {} KiB PSRAM",
         init_start.elapsed().as_millis(),
@@ -220,29 +216,6 @@ fn main() -> ! {
 
 fn delay_until(deadline: Instant) {
     while Instant::now() < deadline {}
-}
-
-fn axp2101_enable_display_power(i2c: &mut I2c<'_, Blocking>) -> Result<(), ()> {
-    const REG_DC_ONOFF: u8 = 0x80;
-    const REG_DC_VOL0: u8 = 0x82;
-    const REG_LDO_ONOFF0: u8 = 0x90;
-    const REG_LDO_VOL0: u8 = 0x92;
-
-    i2c.write(AXP2101_ADDR, &[REG_DC_VOL0, 18]).map_err(|_| ())?;
-    let mut dc_ctrl = [0u8];
-    i2c.write_read(AXP2101_ADDR, &[REG_DC_ONOFF], &mut dc_ctrl)
-        .map_err(|_| ())?;
-    i2c.write(AXP2101_ADDR, &[REG_DC_ONOFF, dc_ctrl[0] | 0x01])
-        .map_err(|_| ())?;
-
-    i2c.write(AXP2101_ADDR, &[REG_LDO_VOL0, 28]).map_err(|_| ())?;
-    let mut ldo_ctrl = [0u8];
-    i2c.write_read(AXP2101_ADDR, &[REG_LDO_ONOFF0], &mut ldo_ctrl)
-        .map_err(|_| ())?;
-    i2c.write(AXP2101_ADDR, &[REG_LDO_ONOFF0, ldo_ctrl[0] | 0x01])
-        .map_err(|_| ())?;
-
-    Ok(())
 }
 
 fn delay_ms(ms: u32) {

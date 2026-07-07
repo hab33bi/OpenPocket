@@ -8,7 +8,7 @@
 //! frames today and window partial flushes per span in P3.
 //! No heap allocation after construction; hot paths write straight to the slice.
 
-use crate::dmi::DmiIndex;
+use crate::display::dmi::DmiIndex;
 
 pub struct WatchFb<'a> {
     buf: &'a mut [u8],

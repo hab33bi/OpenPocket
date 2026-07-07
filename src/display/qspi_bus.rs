@@ -9,7 +9,7 @@ use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Address, Command, DataMode, SpiDmaBus};
 use esp_hal::Blocking;
 
-use crate::dmi::Span;
+use crate::display::dmi::Span;
 
 const QSPI_CMD_WRITE_REG: u16 = 0x02;
 const QSPI_CMD_WRITE_PIXELS: u16 = 0x32;

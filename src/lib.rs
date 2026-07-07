@@ -2,9 +2,8 @@
 
 extern crate alloc;
 
-pub mod clock;
-pub mod dmi;
-#[cfg(feature = "esp")]
-pub mod qspi_bus;
+pub mod board;
+pub mod display;
+pub mod drivers;
+pub mod scenes;
 pub mod trig;
-pub mod watch_fb;
