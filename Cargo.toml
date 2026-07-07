@@ -8,18 +8,9 @@ version      = "0.1.0"
 name = "openpocket"
 path = "./src/bin/main.rs"
 
-[[bin]]
-name = "baker"
-path = "src/bin/baker.rs"
-required-features = ["baker"]
-
 [features]
 default = ["esp"]
 esp = ["dep:esp-hal", "dep:esp-bootloader-esp-idf", "dep:critical-section", "dep:esp-alloc", "dep:esp-println"]
-# prebake enables the high-FPS pre-baked animation player (implies esp)
-prebake = ["esp"]
-# baker enables the host-side asset generator tool (build with host target, NOT the ESP target)
-baker = []
 
 [dependencies]
 esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"], optional = true }

@@ -14,7 +14,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::raidal::lut_sin_cos_q14;
+use crate::trig::lut_sin_cos_q14;
 use crate::watch_fb::{RectAcc, WatchFb};
 
 include!(concat!(env!("OUT_DIR"), "/inter_font.rs"));

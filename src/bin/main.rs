@@ -1,4 +1,10 @@
-﻿#![no_std]
+//! OpenPocket firmware entry — Waveshare ESP32-S3-Touch-AMOLED-1.75 only.
+//!
+//! Boot: PMIC rails → QSPI display init → lock-screen clock loop.
+//! Rendering: single retained WatchFb canvas in PSRAM, incremental deltas,
+//! DMI partial flush, fixed 20 fps cadence (see docs/HARDWARE.md + docs/ROADMAP.md).
+
+#![no_std]
 #![no_main]
 #![deny(clippy::mem_forget)]
 #![deny(clippy::large_stack_frames)]
@@ -13,16 +19,11 @@ use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode as SpiMode;
-use esp_hal::system::{CpuControl, Stack};
 use esp_hal::time::{Duration, Instant, Rate};
 use esp_hal::Blocking;
 use esp_println::println;
 
-
-use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-
 use openpocket::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
-use openpocket::raidal::{Scratch, LOW_W};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -38,111 +39,17 @@ const LCD_HEIGHT: u16 = 466;
 const LCD_COL_OFFSET: u16 = 6;
 const AXP2101_ADDR: u8 = 0x34;
 
-const FB_LEN: usize = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
-
-/// div=3 (156×156 eval) — WebGL parity compromise per plan.
-const RENDER_DIVISOR: u8 = 3;
-
-// Atomics for dual-core row-split eval coordination (core0 drives, signals core1).
-static EVAL_ROW_START: AtomicUsize = AtomicUsize::new(0);
-static EVAL_ROW_END: AtomicUsize = AtomicUsize::new(0);
-static CORE1_READY: AtomicBool = AtomicBool::new(false);
-static CORE1_DONE: AtomicBool = AtomicBool::new(false);
-
-// For parallel upscale after eval (reuse cores).
-static UPSCALE_ROW_START: AtomicUsize = AtomicUsize::new(0);
-static UPSCALE_ROW_END: AtomicUsize = AtomicUsize::new(0);
-static UPSCALE_CORE1_READY: AtomicBool = AtomicBool::new(false);
-static UPSCALE_CORE1_DONE: AtomicBool = AtomicBool::new(false);
-
-// For flush on app core.
-static mut BUS_STATIC: Option<&'static mut QspiBus> = None;
-static FLUSH_READY: AtomicBool = AtomicBool::new(false);
-static mut FLUSH_FB_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static FLUSH_DONE: AtomicBool = AtomicBool::new(false);
-
 #[allow(clippy::large_stack_frames)]
 #[main]
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Reduced heap (8 KiB) + two reclaimed static row buffers (SCRATCH_ROW0/1) for
-    // LOW_RGB565 (48KiB) + scratch (~6KiB each). Avoids heap overlap in dram2.
-    // Board: ESP32-S3R8 — 512KB SRAM + 384KB ROM + stacked 8MB PSRAM.
+    // 8 KiB SRAM heap (no format!/alloc in hot paths); framebuffers live in PSRAM.
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 8 * 1024);
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
-    // Dual-core support (esp-hal CpuControl + atomics for coordination).
-    // Stack must be 16-byte multiple. Persistent worker loop on app core for row-split eval.
-    static mut APP_CORE_STACK: Stack<4096> = Stack::new();
-    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
-
-    // Launch persistent app-core worker (never returns; spins on atomics).
-    // SAFETY + contract: closure runs on core1; uses secondary scratch + global RAIDAL_PTR.
-    let _app_core_guard = unsafe {
-        cpu_control.start_app_core(&mut *core::ptr::addr_of_mut!(APP_CORE_STACK), || {
-            let mut scratch1 = Scratch::new_secondary(LOW_W);
-            loop {
-                fence(Ordering::SeqCst);
-                let mut did_work = false;
-
-                if CORE1_READY.load(Ordering::SeqCst) {
-                    let rs = EVAL_ROW_START.load(Ordering::SeqCst);
-                    let re = EVAL_ROW_END.load(Ordering::SeqCst);
-                    let p = &raw mut openpocket::raidal::RAIDAL_PTR;
-                    let shader_ptr = (*p).load(Ordering::SeqCst);
-                    if !shader_ptr.is_null() {
-                        let shader = &mut *shader_ptr;
-                        shader.eval_rows(&mut scratch1, rs, re);
-                    }
-                    CORE1_DONE.store(true, Ordering::SeqCst);
-                    CORE1_READY.store(false, Ordering::SeqCst);
-                    did_work = true;
-                }
-                if UPSCALE_CORE1_READY.load(Ordering::SeqCst) {
-                    let rs = UPSCALE_ROW_START.load(Ordering::SeqCst);
-                    let re = UPSCALE_ROW_END.load(Ordering::SeqCst);
-                    let shader_p = &raw mut openpocket::raidal::RAIDAL_PTR;
-                    let fb_p = &raw mut openpocket::raidal::FB_PTR;
-                    let shader_ptr = (*shader_p).load(Ordering::SeqCst);
-                    let fb_ptr = (*fb_p).load(Ordering::SeqCst);
-                    if !shader_ptr.is_null() {
-                        let shader = &mut *shader_ptr;
-                        if !fb_ptr.is_null() {
-                            let fb_slice = core::slice::from_raw_parts_mut(fb_ptr, FB_LEN);
-                            shader.upscale_rows(fb_slice, rs, re);
-                        }
-                    }
-                    UPSCALE_CORE1_DONE.store(true, Ordering::SeqCst);
-                    UPSCALE_CORE1_READY.store(false, Ordering::SeqCst);
-                    did_work = true;
-                }
-                if FLUSH_READY.load(Ordering::SeqCst) {
-                    let fb_p = &raw mut FLUSH_FB_PTR;
-                    let fb_ptr = (*fb_p).load(Ordering::SeqCst);
-                    if !fb_ptr.is_null() {
-                        let fb_slice = core::slice::from_raw_parts_mut(fb_ptr, FB_LEN);
-                        let bus_opt = &raw mut BUS_STATIC;
-                        if let Some(bus) = (*bus_opt).as_mut() {
-                            bus.flush_bytes(fb_slice);
-                        }
-                    }
-                    FLUSH_DONE.store(true, Ordering::SeqCst);
-                    FLUSH_READY.store(false, Ordering::SeqCst);
-                    did_work = true;
-                }
-
-                if !did_work {
-                    core::hint::spin_loop();
-                }
-            }
-        })
-    };
-    println!("CPU control ready for APP core (dual-core row-split worker running)");
-
-    println!("=== Raidal-2 (WebGL parity) ===");
-    println!("Q14 eval + integer upscale | div={RENDER_DIVISOR}");
+    println!("=== OpenPocket ===");
     // Hardware: ESP32-S3R8 — 512 KiB SRAM + 384 KiB ROM + stacked 8 MB PSRAM + 16 MB Flash
     // (https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 
@@ -181,10 +88,6 @@ fn main() -> ! {
         .with_buffers(dma_rx, dma_tx);
 
     let mut bus = QspiBus::new(spi, lcd_cs);
-    // Make bus available to app core for flush pipeline.
-    unsafe {
-        BUS_STATIC = Some(&mut *(&mut bus as *mut QspiBus));
-    }
     println!("QSPI DMA {} KiB chunks @ 80 MHz", DMA_CHUNK_BYTES / 1024);
 
     lcd_reset.set_high();
@@ -194,6 +97,7 @@ fn main() -> ! {
     lcd_reset.set_high();
     delay_ms(200);
 
+    // CO5300 init sequence (Waveshare reference; see docs/HARDWARE.md).
     bus.write_c8d8(0xFE, 0x20);
     bus.write_c8d8(0x19, 0x10);
     bus.write_c8d8(0x1C, 0xA0);
@@ -216,18 +120,15 @@ fn main() -> ! {
     bus.write_c8d16d16(0x2B, 0, LCD_HEIGHT - 1);
     bus.write_command(0x2C);
 
-    #[cfg(not(feature = "prebake"))]
-    {
-    // time-display (P1): single retained WatchFb canvas in PSRAM — incremental
-    // ring/text deltas only, no per-frame clear or ping-pong copy (flush is
-    // blocking, so no tearing). Clean frames skip the flush entirely (the
-    // CO5300 retains its GRAM); the loop is paced to a fixed cadence so the
+    // Lock screen: single retained WatchFb canvas in PSRAM — incremental
+    // ring/text deltas only, no per-frame clear or copy (flush is blocking,
+    // so no tearing). Clean frames skip the flush entirely (the CO5300
+    // retains its GRAM); the loop is paced to a fixed cadence so the
     // frame-indexed anim schedules run at their designed duration.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
     let mut fb0 = vec![0u8; byte_count];
 
-    println!("Entering Time Display (black + scale-to-gray AA Inter text + dual-list solid bezel).");
-    println!("Clock (live, no prebake) init...");
+    println!("Lock screen init...");
     let init_start = Instant::now();
     let mut wfb = openpocket::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
     let mut clock = openpocket::clock::Clock::new();
@@ -262,7 +163,7 @@ fn main() -> ! {
         let render_ms = render_start.elapsed().as_millis() as u32;
 
         // Skip the flush when nothing changed — panel keeps showing its GRAM.
-        // Otherwise: partial windowed flush of dirty spans (P3) when the dirty
+        // Otherwise: partial windowed flush of dirty spans when the dirty
         // area is small; full frame when the DMI overflowed or per-window
         // overhead would exceed a straight full flush.
         let mut flush_ms = 0u32;
@@ -315,17 +216,7 @@ fn main() -> ! {
             last_report = Instant::now();
         }
     }
-    }
-
-    #[cfg(feature = "prebake")]
-    {
-        // prebake disabled for blue-gradient (live focus, minimal flash).
-        loop { /* never */ }
-    }
 }
-
-// render_timed removed for animation-cloud live cloud path (simpler single-core eval for now;
-// full dual-core row split from main branch can be re-applied to Cloud::eval_rows for max FPS).
 
 fn delay_until(deadline: Instant) {
     while Instant::now() < deadline {}

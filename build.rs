@@ -7,22 +7,16 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
 
-/// 512-entry sin LUT — f32 (init) + i16 Q14 (hot eval path).
+/// 512-entry Q14 sine LUT for src/trig.rs.
 fn generate_sin_lut() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    let mut body = String::from("pub static SIN_LUT: [f32; 512] = [\n");
-    let mut body_i16 = String::from("pub static SIN_LUT_I16: [i16; 512] = [\n");
+    let mut body = String::from("pub static SIN_LUT_I16: [i16; 512] = [\n");
     for i in 0..512 {
         let angle = (i as f64 / 512.0) * std::f64::consts::TAU;
-        let s = angle.sin();
-        body.push_str(&format!("{:.8}_f32,\n", s));
-        let q14 = (s * 16384.0).round() as i32;
-        let q14 = q14.clamp(-32768, 32767);
-        body_i16.push_str(&format!("{q14}_i16,\n"));
+        let q14 = ((angle.sin() * 16384.0).round() as i32).clamp(-32768, 32767);
+        body.push_str(&format!("{q14}_i16,\n"));
     }
     body.push_str("];\n");
-    body_i16.push_str("];\n");
-    body.push_str(&body_i16);
     let path = std::path::Path::new(&out_dir).join("sin_lut.rs");
     std::fs::write(path, body).expect("write sin_lut.rs");
     println!("cargo:rerun-if-changed=build.rs");
