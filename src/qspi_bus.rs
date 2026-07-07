@@ -74,7 +74,9 @@ impl<'d> QspiBus<'d> {
     }
 
     /// Stream a PSRAM (or SRAM) RGB565 BE byte buffer to the panel via QSPI DMA.
-    pub fn flush_bytes(&mut self, pixels_be: &[u8], scratch: &mut [u8]) {
+    /// Direct from PSRAM slice (no scratch copy) to let GDMA read PSRAM directly where supported.
+    /// This uses DMA + PSRAM better for higher FPS.
+    pub fn flush_bytes(&mut self, pixels_be: &[u8]) {
         if pixels_be.is_empty() {
             return;
         }
@@ -85,7 +87,7 @@ impl<'d> QspiBus<'d> {
         self.cs_low();
         while idx < pixels_be.len() {
             let chunk = (pixels_be.len() - idx).min(DMA_CHUNK_BYTES);
-            scratch[..chunk].copy_from_slice(&pixels_be[idx..idx + chunk]);
+            let chunk_slice = &pixels_be[idx..idx + chunk];
 
             let _ = if first {
                 first = false;
@@ -94,7 +96,7 @@ impl<'d> QspiBus<'d> {
                     Command::_8Bit(QSPI_CMD_WRITE_PIXELS, DataMode::Single),
                     Address::_24Bit(QSPI_ADDR_PIXEL_RAM, DataMode::Single),
                     0,
-                    &scratch[..chunk],
+                    chunk_slice,
                 )
             } else {
                 self.spi.half_duplex_write(
@@ -102,7 +104,7 @@ impl<'d> QspiBus<'d> {
                     Command::None,
                     Address::None,
                     0,
-                    &scratch[..chunk],
+                    chunk_slice,
                 )
             };
 

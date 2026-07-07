@@ -44,8 +44,6 @@ const LCD_HEIGHT: u16 = 466;
 const LCD_COL_OFFSET: u16 = 6;
 const AXP2101_ADDR: u8 = 0x34;
 
-#[cfg(not(feature = "prebake"))]
-const TARGET_FRAME_US: u64 = 16_667;
 const FB_LEN: usize = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
 
 /// div=3 (156×156 eval) — WebGL parity compromise per plan.
@@ -133,8 +131,7 @@ fn main() -> ! {
                         let fb_slice = core::slice::from_raw_parts_mut(fb_ptr, FB_LEN);
                         let bus_opt = &raw mut BUS_STATIC;
                         if let Some(bus) = (*bus_opt).as_mut() {
-                            let mut local_scratch = [0u8; 8192];
-                            bus.flush_bytes(fb_slice, &mut local_scratch);
+                            bus.flush_bytes(fb_slice);
                         }
                     }
                     FLUSH_DONE.store(true, Ordering::SeqCst);
@@ -227,36 +224,31 @@ fn main() -> ! {
 
     #[cfg(not(feature = "prebake"))]
     {
-    // blue-gradient branch: simple premium diagonal gentle blue gradient (dark -> royal).
-    // Live only. Proper double PSRAM fbs + full-res direct render (no low-res to fix lines/flashing).
-    // Diagonal sweep + wave. Target >=20 FPS smooth via fast compute + DMA.
+    // time-display: black background + centered digital time (Inter-style) + startup fade + smooth bezel circle animation.
+    // 30 fps target, 10px bezel padding, beautiful ease curve. Double PSRAM ping-pong + direct render.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
-    // Store properly in PSRAM (via psram_allocator). Double buf for smoothness (render one, flush other).
     let mut fb0 = vec![0u8; byte_count];
     let mut fb1 = vec![0u8; byte_count];
-    let mut dma_scratch = vec![0u8; DMA_CHUNK_BYTES];
 
-    println!("Entering Blue Gradient live loop (MAX SPEED, double PSRAM buf, full res).");
-    println!("Blue Gradient (live first, no prebake) init...");
+    println!("Entering Time Display (black + scale-to-gray AA Inter text + dual-list solid bezel).");
+    println!("Clock (live, no prebake) init...");
     let init_start = Instant::now();
-    let mut gradient = pocket_watch_smoke_test::gradient::BlueGradient::new(
-        pocket_watch_smoke_test::gradient::GradientConfig::default(),
-        LCD_WIDTH,
-        LCD_HEIGHT,
-    );
+    let mut clock = pocket_watch_smoke_test::clock::Clock::new();
     println!(
-        "Gradient ready {} ms | full res {}x{} | 2x FB {} KiB in PSRAM",
+        "Clock ready {} ms | bezel anim={} full={} offsets | 2x FB {} KiB PSRAM",
         init_start.elapsed().as_millis(),
-        LCD_WIDTH,
-        LCD_HEIGHT,
+        clock.bezel_anim_len,
+        clock.bezel_full_len,
         (byte_count * 2) / 1024
     );
 
     let anim_start = Instant::now();
     let mut front = 0usize;
-    // Initial render to fb0
-    gradient.render_to_fb(&mut fb0, 0);
-    bus.flush_bytes(&fb0, &mut dma_scratch);
+    const CLOCK_FRAME_US: u64 = 0; // run full speed (as fast as render+DMA flush allows) for substantial higher FPS
+
+    // Prime (no prev buffer — black fill)
+    clock.render_to_fb(&mut fb0, None, 0);
+    bus.flush_bytes(&fb0);
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
     let mut last_report = Instant::now();
@@ -264,27 +256,46 @@ fn main() -> ! {
 
     loop {
         let frame_start = Instant::now();
-        let time_ms = anim_start.elapsed().as_millis() as u32;
-        let back = 1 - front;
+        let elapsed = anim_start.elapsed().as_millis() as u32;
 
-        // Full res direct to back PSRAM fb (smooth, no upscale lines)
-        if back == 0 {
-            gradient.render_to_fb(&mut fb0, time_ms as i32 * 16);  // approx Q
-            bus.write_command(0x2C);
-            bus.flush_bytes(&fb1, &mut dma_scratch);  // flush previous front
+        // Ping-pong: copy displayed front into back, apply incremental deltas, flush new front
+        let back = 1 - front;
+        let render_start = Instant::now();
+        if front == 0 {
+            clock.render_to_fb(&mut fb1, Some(&fb0), elapsed);
         } else {
-            gradient.render_to_fb(&mut fb1, time_ms as i32 * 16);
-            bus.write_command(0x2C);
-            bus.flush_bytes(&fb0, &mut dma_scratch);
+            clock.render_to_fb(&mut fb0, Some(&fb1), elapsed);
         }
+        let render_ms = render_start.elapsed().as_millis() as u32;
 
         front = back;
+        bus.write_command(0x2C);
+        let front_fb = if front == 0 { &fb0 } else { &fb1 };
+        let flush_start = Instant::now();
+        bus.flush_bytes(front_fb);
+        let flush_ms = flush_start.elapsed().as_millis() as u32;
+
+        // No hard cap delay (CLOCK_FRAME_US=0) — let DMA/PSRAM opts + fast ring draw deliver max FPS
+        // (previous delay_until kept only if >0)
+        if CLOCK_FRAME_US > 0 {
+            let deadline = frame_start + Duration::from_micros(CLOCK_FRAME_US);
+            delay_until(deadline);
+        }
 
         let total_ms = frame_start.elapsed().as_millis() as u32;
         let inst_fps = if total_ms > 0 { 1000.0 / total_ms as f32 } else { 0.0 };
         ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
         if last_report.elapsed() >= Duration::from_secs(1) {
-            println!("gradient fps~{:.1} total={}ms (double PSRAM buf)", ema_fps, total_ms);
+            println!(
+                "clock fps~{:.1} render={}ms flush={}ms total={}ms | centers={} cdelta={} px_writes={}",
+                ema_fps,
+                render_ms,
+                flush_ms,
+                total_ms,
+                clock.last_bezel_centers,
+                clock.last_bezel_center_delta,
+                clock.last_bezel_writes
+            );
             last_report = Instant::now();
         }
     }

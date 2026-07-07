@@ -10,6 +10,7 @@ pub mod raidal;
 pub mod cloud;
 pub mod light_rays;
 pub mod gradient;
+pub mod clock;
 
 #[cfg(feature = "prebake")]
 pub mod prebake;
