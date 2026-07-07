@@ -8,6 +8,7 @@ pub mod plasma;
 pub mod qspi_bus;
 pub mod raidal;
 pub mod cloud;
+pub mod light_rays;
 
 #[cfg(feature = "prebake")]
 pub mod prebake;

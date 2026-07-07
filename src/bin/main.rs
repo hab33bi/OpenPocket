@@ -24,7 +24,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use pocket_watch_smoke_test::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
 use pocket_watch_smoke_test::raidal::{Scratch, LOW_W};
 #[cfg(not(feature = "prebake"))]
-use pocket_watch_smoke_test::cloud::Cloud;
+use pocket_watch_smoke_test::light_rays::LightRays;
 #[cfg(not(feature = "prebake"))]
 use pocket_watch_smoke_test::raidal::{LOW_H, Raidal2Config}; // keep for compat if needed
 #[cfg(not(feature = "prebake"))]
@@ -227,23 +227,25 @@ fn main() -> ! {
 
     #[cfg(not(feature = "prebake"))]
     {
-    // animation-cloud: live Animated Cloud (HeroWave ported).
-    // No prebake. Optimized live: Q14/LUT, low-res div=2, tables for upscale, max speed.
+    // light-rays branch: live Light Rays (from react bits style WebGL/canvas).
+    // Live first. Optimized like main/cloud (Q14, LUT, low-res, direct flush, max speed).
+    // Seamless friendly for infinite loop, prebake if live FPS insufficient.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
     let mut fb0 = vec![0u8; byte_count];
     let mut dma_scratch = vec![0u8; DMA_CHUNK_BYTES];
 
-    println!("Animated Cloud (live only, no prebake) init...");
+    println!("Entering Light Rays live loop (MAX SPEED, live first).");
+    println!("Light Rays (live first, no prebake) init...");
     let init_start = Instant::now();
-    let mut cloud = Cloud::new(
-        pocket_watch_smoke_test::cloud::CloudConfig { time_scale: 1.0 },
+    let mut light_rays = LightRays::new(
+        pocket_watch_smoke_test::light_rays::LightRaysConfig::default(),
         LCD_WIDTH,
         LCD_HEIGHT,
     );
     let low_size = (LCD_WIDTH / 2) as usize * (LCD_HEIGHT / 2) as usize;
     let mut low_buf = vec![0u16; low_size];
     println!(
-        "Cloud ready {} ms | low {}x{} | FB {} KiB",
+        "Light Rays ready {} ms | low {}x{} | FB {} KiB",
         init_start.elapsed().as_millis(),
         LCD_WIDTH / 2,
         LCD_HEIGHT / 2,
@@ -251,9 +253,9 @@ fn main() -> ! {
     );
 
     let anim_start = Instant::now();
-    cloud.update_time(0);
-    cloud.eval_pass(&mut low_buf);
-    cloud.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
+    light_rays.update_time(0);
+    light_rays.eval_pass(&mut low_buf);
+    light_rays.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
     bus.flush_bytes(&fb0, &mut dma_scratch);
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
@@ -267,9 +269,9 @@ fn main() -> ! {
     loop {
         let frame_start = Instant::now();
         let time_ms = anim_start.elapsed().as_millis() as u32;
-        cloud.update_time(time_ms);
-        cloud.eval_pass(&mut low_buf);
-        cloud.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
+        light_rays.update_time(time_ms);
+        light_rays.eval_pass(&mut low_buf);
+        light_rays.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
         bus.write_command(0x2C);
         bus.flush_bytes(&mut fb0, &mut dma_scratch);
 
