@@ -1,27 +1,18 @@
 //! Light Rays - live WebGL-style light rays effect ported for ESP32.
 //!
-//! Based on typical "light rays" from React Bits / canvas / WebGL components (radial beams from center,
-//! animated rotation/pulse, falloff, multiple rays).
+//! Matches https://reactbits.dev/backgrounds/light-rays : black background, light rays coming from the TOP (small/narrow beams),
+//! slightly scaled down effect (concentrated sources in upper/center-top, narrow beams, fade not full screen).
 //! 
 //! Strategy (following main branch learnings + cloud port):
-//! - Live first (no prebake to save flash, as requested - prebake was 80% flash experiment).
+//! - Live first (no prebake to save flash).
 //! - Q14 fixed point + LUT sin/cos (reuse from raidal).
-//! - Low res eval (div=2) + on-fly upscale tables (like cloud and raidal).
-//! - Direct sync flush for reliable animation.
-//! - Dual core ready (eval_rows implemented).
-//! - Minimal flash: pure code + small tables. Should be seamless for infinite loop (periodic rays).
-//! - If live too slow, prebake possible since "more seamless for infinite loop".
+//! - Low res eval (div=2) + on-fly upscale tables.
+//! - Direct sync flush.
+//! - Dual core ready (eval_rows).
+//! - Minimal flash.
 //!
-//! Research/Planning notes:
-//! - Typical React Bits Light Rays: canvas or threejs/webgl with rays from point, alpha, length animated by time,
-//!   often with noise or sin for organic feel. Simple math per pixel: angle/distance to rays.
-//! - Complexity lower than Raidal, similar to cloud: per pixel loop over rays (say 8-12).
-//! - For seamless: make ray angles advance with time such that after period (e.g. 2pi rotation) it loops perfectly.
-//! - Perf target: live 20-30+ FPS. 4-8 rays * low pixels feasible with LUT/ fixed.
-//! - If needed for higher FPS or perfect loop: prebake frames with delta/RLE like before, but try live first.
-//! - Port steps: map JS canvas pixel loop to fixed point, use low res for speed, match color (rays on bg).
-//!
-//! To exact match a specific "from react bits", paste the component code; this is a faithful typical implementation.
+//! Rays: vertical-ish beams from top edge, sources concentrated for "small" look (0.25-0.75 width), narrow width=0.06,
+//! fade downward, subtle sway + per-ray pulse animation. Black base, bright neutral rays.
 
 use alloc::vec::Vec;
 
@@ -44,9 +35,9 @@ impl Default for LightRaysConfig {
     fn default() -> Self {
         Self {
             time_scale: 1.0,
-            num_rays: 8,
-            ray_length: 0.8,
-            beam_width: 0.15,
+            num_rays: 5,        // small number for "small" rays
+            ray_length: 1.2,
+            beam_width: 0.06,   // narrow beams
         }
     }
 }
@@ -103,56 +94,60 @@ impl LightRays {
         let t = self.t_q;
         let num_rays = self.config.num_rays as i32;
         let beam_w_q = (self.config.beam_width * 16384.0) as i32;
-        let len_q = (self.config.ray_length * 16384.0) as i32;
 
-        let center_x = (lw / 2) as i32;
-        let center_y = (lh / 2) as i32;
+        // Rays come from the TOP, small/narrow, on black bg.
+        // Sources spaced across the top (slightly concentrated for "small" effect).
+        // Vertical rays with subtle animation (pulse + slight sway).
 
         for ly in rs..re {
-            let dy = (ly as i32 - center_y) * 16384 / (lh as i32);
+            // y_norm: 0 at top (source), 1 at bottom. Rays fade downward.
+            let y_norm_q = (ly as i32 * 16384) / (lh as i32);  // 0..Q
+
+            // fade stronger near top? No: intensity high near top, fades down.
+            // depth_fade high at top (small y), lower deeper.
+            let depth_fade = 16384 - (y_norm_q * 11000 / 16384); // fade to ~30% at bottom
+
             for lx in 0..lw {
-                let dx = (lx as i32 - center_x) * 16384 / (lw as i32);
-
-                // dist = sqrt(dx*dx + dy*dy) approx or use for falloff
-                let dist2 = ((dx as i64 * dx as i64 + dy as i64 * dy as i64) >> 14) as i32;
-                let dist = isqrt_approx(dist2);  // approx sqrt
-
-                // angle in Q14 (0 to TAU ~ 2pi scaled)
-                let angle = atan2_q14(dy, dx);  // custom or approx
+                // u_x 0 to 1 normalized across width
+                let u_x_q = (lx as i32 * 16384) / (lw as i32);
 
                 let mut intensity: i32 = 0;
 
                 for r in 0..num_rays {
-                    let ray_base = (r as i32 * 16384 * 2) / num_rays ;  // 2pi / n
-                    let ray_angle = ray_base + (t / 2);  // slow rotate with time ( /2 for scale)
+                    // Source x positions at top, spread but "small" (not full width)
+                    // Concentrate in center-top for small effect: sources from ~0.25 to 0.75
+                    let spread = 8192; // Q/2
+                    let base = 4096 + (r as i32 * spread * 2 / (num_rays - 1)); // 0.25 to 0.75 in Q
 
-                    let mut d_angle = angle - ray_angle;
-                    // wrap
-                    if d_angle > 8192 { d_angle -= 16384; }
-                    if d_angle < -8192 { d_angle += 16384; }
-                    let d_angle = if d_angle < 0 { -d_angle } else { d_angle };
+                    // slight horizontal sway with time for organic feel
+                    let sway = (lut_sin_cos_q14(t * 3 + (r as i32 * 1200)) * 1200) >> 14; // small sway
+                    let ray_x_q = base + sway;
 
-                    if d_angle < beam_w_q {
-                        let fall = (16384 - (d_angle * 16384 / beam_w_q)) ;  // linear
-                        let len_fall = if dist > len_q { 0 } else { 16384 - (dist * 16384 / len_q) };
-                        let pulse = (16384 + lut_sin_cos_q14(t + (r as i32 * 2000))) / 2;  // pulse
-                        let contrib = (fall * len_fall / 16384) * pulse / 16384 ;
+                    // horizontal distance to this ray's x at current y (vertical rays)
+                    let dx_q = if u_x_q > ray_x_q { u_x_q - ray_x_q } else { ray_x_q - u_x_q };
+
+                    if dx_q < beam_w_q {
+                        // linear cross section for the beam
+                        let cross = 16384 - (dx_q * 16384 / beam_w_q);
+
+                        // pulse per ray
+                        let pulse = (12000 + lut_sin_cos_q14(t * 4 + (r as i32 * 1500))) >> 1; //  ~0.73 + 0.27*sin
+
+                        let contrib = (cross * depth_fade / 16384) * pulse / 16384;
                         intensity += contrib;
                     }
                 }
 
                 intensity = (intensity / num_rays).min(16384);
 
-                // Color: bright rays (white/yellow) on dark bg
-                let bg = 200;  // dark
-                let ray_c = (intensity * 200 / 16384 + bg).min(255 * 64 / 255) ; wait use Q
-                // simple: r g b high for rays
-                let ray_val = (intensity * 240 / 16384 ) as i32;  // 0 to ~240 in 0-255 scale later
-                let r = (bg + ray_val * 1 ) .min(255);
-                let g = (bg + ray_val * 1 ) .min(255);
-                let b = (bg + ray_val * 2 ) .min(255);  // slight blue tint or white
+                // Black background, bright rays (slightly warm/white)
+                let base = 800; // very dark ~5/255 in Q14
+                let ray_val = (intensity * 220 / 16384) as i32; // scale brightness
 
-                // convert to Q for helper? simplify
+                let r = (base + ray_val * 1) .min(255);
+                let g = (base + ray_val * 1) .min(255);
+                let b = (base + ray_val * 1) .min(255); // neutral white rays for classic look
+
                 let r_q = (r as i32 * 16384 / 255) as i32;
                 let g_q = (g as i32 * 16384 / 255) as i32;
                 let b_q = (b as i32 * 16384 / 255) as i32;
