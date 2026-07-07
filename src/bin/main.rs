@@ -227,25 +227,25 @@ fn main() -> ! {
 
     #[cfg(not(feature = "prebake"))]
     {
-    // light-rays branch: live Light Rays (from react bits style WebGL/canvas).
-    // Live first. Optimized like main/cloud (Q14, LUT, low-res, direct flush, max speed).
-    // Seamless friendly for infinite loop, prebake if live FPS insufficient.
+    // blue-gradient branch: simple premium diagonal gentle blue gradient (dark -> royal).
+    // Live only. Optimized: Q14 + LUT, (low-res + upscale or full), direct sync flush, max speed.
+    // Diagonal sweep + subtle wave for beautiful smooth >=25 FPS.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
     let mut fb0 = vec![0u8; byte_count];
     let mut dma_scratch = vec![0u8; DMA_CHUNK_BYTES];
 
-    println!("Entering Light Rays live loop (MAX SPEED, live first).");
-    println!("Light Rays (live first, no prebake) init...");
+    println!("Entering Blue Gradient live loop (MAX SPEED, live first).");
+    println!("Blue Gradient (live first, no prebake) init...");
     let init_start = Instant::now();
-    let mut light_rays = LightRays::new(
-        pocket_watch_smoke_test::light_rays::LightRaysConfig::default(),
+    let mut gradient = pocket_watch_smoke_test::gradient::BlueGradient::new(
+        pocket_watch_smoke_test::gradient::GradientConfig::default(),
         LCD_WIDTH,
         LCD_HEIGHT,
     );
     let low_size = (LCD_WIDTH / 2) as usize * (LCD_HEIGHT / 2) as usize;
     let mut low_buf = vec![0u16; low_size];
     println!(
-        "Light Rays ready {} ms | low {}x{} | FB {} KiB",
+        "Gradient ready {} ms | low {}x{} | FB {} KiB",
         init_start.elapsed().as_millis(),
         LCD_WIDTH / 2,
         LCD_HEIGHT / 2,
@@ -253,25 +253,21 @@ fn main() -> ! {
     );
 
     let anim_start = Instant::now();
-    light_rays.update_time(0);
-    light_rays.eval_pass(&mut low_buf);
-    light_rays.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
+    gradient.update_time(0);
+    gradient.eval_pass(&mut low_buf);
+    gradient.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
     bus.flush_bytes(&fb0, &mut dma_scratch);
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
-    // Live cloud loop (inside cfg for scope, max speed)
     let mut last_report = Instant::now();
     let mut ema_fps: f32 = 0.0;
-    let low_w = LCD_WIDTH / 2;
-    let low_h = LCD_HEIGHT / 2;
-    let mut low_buf = vec![0u16; (low_w as usize)*(low_h as usize)];
 
     loop {
         let frame_start = Instant::now();
         let time_ms = anim_start.elapsed().as_millis() as u32;
-        light_rays.update_time(time_ms);
-        light_rays.eval_pass(&mut low_buf);
-        light_rays.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
+        gradient.update_time(time_ms);
+        gradient.eval_pass(&mut low_buf);
+        gradient.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
         bus.write_command(0x2C);
         bus.flush_bytes(&mut fb0, &mut dma_scratch);
 
@@ -279,21 +275,17 @@ fn main() -> ! {
         let inst_fps = if total_ms > 0 { 1000.0 / total_ms as f32 } else { 0.0 };
         ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
         if last_report.elapsed() >= Duration::from_secs(1) {
-            println!("cloud fps~{:.1} total={}ms", ema_fps, total_ms);
+            println!("gradient fps~{:.1} total={}ms", ema_fps, total_ms);
             last_report = Instant::now();
         }
     }
     }
 
-    // prebake disabled on animation-cloud branch (focus on live cloud, minimal flash).
-    // The prebake experiment (80% flash) is noted as "great experiment" but not for this.
     #[cfg(feature = "prebake")]
     {
-        // prebake not built for this branch
+        // prebake disabled for blue-gradient (live focus, minimal flash).
         loop { /* never */ }
     }
-
-    // (the live cloud loop is inside the previous #[cfg(not(prebake))] block above for scope)
 }
 
 // render_timed removed for animation-cloud live cloud path (simpler single-core eval for now;

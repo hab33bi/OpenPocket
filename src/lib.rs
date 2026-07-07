@@ -9,6 +9,7 @@ pub mod qspi_bus;
 pub mod raidal;
 pub mod cloud;
 pub mod light_rays;
+pub mod gradient;
 
 #[cfg(feature = "prebake")]
 pub mod prebake;
