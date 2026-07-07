@@ -15,7 +15,7 @@ use esp_hal::clock::CpuClock;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::i2c::master::{Config as I2cConfig, I2c};
+use esp_hal::i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode as SpiMode;
@@ -55,9 +55,16 @@ fn main() -> ! {
 
     println!("=== OpenPocket ===");
 
+    // Both esp-hal I2C timeouts default OFF on the S3 — a clock-stretching or
+    // wedged device then blocks a transaction FOREVER (observed: whole-firmware
+    // freeze under touch-read bursts). Bounded timeouts turn hangs into Err,
+    // which the touch layer counts and recovers from via chip re-init.
     let mut i2c = I2c::new(
         peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+        I2cConfig::default()
+            .with_frequency(Rate::from_khz(400))
+            .with_timeout(BusTimeout::Maximum)
+            .with_software_timeout(SoftwareTimeout::Transaction(Duration::from_millis(20))),
     )
     .unwrap()
     .with_sda(peripherals.GPIO15)

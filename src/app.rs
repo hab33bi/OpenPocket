@@ -80,6 +80,7 @@ impl<'a, 'd> App<'a, 'd> {
         let mut last_touch_read = Instant::now();
         let mut i2c_errors: u32 = 0;
         let mut consec_errors: u32 = 0;
+        let mut int_was_low = false;
 
         loop {
             let frame_start = Instant::now();
@@ -155,7 +156,14 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 flush_ms = flush_start.elapsed().as_millis() as u32;
                 self.wfb.clear_damage();
-                if partial { 'P' } else { 'F' }
+                if partial {
+                    'P'
+                } else {
+                    // Full flushes are rare (scene switches, heal blit) — log each
+                    // so a freeze inside one is pinpointed in serial.
+                    println!("flush: full frame {flush_ms}ms");
+                    'F'
+                }
             };
             let flushed = flush_mode != '-';
 
@@ -169,6 +177,7 @@ impl<'a, 'd> App<'a, 'd> {
                 &mut last_touch_read,
                 &mut i2c_errors,
                 &mut consec_errors,
+                &mut int_was_low,
             );
 
             // Bus-health recovery: repeated touch read failures → re-init chip.
@@ -217,14 +226,30 @@ impl<'a, 'd> App<'a, 'd> {
         last_read: &mut Instant,
         i2c_errors: &mut u32,
         consec_errors: &mut u32,
+        int_was_low: &mut bool,
     ) {
         loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
-            let report = if self.tp_int.is_low()
-                && last_read.elapsed() >= Duration::from_millis(2)
-            {
+
+            // Edge-triggered: read once per INT falling edge (the chip asserts
+            // per report), with a slow level-based fallback (≥20 ms) in case an
+            // edge is missed while INT stays low. Keeps I2C traffic to what the
+            // chip actually signals instead of hammering the shared bus.
+            let int_low = self.tp_int.is_low();
+            let falling_edge = int_low && !*int_was_low;
+            *int_was_low = int_low;
+            let do_read = (falling_edge && last_read.elapsed() >= Duration::from_millis(2))
+                || (int_low && last_read.elapsed() >= Duration::from_millis(20));
+
+            let report = if do_read {
                 *last_read = Instant::now();
-                match cst9217::read_touch(&mut self.i2c) {
+                let t0 = Instant::now();
+                let r = cst9217::read_touch(&mut self.i2c);
+                let read_ms = t0.elapsed().as_millis() as u32;
+                if read_ms > 5 {
+                    println!("touch: slow read {read_ms}ms");
+                }
+                match r {
                     Ok(r) => {
                         *consec_errors = 0;
                         r

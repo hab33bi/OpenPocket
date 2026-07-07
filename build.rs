@@ -1,4 +1,10 @@
 fn main() {
+    // Force this script to rerun on EVERY build: the RTC seed timestamp
+    // (BUILD_SECS_2000) must be fresh, and cargo otherwise caches build-script
+    // output until an input changes (observed: a watch seeded 53 min late from
+    // a stale stamp). The missing path is always treated as dirty.
+    println!("cargo:rerun-if-changed=__force_rerun_for_build_time__");
+
     generate_sin_lut();
     generate_inter_font();
     generate_bezel_schedules();
@@ -78,6 +84,25 @@ fn generate_spike_asset() {
     let out_path = std::path::Path::new(&out_dir).join("spike_rgb565.bin");
     let src_path = std::path::Path::new("assets/Spike.jpg");
     println!("cargo:rerun-if-changed=assets/Spike.jpg");
+
+    // build.rs now reruns every build (for the RTC timestamp); skip the
+    // expensive decode/resize/dither when the output is already newer than
+    // both the source image and this script.
+    if let (Ok(out_meta), Ok(src_meta), Ok(script_meta)) = (
+        std::fs::metadata(&out_path),
+        std::fs::metadata(src_path),
+        std::fs::metadata("build.rs"),
+    ) {
+        if let (Ok(out_t), Ok(src_t), Ok(script_t)) = (
+            out_meta.modified(),
+            src_meta.modified(),
+            script_meta.modified(),
+        ) {
+            if out_t > src_t && out_t > script_t {
+                return;
+            }
+        }
+    }
 
     if !src_path.exists() {
         // Stub: black frame so builds don't hard-fail without the asset.
