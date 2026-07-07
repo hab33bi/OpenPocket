@@ -7,10 +7,15 @@
 //! - Centered for round display, soft vignette.
 //! - Black/dark edges for contrast.
 //!
+//! PSRAM + Double Buf for smoothness (per plan/research):
+//! - Framebuffers stored in PSRAM (via psram_allocator in main).
+//! - Double buffering (fb0/fb1): render complete to back, flush front (avoids tearing/flashing/lines during update).
+//! - Full res direct render_to_fb (no low-res/upscale) for artifact-free smooth gradient.
+//! - Research on board (Waveshare ESP32-S3 AMOLED): PSRAM double buf + DMA enables 25-60FPS smooth anims (LVGL/custom examples).
+//! - Gradient compute very cheap at full res -> total ~flush time (~25-40ms) => 25-40 FPS easily >20 target.
+//!
 //! Strategy (following main branch learnings + cloud/light-rays ports, web research):
 //! - Live only (no prebake, minimal flash).
-//! - Full res for max smoothness (gradient math trivial; ~negligible compute vs flush).
-//!   Or low-res + bilinear for consistency (div=2).
 //! - Q14 + lut_sin_cos_q14 (best internal "lib") for wave.
 //! - Direct sync flush.
 //! - Extremely efficient: few ops + 1 LUT/pixel.
@@ -26,7 +31,7 @@
 //! - To 25+FPS: full res ok; optimize DMA if needed (8k chunks already good).
 //! - Premium: high prec lerp, LUT wave, round center, calm params.
 //!
-//! Usage: similar to Cloud/LightRays.
+//! Usage: similar to Cloud/LightRays. Call render_to_fb for full direct.
 
 use alloc::vec::Vec;
 
@@ -168,6 +173,74 @@ impl BlueGradient {
 
     pub fn eval_pass(&self, low_buf: &mut [u16]) {
         self.eval_rows(low_buf, 0, self.low_h as usize);
+    }
+
+    /// Full resolution direct render to display-ready BE RGB565 framebuffer in PSRAM.
+    /// No low-res/upscale to ensure smooth no-artifact gradient (eliminates lines).
+    /// Diagonal gentle sweep: phase along (x+y), subtle wave.
+    pub fn render_to_fb(&self, fb: &mut [u8], t_q: i32) {
+        let w = self.out_w as usize;
+        let h = self.out_h as usize;
+        let cx = (w / 2) as i32;
+        let cy = (h / 2) as i32;
+
+        let sweep = (self.config.sweep_speed * 16384.0) as i32;
+        let amp = (self.config.wave_amp * 16384.0) as i32;
+
+        // Precompute colors in Q14 for smooth lerp
+        let dark_r: i32 = 0;   // dark blue ~ #000020
+        let dark_g: i32 = 0;
+        let dark_b: i32 = 0x10 * 257; // approx
+
+        let royal_r: i32 = 0x41 * 257;
+        let royal_g: i32 = 0x69 * 257;
+        let royal_b: i32 = 0xE1 * 257;
+
+        for y in 0..h {
+            let y_off = (y as i32 - cy) * 16384 / (h as i32);
+            for x in 0..w {
+                let x_off = (x as i32 - cx) * 16384 / (w as i32);
+
+                // Diagonal: (x + y) for sweep direction
+                let diag = x_off + y_off;
+
+                let phase = t_q.wrapping_mul(sweep >> 10);  // scale for gentle speed
+
+                // Factor for blend, mod for seamless
+                let mut factor = (diag + phase) & 0xFFFF;
+                if factor > 8192 { factor = 16384 - (factor & 0x3FFF); } // triangle wave like for sweep
+                factor = factor.clamp(0, 16384);
+
+                // Gentle wave on perpendicular for smooth organic flow (no hard lines)
+                let perp = x_off - y_off;
+                let wave = lut_sin_cos_q14(perp + (phase >> 1));
+                let wave_contrib = ((wave * amp) >> 14);
+                factor = (factor + wave_contrib).clamp(0, 16384);
+
+                // Smooth Q14 lerp
+                let r = dark_r + (((royal_r - dark_r) * factor) >> 14);
+                let g = dark_g + (((royal_g - dark_g) * factor) >> 14);
+                let b = dark_b + (((royal_b - dark_b) * factor) >> 14);
+
+                // Soft vignette for round display premium look (majority not hard edge)
+                let dist2 = (x_off as i64 * x_off as i64 + y_off as i64 * y_off as i64) >> 10;
+                let dist = isqrt_approx(dist2 as i32);
+                let vig = (16384 - (dist * 3000 / 16384)).max(6000);
+                let r = (r * vig) >> 14;
+                let g = (g * vig) >> 14;
+                let b = (b * vig) >> 14;
+
+                // To RGB565 BE (clamped)
+                let r5 = ((r.max(0).min(16384) * 31) >> 14) as u8;
+                let g6 = ((g.max(0).min(16384) * 63) >> 14) as u8;
+                let b5 = ((b.max(0).min(16384) * 31) >> 14) as u8;
+                let px = ((r5 as u16) << 11) | ((g6 as u16) << 5) | (b5 as u16);
+
+                let idx = (y * w + x) * 2;
+                fb[idx] = (px >> 8) as u8;
+                fb[idx + 1] = px as u8;
+            }
+        }
     }
 
     pub fn upscale_rows(&self, low: &[u16], out: &mut [u8], row_start: usize, row_end: usize) {

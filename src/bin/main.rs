@@ -228,13 +228,15 @@ fn main() -> ! {
     #[cfg(not(feature = "prebake"))]
     {
     // blue-gradient branch: simple premium diagonal gentle blue gradient (dark -> royal).
-    // Live only. Optimized: Q14 + LUT, (low-res + upscale or full), direct sync flush, max speed.
-    // Diagonal sweep + subtle wave for beautiful smooth >=25 FPS.
+    // Live only. Proper double PSRAM fbs + full-res direct render (no low-res to fix lines/flashing).
+    // Diagonal sweep + wave. Target >=20 FPS smooth via fast compute + DMA.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
+    // Store properly in PSRAM (via psram_allocator). Double buf for smoothness (render one, flush other).
     let mut fb0 = vec![0u8; byte_count];
+    let mut fb1 = vec![0u8; byte_count];
     let mut dma_scratch = vec![0u8; DMA_CHUNK_BYTES];
 
-    println!("Entering Blue Gradient live loop (MAX SPEED, live first).");
+    println!("Entering Blue Gradient live loop (MAX SPEED, double PSRAM buf, full res).");
     println!("Blue Gradient (live first, no prebake) init...");
     let init_start = Instant::now();
     let mut gradient = pocket_watch_smoke_test::gradient::BlueGradient::new(
@@ -242,20 +244,18 @@ fn main() -> ! {
         LCD_WIDTH,
         LCD_HEIGHT,
     );
-    let low_size = (LCD_WIDTH / 2) as usize * (LCD_HEIGHT / 2) as usize;
-    let mut low_buf = vec![0u16; low_size];
     println!(
-        "Gradient ready {} ms | low {}x{} | FB {} KiB",
+        "Gradient ready {} ms | full res {}x{} | 2x FB {} KiB in PSRAM",
         init_start.elapsed().as_millis(),
-        LCD_WIDTH / 2,
-        LCD_HEIGHT / 2,
-        byte_count / 1024
+        LCD_WIDTH,
+        LCD_HEIGHT,
+        (byte_count * 2) / 1024
     );
 
     let anim_start = Instant::now();
-    gradient.update_time(0);
-    gradient.eval_pass(&mut low_buf);
-    gradient.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
+    let mut front = 0usize;
+    // Initial render to fb0
+    gradient.render_to_fb(&mut fb0, 0);
     bus.flush_bytes(&fb0, &mut dma_scratch);
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
@@ -265,17 +265,26 @@ fn main() -> ! {
     loop {
         let frame_start = Instant::now();
         let time_ms = anim_start.elapsed().as_millis() as u32;
-        gradient.update_time(time_ms);
-        gradient.eval_pass(&mut low_buf);
-        gradient.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
-        bus.write_command(0x2C);
-        bus.flush_bytes(&mut fb0, &mut dma_scratch);
+        let back = 1 - front;
+
+        // Full res direct to back PSRAM fb (smooth, no upscale lines)
+        if back == 0 {
+            gradient.render_to_fb(&mut fb0, time_ms as i32 * 16);  // approx Q
+            bus.write_command(0x2C);
+            bus.flush_bytes(&fb1, &mut dma_scratch);  // flush previous front
+        } else {
+            gradient.render_to_fb(&mut fb1, time_ms as i32 * 16);
+            bus.write_command(0x2C);
+            bus.flush_bytes(&fb0, &mut dma_scratch);
+        }
+
+        front = back;
 
         let total_ms = frame_start.elapsed().as_millis() as u32;
         let inst_fps = if total_ms > 0 { 1000.0 / total_ms as f32 } else { 0.0 };
         ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
         if last_report.elapsed() >= Duration::from_secs(1) {
-            println!("gradient fps~{:.1} total={}ms", ema_fps, total_ms);
+            println!("gradient fps~{:.1} total={}ms (double PSRAM buf)", ema_fps, total_ms);
             last_report = Instant::now();
         }
     }

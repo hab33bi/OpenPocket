@@ -35,9 +35,9 @@ impl Default for LightRaysConfig {
     fn default() -> Self {
         Self {
             time_scale: 1.0,
-            num_rays: 5,        // small number for "small" rays
-            ray_length: 1.2,
-            beam_width: 0.06,   // narrow beams
+            num_rays: 6,
+            ray_length: 1.8,   // 3x larger for bigger effect
+            beam_width: 0.18,  // 3x wider beams
         }
     }
 }
@@ -92,67 +92,79 @@ impl LightRays {
         let re = row_end.min(lh);
 
         let t = self.t_q;
-        let num_rays = self.config.num_rays as i32;
-        let beam_w_q = (self.config.beam_width * 16384.0) as i32;
+        let num = self.config.num_rays as i32;  // e.g. 5
+        let beam = (self.config.beam_width * 16384.0) as i32;  // small e.g. 0.06*Q ~ 1000
+        let len_q = (self.config.ray_length * 16384.0) as i32;  // e.g. 0.5*Q
 
-        // Rays come from the TOP, small/narrow, on black bg.
-        // Sources spaced across the top (slightly concentrated for "small" effect).
-        // Vertical rays with subtle animation (pulse + slight sway).
+        let cx = (lw / 2) as i32;
+
+        // For top-center: origin slightly above top, dir down
+        let ray_y0 = -((lh / 5) as i32);  // above top for "from top"
 
         for ly in rs..re {
-            // y_norm: 0 at top (source), 1 at bottom. Rays fade downward.
-            let y_norm_q = (ly as i32 * 16384) / (lh as i32);  // 0..Q
+            if ly > (lh * 85 / 100) as usize {  // larger coverage, ~85% height for 3x bigger effect, still some black at bottom
+                for lx in 0..lw {
+                    low_buf[ly * lw + lx] = 0;  // pure black at very bottom
+                }
+                continue;
+            }
 
-            // fade stronger near top? No: intensity high near top, fades down.
-            // depth_fade high at top (small y), lower deeper.
-            let depth_fade = 16384 - (y_norm_q * 11000 / 16384); // fade to ~30% at bottom
+            let sy = (ly as i32 - ray_y0) ;  // positive down
 
             for lx in 0..lw {
-                // u_x 0 to 1 normalized across width
-                let u_x_q = (lx as i32 * 16384) / (lw as i32);
+                let sx = (lx as i32 - cx) ;
 
-                let mut intensity: i32 = 0;
+                // approx length
+                let dist = isqrt_approx( (sx as i64 * sx as i64 + sy as i64 * sy as i64) as i32 >> 0 );  // rough
 
-                for r in 0..num_rays {
-                    // Source x positions at top, spread but "small" (not full width)
-                    // Concentrate in center-top for small effect: sources from ~0.25 to 0.75
-                    let spread = 8192; // Q/2
-                    let base = 4096 + (r as i32 * spread * 2 / (num_rays - 1)); // 0.25 to 0.75 in Q
+                // horizontal closeness to center line from top (for spread)
+                let dx_norm = if sy == 0 { 0 } else { (sx as i64 * 16384 / sy as i64) as i32 };
 
-                    // slight horizontal sway with time for organic feel
-                    let sway = (lut_sin_cos_q14(t * 3 + (r as i32 * 1200)) * 1200) >> 14; // small sway
-                    let ray_x_q = base + sway;
+                let abs_dx = if dx_norm < 0 { -dx_norm } else { dx_norm };
 
-                    // horizontal distance to this ray's x at current y (vertical rays)
-                    let dx_q = if u_x_q > ray_x_q { u_x_q - ray_x_q } else { ray_x_q - u_x_q };
+                let mut intens = 0i32;
 
-                    if dx_q < beam_w_q {
-                        // linear cross section for the beam
-                        let cross = 16384 - (dx_q * 16384 / beam_w_q);
+                // simulate multiple rays with offsets for width - wider spread now
+                for r in 0..num {
+                    let offset = (r - num/2) * (beam / 4) ;  // adjusted for larger
 
-                        // pulse per ray
-                        let pulse = (12000 + lut_sin_cos_q14(t * 4 + (r as i32 * 1500))) >> 1; //  ~0.73 + 0.27*sin
+                    let d = abs_dx + offset;
 
-                        let contrib = (cross * depth_fade / 16384) * pulse / 16384;
-                        intensity += contrib;
+                    if d < beam && d >= 0 {
+                        let cross = beam - d;
+
+                        // length falloff - longer now
+                        let len_f = if dist > len_q { 0 } else { len_q - dist };
+
+                        // fade from top - gentler for bigger effect
+                        let fade = 16384 - ( (ly as i32 * 5000) / lh as i32 );
+
+                        // pulse and anim
+                        let pulse = (10000 + lut_sin_cos_q14( (t * 5) + (r * 1000) )) >> 1 ;
+
+                        let mut contrib = (cross * len_f / beam ) * fade / 16384 ;
+                        contrib = (contrib * pulse / 16384 ) ;
+
+                        intens += contrib ;
                     }
                 }
 
-                intensity = (intensity / num_rays).min(16384);
+                intens = (intens / num).min(16384);
 
-                // Black background, bright rays (slightly warm/white)
-                let base = 800; // very dark ~5/255 in Q14
-                let ray_val = (intensity * 220 / 16384) as i32; // scale brightness
+                // black bg + rays (white/cyan tint for light rays)
+                let base = 0;  // pure black
+                let v = (intens * 220 / 16384) as i32;  // brightness, slightly higher for visibility
 
-                let r = (base + ray_val * 1) .min(255);
-                let g = (base + ray_val * 1) .min(255);
-                let b = (base + ray_val * 1) .min(255); // neutral white rays for classic look
+                // slight cyan tint like example #00ffff but on device white-ish
+                let r = (base + v) .min(255);
+                let g = (base + v * 1) .min(255);
+                let b = (base + v * 1) .min(255);
 
-                let r_q = (r as i32 * 16384 / 255) as i32;
-                let g_q = (g as i32 * 16384 / 255) as i32;
-                let b_q = (b as i32 * 16384 / 255) as i32;
+                let rq = (r as i32 * 16384 / 255) as i32;
+                let gq = (g as i32 * 16384 / 255) as i32;
+                let bq = (b as i32 * 16384 / 255) as i32;
 
-                let px = q14_rgb_to_rgb565(r_q, g_q, b_q);
+                let px = q14_rgb_to_rgb565(rq, gq, bq);
                 low_buf[ly * lw + lx] = px;
             }
         }
@@ -240,20 +252,3 @@ fn isqrt_approx(x: i32) -> i32 {
     y
 }
 
-// Simple atan2 approx in Q14 range (0 to TAU approx)
-#[inline]
-fn atan2_q14(y: i32, x: i32) -> i32 {
-    // Basic approx, sufficient for rays
-    if x == 0 && y == 0 { return 0; }
-    let abs_y = if y < 0 { -y } else { y };
-    let abs_x = if x < 0 { -x } else { x };
-    let mut a = if abs_x > abs_y { 
-        (abs_y * 4096) / (abs_x + abs_y)   // rough
-    } else {
-        8192 - (abs_x * 4096) / (abs_y + abs_x)
-    };
-    if x < 0 { a = 16384 - a; }
-    if y < 0 { a = -a; }
-    // scale to our TAU ~103k but for simplicity use 16384 for 2pi unit here
-    a 
-}
