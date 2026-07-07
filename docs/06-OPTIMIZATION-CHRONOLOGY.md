@@ -14,6 +14,7 @@ Phase 2: Raidal-2 port, div=2, fused path     → ~4 s/frame, 0.2 FPS
 Phase 3: SoA cache + row staging               → ~4 s (minor)
 Phase 4: div=4 "extreme" + byte FB + 8K DMA   → ~1.6 s, 0.6 FPS, quality ↓
 Phase 5: div=3 two-pass Q14 + upmap (current)  → slight improvement (split TBD)
+Phase 6: time-display bezel (clock.rs)         → see below
 ```
 
 ---
@@ -197,6 +198,35 @@ Split timers validated the architecture hypothesis. Next session must **research
 ### Release profile default
 - `opt-level = 3` in both dev and release — user often flashes dev profile
 - **Recommend:** always benchmark with `--release`
+
+---
+
+## Phase 6 — Time display bezel ring (`src/clock.rs`, `time-display` branch)
+
+Full chronology in [`08-TIME-DISPLAY-HANDOFF.md`](08-TIME-DISPLAY-HANDOFF.md). Implementation spec in [`09-BESPOKE-FRAMEBUFFER-PROMPT.md`](09-BESPOKE-FRAMEBUFFER-PROMPT.md).
+
+### Gen 6a — Prefix replay (broken ramp)
+
+- `fb.fill(0)` + full anim prefix `list[0..p×len]` × 3×3 each frame
+- Render ramped 66→672 ms as p grew; flush flat ~24 ms
+- **Verdict:** ❌ O(p) per-frame cost
+
+### Gen 6b — Incremental carry + cap (broken curve)
+
+- `copy_from_slice` ping-pong; delta-only ring; static skips ring
+- `MAX_CENTERS_PER_FRAME = 4500` to bound work
+- FPS stable ~11; render flat ~66 ms — **but ring stops ~2/3**
+- **Root cause:** cap lags cubic ease peak; phase exits on wall-clock not completion
+- **Verdict:** ❌ FPS fixed, curve broken — do not tune cap; use ease schedule LUT (P0)
+
+### Gen 6c — Planned: WatchFb + DMI + schedule (doc 09)
+
+- Build-time ease schedule; phase completion rule; retained layers; partial flush
+- **Verdict:** 🔄 Next implementation target
+
+### Lesson
+
+**Decouple animation progress from wall-clock ease evaluation.** Premium motion requires **scheduled per-frame work budgets**, not `min(ease_delta, cap)`. bitbank2 achieves smooth playback by **pipeline overlap** and **bounded line callbacks** — adapt patterns, not codecs.
 
 ---
 

@@ -312,3 +312,32 @@ clock fps~11.0 render=66ms  flush=24ms total=91ms  | bezel_writes=19444  (stable
 ```
 clock fps~X render=Rms flush=Fms total=Tms | centers=C cdelta=D px_writes=W
 ```
+
+### Update 2026-07-07 — ring stops at ~2/3 (curve + cap bug)
+
+**Symptom:** After incremental+carry fix, FPS stable ~11 but ring **stops ~2/3 around the circle** and does not follow the premium cubic ease curve. Motion feels wrong in the middle third, then phase ends with incomplete ring frozen in static mode.
+
+**Root cause (two interacting bugs in `src/clock.rs`):**
+
+1. **`MAX_CENTERS_PER_FRAME = 4500`** rate-limits visual progress. At ~11 fps × 8 s = ~88 frames, average demand is 396000/88 ≈ 4500 centers/frame — exactly at the cap. Cubic ease-in-out has **peak derivative ~2–3× average** in the middle third (t≈0.3–0.7), needing ~9000–13500 centers/frame there. Cap prevents catch-up → `drawn_centers` lags ideal ease.
+
+2. **Phase exits on wall-clock, not completion.** At `elapsed_ms >= BEZEL_INITIAL_MS` (8000 ms), `in_initial` becomes false → `animating` false → `ring_static = true` → **zero ring writes**. Typical `drawn_centers` at that moment ≈ 264000/396000 (**~66%**). Ring frozen incomplete forever.
+
+```
+ideal_centers = cubic_ease(t) × 396000     ← what user expects to see
+actual_centers += min(ideal_delta, 4500)   ← what code draws
+at t=8s: animating=false, static=true      ← drawing stops regardless of actual
+```
+
+**Why incremental fix was necessary but insufficient:**
+- Incremental delta + `copy_from_slice` correctly fixed render ramp (66→672 ms prefix replay).
+- `MAX_CENTERS_PER_FRAME` was added to bound per-frame work but **breaks ease curve fidelity**.
+- Static mode correctly skips ring redraws for FPS, but triggers before ring complete.
+
+**Correct fix (see [`09-BESPOKE-FRAMEBUFFER-PROMPT.md`](09-BESPOKE-FRAMEBUFFER-PROMPT.md) P0):**
+- Build-time **ease schedule LUT**: `schedule[i]` = cumulative centers for frame i (integral of cubic/Bezier ease).
+- Per-frame target from schedule, not `clamp(ease(t) × len)`.
+- Phase exit only when `drawn_centers == schedule[last]` (catch-up frames allowed).
+- Remove `MAX_CENTERS_PER_FRAME` once schedule bounds deltas by construction.
+
+**Secondary cost to address in P1:** `copy_from_slice` 434 KiB PSRAM every frame (~part of 66 ms static render). `WatchFb` retained layers eliminate this.

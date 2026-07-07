@@ -12,7 +12,8 @@
 
 | Audience | First file |
 |----------|------------|
-| **New AI model (continuation)** | [`03-FOLLOWUP-PROMPT.md`](03-FOLLOWUP-PROMPT.md) — copy the prompt block into a new chat |
+| **New AI model (Raidal shader)** | [`03-FOLLOWUP-PROMPT.md`](03-FOLLOWUP-PROMPT.md) — copy the prompt block into a new chat |
+| **New AI model (`time-display` branch / watch OS)** | [`09-BESPOKE-FRAMEBUFFER-PROMPT.md`](09-BESPOKE-FRAMEBUFFER-PROMPT.md) — WatchFb + DMI + premium animation |
 | **Human developer** | [`01-PROJECT-HANDOFF.md`](01-PROJECT-HANDOFF.md) — full project bible |
 | **Performance engineer** | [`02-ANIMATION-BOTTLENECK.md`](02-ANIMATION-BOTTLENECK.md) — why it's slow and what to try next |
 
@@ -29,6 +30,8 @@
 | 05 | [`05-MEMORY-LINKER.md`](05-MEMORY-LINKER.md) | Buffer sizes, PSRAM vs internal SRAM, `dram2_seg` overflow, `low_rgb565` placement | Before allocator/linker changes |
 | 06 | [`06-OPTIMIZATION-CHRONOLOGY.md`](06-OPTIMIZATION-CHRONOLOGY.md) | Every optimization attempt, timings, lessons — avoid repeating failures | Before proposing "new" ideas |
 | 07 | [`07-PREBAKE-PIPELINE.md`](07-PREBAKE-PIPELINE.md) | Video/frame-loop fallback spec (back-burner only) | If live math cannot hit 6 FPS |
+| 08 | [`08-TIME-DISPLAY-HANDOFF.md`](08-TIME-DISPLAY-HANDOFF.md) | Digital clock + bezel ring chronology, profiling, failures | Before changing `clock.rs` |
+| **09** | [`09-BESPOKE-FRAMEBUFFER-PROMPT.md`](09-BESPOKE-FRAMEBUFFER-PROMPT.md) | **Master prompt: WatchFb + DMI + premium animation for watch OS** | **Paste into new chat for display stack work** |
 
 ---
 
@@ -56,7 +59,8 @@
 | `src/bin/main.rs` | Init, PMIC, display, loop, `eval=` / `upscale=` / `flush=` logging |
 | `src/raidal.rs` | Two-pass render: Q14 `eval_pass` → `upscale_pass` |
 | `src/qspi_bus.rs` | CO5300 QSPI, `flush_bytes` 8 KiB DMA chunks |
-| `build.rs` | `SIN_LUT` + `SIN_LUT_I16` Q14 tables |
+| `src/clock.rs` | Time display + bezel ring (`time-display` branch) |
+| `build.rs` | `SIN_LUT` + `SIN_LUT_I16` Q14 tables; Inter font; ease schedules (planned) |
 | `src/plasma.rs` | Legacy demo — **not** active renderer |
 
 ---
