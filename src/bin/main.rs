@@ -32,7 +32,10 @@ use openpocket::scenes::lock::Clock;
 use openpocket::time::WallClock;
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Print, don't freeze silently — dev builds have overflow checks and a
+    // silent panic looks exactly like a hang.
+    println!("PANIC: {}", info);
     loop {}
 }
 
@@ -158,6 +161,7 @@ fn main() -> ! {
         wfb,
         i2c,
         tp_int,
+        tp_reset,
         wall,
         clock,
         swipe: SwipeTracker::new(LCD_HEIGHT),

@@ -83,6 +83,12 @@ pub fn init(i2c: &mut I2c<'_, Blocking>, rst: &mut Output) -> Result<Attributes,
     // Back to normal reporting mode.
     i2c.write(CST9217_ADDR, &[0xD1, 0x09]).map_err(|_| ())?;
 
+    // Disable the auto low-power scan mode (SensorLib reg 0xD106): the chip
+    // otherwise drops its scan/report rate after ~10 s idle, which presented
+    // as "touch stops working once the startup animation ends". We are not
+    // power-constrained on the dev bench; revisit with the M5 power milestone.
+    i2c.write(CST9217_ADDR, &[0xD1, 0x06]).map_err(|_| ())?;
+
     Ok(Attributes {
         chip_type,
         res_x,
@@ -91,29 +97,31 @@ pub fn init(i2c: &mut I2c<'_, Blocking>, rst: &mut Output) -> Result<Attributes,
     })
 }
 
-/// Read the current report. `None` = I2C error or no valid report; a report
-/// with `pressed == false` is an explicit lift-off event.
-pub fn read_touch(i2c: &mut I2c<'_, Blocking>) -> Option<TouchPoint> {
+/// Read the current report. `Err` = I2C transaction failed (bus health signal);
+/// `Ok(None)` = no valid/new report; a report with `pressed == false` is an
+/// explicit lift-off event.
+pub fn read_touch(i2c: &mut I2c<'_, Blocking>) -> Result<Option<TouchPoint>, ()> {
     let mut buf = [0u8; 15]; // 2 fingers × 5 + 5, per reference driver
-    i2c.write_read(CST9217_ADDR, &[0xD0, 0x00], &mut buf).ok()?;
-    i2c.write(CST9217_ADDR, &[0xD0, 0x00, ACK]).ok()?;
+    i2c.write_read(CST9217_ADDR, &[0xD0, 0x00], &mut buf)
+        .map_err(|_| ())?;
+    i2c.write(CST9217_ADDR, &[0xD0, 0x00, ACK]).map_err(|_| ())?;
 
     if buf[6] != ACK {
-        return None;
+        return Ok(None);
     }
     let fingers = buf[5] & 0x7F;
     if fingers == 0 || fingers > 2 {
-        return None;
+        return Ok(None);
     }
     let evt = buf[0] & 0x0F;
     let x = ((buf[1] as u16) << 4) | ((buf[3] as u16) >> 4);
     let y = ((buf[2] as u16) << 4) | ((buf[3] as u16) & 0x0F);
-    Some(TouchPoint {
+    Ok(Some(TouchPoint {
         x,
         y,
         fingers,
         pressed: evt == 0x06,
-    })
+    }))
 }
 
 fn delay_ms(ms: u32) {

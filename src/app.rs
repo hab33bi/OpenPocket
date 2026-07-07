@@ -9,7 +9,7 @@
 //! and spends the cadence remainder polling the touch INT pin — so touch reads
 //! happen within microseconds of the controller asserting INT.
 
-use esp_hal::gpio::Input;
+use esp_hal::gpio::{Input, Output};
 use esp_hal::i2c::master::I2c;
 use esp_hal::time::{Duration, Instant};
 use esp_hal::Blocking;
@@ -26,6 +26,15 @@ use crate::time::WallClock;
 /// Fixed 20 fps cadence — matches TARGET_FPS in build.rs so the frame-indexed
 /// ease schedules take exactly their designed wall-clock duration.
 const FRAME_US: u64 = 50_000;
+/// Minimum gap between scene switches — a second debounce layer above the
+/// recognizer's tap refractory, so the scene can never flicker.
+const SCENE_COOLDOWN_MS: u64 = 400;
+/// Swipe-up release verdict: unlock when the drag traveled this far…
+const UNLOCK_DY: i32 = 466 / 4;
+/// …or released with at least this upward velocity (Q8 px/ms ≈ 0.5 px/ms).
+const UNLOCK_VEL_Q8: i32 = 128;
+/// Consecutive touch I2C errors before the controller is re-initialized.
+const TOUCH_REINIT_ERRORS: u32 = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Scene {
@@ -33,11 +42,19 @@ enum Scene {
     Unlocked,
 }
 
+/// Scene-changing intents produced by the touch poll, applied at frame top.
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    Toggle,
+    Unlock,
+}
+
 pub struct App<'a, 'd> {
     pub bus: QspiBus<'d>,
     pub wfb: WatchFb<'a>,
     pub i2c: I2c<'d, Blocking>,
     pub tp_int: Input<'d>,
+    pub tp_reset: Output<'d>,
     pub wall: WallClock,
     pub clock: lock::Clock,
     pub swipe: SwipeTracker,
@@ -55,10 +72,14 @@ impl<'a, 'd> App<'a, 'd> {
         println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
         let mut scene = Scene::Locked;
-        let mut tap: Option<(u16, u16)> = None;
+        let mut action: Option<Action> = None;
+        let mut last_scene_switch = Instant::now();
         let mut last_report = Instant::now();
         let mut ema_fps: f32 = 0.0;
         let mut touch_log_ctr: u32 = 0;
+        let mut last_touch_read = Instant::now();
+        let mut i2c_errors: u32 = 0;
+        let mut consec_errors: u32 = 0;
 
         loop {
             let frame_start = Instant::now();
@@ -67,20 +88,34 @@ impl<'a, 'd> App<'a, 'd> {
             self.wall.maybe_resync(&mut self.i2c);
             let now = self.wall.now();
 
-            // Temporary M3 trigger: a confirmed tap toggles the scene.
-            if tap.take().is_some() {
-                scene = match scene {
-                    Scene::Locked => {
-                        unlocked::draw(&mut self.wfb);
-                        println!("scene: -> Unlocked");
-                        Scene::Unlocked
-                    }
-                    Scene::Unlocked => {
-                        self.clock.repaint_full(&mut self.wfb);
-                        println!("scene: -> Locked");
-                        Scene::Locked
-                    }
+            // Apply at most one scene change per cooldown window (debounce
+            // layer 2 — layer 1 is the recognizer's tap refractory).
+            if let Some(a) = action.take() {
+                let cooled = last_scene_switch.elapsed()
+                    >= Duration::from_millis(SCENE_COOLDOWN_MS);
+                let next = match (a, scene) {
+                    _ if !cooled => None,
+                    // Swipe-up unlock (pre-M4: instant switch on release verdict).
+                    (Action::Unlock, Scene::Locked) => Some(Scene::Unlocked),
+                    // Temporary M3 trigger: a debounced tap toggles either way.
+                    (Action::Toggle, Scene::Locked) => Some(Scene::Unlocked),
+                    (Action::Toggle, Scene::Unlocked) => Some(Scene::Locked),
+                    _ => None,
                 };
+                if let Some(next) = next {
+                    last_scene_switch = Instant::now();
+                    match next {
+                        Scene::Unlocked => {
+                            unlocked::draw(&mut self.wfb);
+                            println!("scene: -> Unlocked");
+                        }
+                        Scene::Locked => {
+                            self.clock.repaint_full(&mut self.wfb);
+                            println!("scene: -> Locked");
+                        }
+                    }
+                    scene = next;
+                }
             }
 
             let render_start = Instant::now();
@@ -130,8 +165,18 @@ impl<'a, 'd> App<'a, 'd> {
                 frame_start + Duration::from_micros(FRAME_US),
                 anim_start,
                 &mut touch_log_ctr,
-                &mut tap,
+                &mut action,
+                &mut last_touch_read,
+                &mut i2c_errors,
+                &mut consec_errors,
             );
+
+            // Bus-health recovery: repeated touch read failures → re-init chip.
+            if consec_errors >= TOUCH_REINIT_ERRORS {
+                consec_errors = 0;
+                let ok = cst9217::init(&mut self.i2c, &mut self.tp_reset).is_ok();
+                println!("touch: reinit after errors ok={}", ok as u8);
+            }
 
             let inst_fps = if work_ms > 0 { 1000.0 / work_ms as f32 } else { 0.0 };
             if flushed {
@@ -139,13 +184,15 @@ impl<'a, 'd> App<'a, 'd> {
             }
             if last_report.elapsed() >= Duration::from_secs(1) {
                 println!(
-                    "clock fps~{:.1} render={}ms flush={}ms({}) spans={} work={}ms | centers={} cdelta={} px_writes={}",
+                    "clock fps~{:.1} render={}ms flush={}ms({}) spans={} work={}ms terr={} int={} | centers={} cdelta={} px_writes={}",
                     ema_fps,
                     render_ms,
                     flush_ms,
                     flush_mode,
                     span_count,
                     work_ms,
+                    i2c_errors,
+                    self.tp_int.is_low() as u8,
                     self.clock.last_bezel_centers,
                     self.clock.last_bezel_center_delta,
                     self.clock.last_bezel_writes
@@ -156,18 +203,38 @@ impl<'a, 'd> App<'a, 'd> {
     }
 
     /// Busy-wait until `deadline` while polling the touch INT pin; INT asserted
-    /// → read the report immediately (latest wins) and feed the recognizer.
+    /// → read the report (latest wins, rate-limited to one I2C transaction per
+    /// 2 ms so a held-low INT can't hammer the shared bus) and feed the
+    /// recognizer. A scene-changing gesture breaks out early so the switch
+    /// lands on the very next frame.
+    #[allow(clippy::too_many_arguments)]
     fn poll_touch_until(
         &mut self,
         deadline: Instant,
         anim_start: Instant,
         log_ctr: &mut u32,
-        tap: &mut Option<(u16, u16)>,
+        action: &mut Option<Action>,
+        last_read: &mut Instant,
+        i2c_errors: &mut u32,
+        consec_errors: &mut u32,
     ) {
         loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
-            let report = if self.tp_int.is_low() {
-                cst9217::read_touch(&mut self.i2c)
+            let report = if self.tp_int.is_low()
+                && last_read.elapsed() >= Duration::from_millis(2)
+            {
+                *last_read = Instant::now();
+                match cst9217::read_touch(&mut self.i2c) {
+                    Ok(r) => {
+                        *consec_errors = 0;
+                        r
+                    }
+                    Err(()) => {
+                        *i2c_errors += 1;
+                        *consec_errors += 1;
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -188,19 +255,22 @@ impl<'a, 'd> App<'a, 'd> {
                     }
                 }
                 GestureEvent::DragEnd { dy, vel_q8 } => {
-                    let unlock = dy as i32 > LCD_HEIGHT as i32 / 3 || vel_q8 > 128;
+                    let unlock = dy as i32 > UNLOCK_DY || vel_q8 > UNLOCK_VEL_Q8;
                     println!(
                         "gesture: release dy={dy} vel_q8={vel_q8} -> {}",
                         if unlock { "unlock" } else { "springback" }
                     );
+                    if unlock {
+                        *action = Some(Action::Unlock);
+                    }
                 }
                 GestureEvent::Tap { x, y } => {
                     println!("gesture: tap x={x} y={y}");
-                    *tap = Some((x, y));
+                    *action = Some(Action::Toggle);
                 }
                 GestureEvent::None => {}
             }
-            if Instant::now() >= deadline {
+            if action.is_some() || Instant::now() >= deadline {
                 break;
             }
             core::hint::spin_loop();

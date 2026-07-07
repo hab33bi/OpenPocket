@@ -46,15 +46,17 @@ const FADE_MS: u32 = 2_400;
 /// Anim-list layout: TAPS entries per angle step (dr = -HALF_T ..= HALF_T).
 const TAPS: usize = (BEZEL_THICKNESS + 1) as usize;
 const HALF_T: i32 = BEZEL_THICKNESS / 2;
-/// Rounded end-cap zone in angle steps (~5 px of arc length at r=223): ring
-/// thickness tapers to a point on a semicircular profile at each arc end.
-const CAP_STEPS: i32 = 64;
 /// Faded-edge window at each arc end, in angle steps (100 steps = 1°): alpha
 /// ramps 0 → solid over this span, giving both ends a soft comet tip.
 const FADE_STEPS: i32 = 400;
+/// Thickness-taper zone: the ring narrows to a point on a semicircular profile
+/// across the whole fade window. (Was 64 steps ≈ 2.5 px of arc — the ring hit
+/// full thickness immediately, leaving a blunt dim stub that read as a square
+/// at the arc origin during the startup sweep.)
+const CAP_STEPS: i32 = FADE_STEPS;
 /// Frames to blend the two faded rounded ends into a solid seam once the ring
 /// closes (Heal), and back out again on minute change (Unheal).
-const HEAL_FRAMES: u32 = 8;
+const HEAL_FRAMES: u32 = 12;
 
 /// Bezel animation phase, advanced by frame index against the build-time schedules.
 /// A sweep phase exits only when its schedule is consumed AND the ring reached the
@@ -198,9 +200,13 @@ impl Clock {
             }
         }
 
-        // Startup fade, quantized to 32 levels: retained text and the ring's fixed
-        // start window only redraw when the level steps (~32× total), not every
-        // frame — keeps fade-period frames inside the 20 fps budget.
+        // Startup fade applies to TEXT ONLY, quantized to 32 levels so the
+        // retained text redraws ~32× total during the fade, not every frame.
+        // The ring always renders at full brightness — its comet-tip end
+        // profile is the designed fade. (Mixing the global fade into the ring
+        // left a brightness gradient along the swept body: a bright refreshed
+        // start-window block against a dim stale body — the "square" — and a
+        // visible flash when the one-shot solidity blit normalized it.)
         let fade_q14 = if elapsed_ms < FADE_MS {
             const LEVELS: u32 = 32;
             let level = (elapsed_ms * LEVELS / FADE_MS).min(LEVELS - 1);
@@ -208,11 +214,10 @@ impl Clock {
         } else {
             Q
         };
-        let fade_changed = fade_q14 != self.last_text.2;
 
         let prev_centers = self.drawn_centers;
         let mut ring_acc = RectAcc::empty();
-        let bezel_writes = self.step_bezel(wfb.buf_mut(), fade_q14, fade_changed, &mut ring_acc);
+        let bezel_writes = self.step_bezel(wfb.buf_mut(), &mut ring_acc);
         if !ring_acc.is_empty() {
             // +1 slack: stamps are 3×3 around each accumulated center.
             wfb.mark_rect(
@@ -315,26 +320,21 @@ impl Clock {
 
     /// Advance the bezel animation one frame against its build-time schedule.
     /// Per-frame deltas are bounded by schedule construction — no runtime cap.
-    fn step_bezel(
-        &mut self,
-        fb: &mut [u8],
-        fade_q14: i32,
-        fade_changed: bool,
-        acc: &mut RectAcc,
-    ) -> usize {
+    /// The ring always renders at full brightness (startup fade is text-only).
+    fn step_bezel(&mut self, fb: &mut [u8], acc: &mut RectAcc) -> usize {
         match self.phase {
             BezelPhase::Static => 0,
             BezelPhase::Heal => {
                 // Ring closed with two faded rounded ends meeting at the seam;
                 // lift both end windows toward solid over HEAL_FRAMES.
                 let lift = (self.frame_in_phase + 1) as i32;
-                let mut writes =
-                    self.redraw_end_windows(fb, fade_q14, lift, HEAL_FRAMES as i32, acc);
+                let mut writes = self.redraw_end_windows(fb, lift, HEAL_FRAMES as i32, acc);
                 self.frame_in_phase += 1;
                 if self.frame_in_phase >= HEAL_FRAMES {
-                    // One-shot deduped full blit normalizes solidity/brightness,
-                    // then the complete ring is retained on the canvas.
-                    let (hi, lo) = bezel_color_bytes(fade_q14);
+                    // One-shot deduped full blit normalizes solidity, then the
+                    // complete ring is retained on the canvas. Invisible as a
+                    // brightness change — the body was drawn at full color.
+                    let (hi, lo) = bezel_color_bytes(Q);
                     writes += self.blit_full_ring(fb, hi, lo, acc);
                     self.phase = BezelPhase::Static;
                 }
@@ -344,8 +344,7 @@ impl Clock {
                 // Reverse of Heal: solid seam blends back into two faded ends
                 // before the undraw sweep starts.
                 let lift = (HEAL_FRAMES - 1 - self.frame_in_phase) as i32;
-                let writes =
-                    self.redraw_end_windows(fb, fade_q14, lift, HEAL_FRAMES as i32, acc);
+                let writes = self.redraw_end_windows(fb, lift, HEAL_FRAMES as i32, acc);
                 self.frame_in_phase += 1;
                 if self.frame_in_phase >= HEAL_FRAMES {
                     self.phase = BezelPhase::Undraw;
@@ -362,7 +361,7 @@ impl Clock {
 
                 let idx = (self.frame_in_phase as usize).min(schedule.len() - 1);
                 let target = self.scale_sched(schedule[idx]);
-                let writes = self.apply_bezel_target(fb, target, fade_q14, fade_changed, acc);
+                let writes = self.apply_bezel_target(fb, target, acc);
                 self.frame_in_phase = self.frame_in_phase.saturating_add(1);
 
                 // Exit on completion, never wall clock: schedule consumed AND ring at
@@ -402,14 +401,7 @@ impl Clock {
     /// Grow: redraw [prev_tip_fade_start .. target] so last frame's faded tip
     /// solidifies as the arc advances. Shrink: black the removed segment, then
     /// redraw the fade window behind the new tip.
-    fn apply_bezel_target(
-        &mut self,
-        fb: &mut [u8],
-        target: usize,
-        fade_q14: i32,
-        fade_changed: bool,
-        acc: &mut RectAcc,
-    ) -> usize {
+    fn apply_bezel_target(&mut self, fb: &mut [u8], target: usize, acc: &mut RectAcc) -> usize {
         let len = self.bezel_offsets_anim.len();
         let target = target.min(len);
         let prev = self.drawn_centers;
@@ -418,20 +410,20 @@ impl Clock {
 
         if target > prev {
             let lo = prev.saturating_sub(fade_entries);
-            writes += self.redraw_arc_range(fb, lo, target, target, fade_q14, 0, 1, acc);
+            writes += self.redraw_arc_range(fb, lo, target, target, 0, 1, acc);
         } else if target < prev {
             for i in target..prev {
                 writes += black_bezel_3x3(fb, self.bezel_offsets_anim[i], acc);
             }
             let lo = target.saturating_sub(fade_entries);
-            writes += self.redraw_arc_range(fb, lo, target, target, fade_q14, 0, 1, acc);
+            writes += self.redraw_arc_range(fb, lo, target, target, 0, 1, acc);
         }
 
-        // Refresh the fixed start end when the startup fade's brightness level
-        // actually stepped, or while the moving tip's window overlaps it.
-        if target > 0 && (fade_changed || target < 2 * fade_entries) {
+        // Refresh the fixed start end while the moving tip's window overlaps it
+        // (their combined profile changes as the tip crosses through).
+        if target > 0 && target < 2 * fade_entries {
             let hi_end = target.min(fade_entries);
-            writes += self.redraw_arc_range(fb, 0, hi_end, target, fade_q14, 0, 1, acc);
+            writes += self.redraw_arc_range(fb, 0, hi_end, target, 0, 1, acc);
         }
 
         self.drawn_centers = target;
@@ -440,28 +432,11 @@ impl Clock {
 
     /// Redraw both end windows of the closed ring (fixed start + tip at list end)
     /// with the end profile lifted `lift/den` toward solid (Heal/Unheal seam blend).
-    fn redraw_end_windows(
-        &self,
-        fb: &mut [u8],
-        fade_q14: i32,
-        lift: i32,
-        den: i32,
-        acc: &mut RectAcc,
-    ) -> usize {
+    fn redraw_end_windows(&self, fb: &mut [u8], lift: i32, den: i32, acc: &mut RectAcc) -> usize {
         let len = self.bezel_offsets_anim.len();
         let fade_entries = (FADE_STEPS as usize * TAPS).min(len);
-        let mut writes =
-            self.redraw_arc_range(fb, 0, fade_entries, len, fade_q14, lift, den, acc);
-        writes += self.redraw_arc_range(
-            fb,
-            len - fade_entries,
-            len,
-            len,
-            fade_q14,
-            lift,
-            den,
-            acc,
-        );
+        let mut writes = self.redraw_arc_range(fb, 0, fade_entries, len, lift, den, acc);
+        writes += self.redraw_arc_range(fb, len - fade_entries, len, len, lift, den, acc);
         writes
     }
 
@@ -477,7 +452,6 @@ impl Clock {
         lo: usize,
         hi: usize,
         arc_end: usize,
-        fade_q14: i32,
         lift: i32,
         den: i32,
         acc: &mut RectAcc,
@@ -506,7 +480,7 @@ impl Clock {
                     alpha += (256 - alpha) * lift / den;
                     hw += (HALF_T - hw) * lift / den;
                 }
-                col = bezel_color_bytes((fade_q14 * alpha) >> 8);
+                col = bezel_color_bytes((Q * alpha) >> 8);
             }
             (alpha, hw, col)
         };
