@@ -1,0 +1,30 @@
+[package]
+edition      = "2024"
+name         = "pocket-watch-smoke-test"
+rust-version = "1.88"
+version      = "0.1.0"
+
+[[bin]]
+name = "pocket-watch-smoke-test"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"] }
+
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+
+critical-section = "1.2.0"
+esp-alloc        = "0.10.0"
+esp-println = { version = "0.13", features = ["esp32s3", "critical-section"] }
+libm        = "0.2"
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# Shader hot path needs speed even in dev flashes.
+opt-level = 3
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 3
