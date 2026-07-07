@@ -12,6 +12,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use libm::atan2f;
 
+#[cfg(feature = "esp")]
 use esp_hal::ram;
 
 // Fixed-size for RENDER_DIVISOR=3 (156×156). Enables #[ram(reclaimed)] SRAM placement
@@ -24,7 +25,12 @@ pub const LOW_PIXELS: usize = (LOW_W as usize) * (LOW_H as usize);
 /// 48 KiB — must not overflow dram2_seg.
 /// Board spec: 512 KiB internal SRAM + stacked 8 MB PSRAM (ESP32-S3R8, per Waveshare docs).
 /// Uses MaybeUninit because reclaimed section requires Uninit marker.
+#[cfg(feature = "esp")]
 #[ram(reclaimed)]
+pub static mut LOW_RGB565: [MaybeUninit<u16>; LOW_PIXELS] =
+    [const { MaybeUninit::uninit() }; LOW_PIXELS];
+
+#[cfg(not(feature = "esp"))]
 pub static mut LOW_RGB565: [MaybeUninit<u16>; LOW_PIXELS] =
     [const { MaybeUninit::uninit() }; LOW_PIXELS];
 
@@ -51,11 +57,21 @@ unsafe fn low_rgb565() -> &'static [u16; LOW_PIXELS] {
 // Use MaybeUninit to satisfy esp_hal Uninit trait for reclaimed section.
 pub const ROW_PACK_LEN: usize = (LOW_W as usize) * (LAYERS + 1);
 
+#[cfg(feature = "esp")]
 #[ram(reclaimed)]
 pub static mut SCRATCH_ROW0: [MaybeUninit<i32>; ROW_PACK_LEN] =
     [const { MaybeUninit::uninit() }; ROW_PACK_LEN];
 
+#[cfg(not(feature = "esp"))]
+pub static mut SCRATCH_ROW0: [MaybeUninit<i32>; ROW_PACK_LEN] =
+    [const { MaybeUninit::uninit() }; ROW_PACK_LEN];
+
+#[cfg(feature = "esp")]
 #[ram(reclaimed)]
+pub static mut SCRATCH_ROW1: [MaybeUninit<i32>; ROW_PACK_LEN] =
+    [const { MaybeUninit::uninit() }; ROW_PACK_LEN];
+
+#[cfg(not(feature = "esp"))]
 pub static mut SCRATCH_ROW1: [MaybeUninit<i32>; ROW_PACK_LEN] =
     [const { MaybeUninit::uninit() }; ROW_PACK_LEN];
 
@@ -468,7 +484,7 @@ fn build_upscale_table(out_size: u16, low_size: u16, div: u16) -> Vec<UpSample1D
 
 #[inline(always)]
 #[unsafe(link_section = ".iram0.text")]
-fn lut_sin_cos_q14(phase: i32) -> i32 {
+pub fn lut_sin_cos_q14(phase: i32) -> i32 {
     let mut x = phase % TAU_Q14;
     if x < 0 {
         x += TAU_Q14;
@@ -483,7 +499,7 @@ fn lut_sin_cos_q14(phase: i32) -> i32 {
 }
 
 #[inline(always)]
-fn lut_cos_angle_q14(angle_rad: f32) -> i32 {
+pub fn lut_cos_angle_q14(angle_rad: f32) -> i32 {
     let tau = core::f32::consts::TAU;
     let mut a = angle_rad % tau;
     if a < 0.0 {
@@ -531,7 +547,7 @@ fn fast_tanh_q14(x: i32) -> i32 {
 }
 
 #[inline(always)]
-fn q14_rgb_to_rgb565(r: i32, g: i32, b: i32) -> u16 {
+pub fn q14_rgb_to_rgb565(r: i32, g: i32, b: i32) -> u16 {
     let clamp = |v: i32| v.clamp(0, Q) as u32;
     let r5 = (clamp(r) * 31 / Q as u32) as u16;
     let g6 = (clamp(g) * 63 / Q as u32) as u16;

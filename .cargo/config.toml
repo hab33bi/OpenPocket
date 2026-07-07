@@ -1,16 +1,18 @@
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor --chip esp32s3"
-
-[env]
-
-[build]
 rustflags = [
   "-C", "link-arg=-nostartfiles",
   "-Z", "stack-protector=all",
   "-C", "target-cpu=esp32s3",
 ]
 
+[env]
+
+[build]
 target = "xtensa-esp32s3-none-elf"
+
+# Note: for building the host `baker` tool (pre-bake asset generator), override like this:
+# cargo build --bin baker --features baker --no-default-features --target x86_64-pc-windows-msvc --config 'build.target="x86_64-pc-windows-msvc"' --config 'build.rustflags=[]'
 
 [unstable]
 build-std = ["alloc", "core"]

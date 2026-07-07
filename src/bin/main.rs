@@ -22,7 +22,13 @@ use esp_println::println;
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use pocket_watch_smoke_test::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
-use pocket_watch_smoke_test::raidal::{Raidal2, Raidal2Config, Scratch, LOW_H, LOW_W};
+use pocket_watch_smoke_test::raidal::{Scratch, LOW_W};
+#[cfg(not(feature = "prebake"))]
+use pocket_watch_smoke_test::cloud::Cloud;
+#[cfg(not(feature = "prebake"))]
+use pocket_watch_smoke_test::raidal::{LOW_H, Raidal2Config}; // keep for compat if needed
+#[cfg(not(feature = "prebake"))]
+use pocket_watch_smoke_test::raidal::Raidal2; // optional fallback
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -38,6 +44,7 @@ const LCD_HEIGHT: u16 = 466;
 const LCD_COL_OFFSET: u16 = 6;
 const AXP2101_ADDR: u8 = 0x34;
 
+#[cfg(not(feature = "prebake"))]
 const TARGET_FRAME_US: u64 = 16_667;
 const FB_LEN: usize = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
 
@@ -218,188 +225,77 @@ fn main() -> ! {
     bus.write_c8d16d16(0x2B, 0, LCD_HEIGHT - 1);
     bus.write_command(0x2C);
 
+    #[cfg(not(feature = "prebake"))]
+    {
+    // animation-cloud: live Animated Cloud (HeroWave ported).
+    // No prebake. Optimized live: Q14/LUT, low-res div=2, tables for upscale, max speed.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
-    // Double framebuffer for pipeline: render to one while the other is being flushed by app core.
     let mut fb0 = vec![0u8; byte_count];
-    let mut fb1 = vec![0u8; byte_count];
-    let mut use_fb0 = true;
-    // Publish current for diagnostics / upscale (we will update the ptr each time).
-    unsafe {
-        let p = &raw mut pocket_watch_smoke_test::raidal::FB_PTR;
-        (*p).store(fb0.as_mut_ptr(), Ordering::SeqCst);
-    }
     let mut dma_scratch = vec![0u8; DMA_CHUNK_BYTES];
 
-    // Use compile-time fixed low size for SRAM static (div=3). Matches Raidal2::LOW_W/H.
-    let low_w = LOW_W;
-    let low_h = LOW_H;
-
-    println!("Building static cache + upscale map...");
-    let cache_start = Instant::now();
-    let mut shader = Raidal2::new(
-        Raidal2Config {
-            render_divisor: RENDER_DIVISOR,
-            time_scale: 1.0,
-        },
+    println!("Animated Cloud (live only, no prebake) init...");
+    let init_start = Instant::now();
+    let mut cloud = Cloud::new(
+        pocket_watch_smoke_test::cloud::CloudConfig { time_scale: 1.0 },
         LCD_WIDTH,
         LCD_HEIGHT,
     );
-    // Publish the instance so the parked app-core worker can call methods on it (row eval).
-    unsafe {
-        let p = &raw mut pocket_watch_smoke_test::raidal::RAIDAL_PTR;
-        (*p).store(&mut shader as *mut _, Ordering::SeqCst);
-    }
-    let mut scratch = Scratch::new(low_w);
-    // Secondary scratch for potential dual-core app core use (see plan).
-    let _scratch_secondary = Scratch::new_secondary(low_w);
+    let low_size = (LCD_WIDTH / 2) as usize * (LCD_HEIGHT / 2) as usize;
+    let mut low_buf = vec![0u16; low_size];
     println!(
-        "Init {} ms | eval {}x{} | FB {} KiB",
-        cache_start.elapsed().as_millis(),
-        low_w,
-        low_h,
+        "Cloud ready {} ms | low {}x{} | FB {} KiB",
+        init_start.elapsed().as_millis(),
+        LCD_WIDTH / 2,
+        LCD_HEIGHT / 2,
         byte_count / 1024
     );
 
-    // Diagnostic: low_rgb565 placement.
-    // Board: ESP32-S3R8 — internal SRAM ~512 KiB total, stacked 8MB PSRAM at ~0x3C000000.
-    // We want LOW_RGB565 in #[ram(reclaimed)] static (fast internal), **not** from the heap.
-    let low_ptr = pocket_watch_smoke_test::raidal::low_rgb565_ptr() as usize;
-    println!("low_rgb565 ptr: 0x{:08x}", low_ptr);
-    if (0x3C000000..0x3D000000).contains(&low_ptr) {
-        println!("  WARNING: appears to be in PSRAM region — placement failed!");
-    } else {
-        println!("  Appears internal (good). Note: symbol may show under HEAP if reclaimed region overlaps allocator arena.");
-    }
-
     let anim_start = Instant::now();
-    shader.init_time(0);
-    render_timed(&mut shader, &mut scratch, &mut fb0);
+    cloud.update_time(0);
+    cloud.eval_pass(&mut low_buf);
+    cloud.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
     bus.flush_bytes(&fb0, &mut dma_scratch);
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
+    // Live cloud loop (inside cfg for scope, max speed)
     let mut last_report = Instant::now();
     let mut ema_fps: f32 = 0.0;
-
-    // The worker FLUSH offload + pending logic is bypassed for now to fix the
-    // "stuck after first frame" issue. We do direct flush after every render.
-    let _pending_flush = false;
-
-    println!("Entering main loop with synchronous flush (worker FLUSH offload bypassed to fix first-frame glitch).");
-    println!("Once multi-frame updates are confirmed, we can re-enable offload or proceed to pre-bake plan.");
+    let low_w = LCD_WIDTH / 2;
+    let low_h = LCD_HEIGHT / 2;
+    let mut low_buf = vec![0u16; (low_w as usize)*(low_h as usize)];
 
     loop {
         let frame_start = Instant::now();
         let time_ms = anim_start.elapsed().as_millis() as u32;
-
-        shader.update_time(time_ms);
-        let current_fb = if use_fb0 { &mut fb0 } else { &mut fb1 };
-
-        // Update FB_PTR every frame so the worker's upscale_rows half writes to the
-        // correct double-buffer (previously only pointed at fb0, breaking fb1 band).
-        unsafe {
-            let p = &raw mut pocket_watch_smoke_test::raidal::FB_PTR;
-            (*p).store(current_fb.as_mut_ptr(), Ordering::SeqCst);
-        }
-
-        let (eval_ms, upscale_ms) = render_timed(&mut shader, &mut scratch, current_fb);
-
-        // === FIX for "stuck after first frame" glitch ===
-        // The previous double-fb + worker FLUSH signal + pending_flush wait was not
-        // reliably completing (worker inside long flush_bytes, bus aliasing via BUS_STATIC,
-        // or signal visibility after first use).
-        // For now we do synchronous flush on core0 after every render. This guarantees
-        // repeated display updates using the exact path that worked for the visible first frame.
-        // Animation will run (at render + ~25 ms cost). Overlap can be re-added later or
-        // we move to the pre-bake plan once this base is solid.
-        //
-        // We still keep the per-frame FB_PTR + render_timed (dual compute split) because
-        // that part succeeded for the initial frame.
+        cloud.update_time(time_ms);
+        cloud.eval_pass(&mut low_buf);
+        cloud.upscale_rows(&low_buf, &mut fb0, 0, LCD_HEIGHT as usize);
         bus.write_command(0x2C);
-        bus.flush_bytes(current_fb, &mut dma_scratch);
+        bus.flush_bytes(&mut fb0, &mut dma_scratch);
 
-        // pending flush logic bypassed for now (see comment at declaration)
-
-        // Swap render target for next frame (simple double-buffering of the *render* side).
-        use_fb0 = !use_fb0;
-
-        let flush_ms = 26; // offloaded to app core; approximate for log.
-
-        let total_ms = frame_start.elapsed().as_millis();
-        let inst_fps = if total_ms > 0 {
-            1000.0 / total_ms as f32
-        } else {
-            0.0
-        };
-        ema_fps = if ema_fps < 1.0 {
-            inst_fps
-        } else {
-            ema_fps * 0.9 + inst_fps * 0.1
-        };
-
+        let total_ms = frame_start.elapsed().as_millis() as u32;
+        let inst_fps = if total_ms > 0 { 1000.0 / total_ms as f32 } else { 0.0 };
+        ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
         if last_report.elapsed() >= Duration::from_secs(1) {
-            println!(
-                "fps~{:.1} eval={eval_ms}ms upscale={upscale_ms}ms flush={flush_ms}ms total={total_ms}ms",
-                ema_fps
-            );
+            println!("cloud fps~{:.1} total={}ms", ema_fps, total_ms);
             last_report = Instant::now();
         }
-
-        delay_until(frame_start + Duration::from_micros(TARGET_FRAME_US));
     }
+    }
+
+    // prebake disabled on animation-cloud branch (focus on live cloud, minimal flash).
+    // The prebake experiment (80% flash) is noted as "great experiment" but not for this.
+    #[cfg(feature = "prebake")]
+    {
+        // prebake not built for this branch
+        loop { /* never */ }
+    }
+
+    // (the live cloud loop is inside the previous #[cfg(not(prebake))] block above for scope)
 }
 
-fn render_timed(
-    shader: &mut Raidal2,
-    scratch: &mut Scratch,
-    framebuffer: &mut [u8],
-) -> (u64, u64) {
-    // Use the known fixed low size (div=3). Dual splits rows. Complete all eval before any upscale to avoid memory contention.
-    let lh = LOW_H as usize;
-    let mid = lh / 2;
-
-    let t0 = Instant::now();
-
-    // Signal core1 for its eval half first
-    EVAL_ROW_START.store(mid, Ordering::SeqCst);
-    EVAL_ROW_END.store(lh, Ordering::SeqCst);
-    CORE1_READY.store(true, Ordering::SeqCst);
-    fence(Ordering::SeqCst);
-
-    // Core0 does its eval half in parallel
-    shader.eval_rows(scratch, 0, mid);
-
-    // Wait for core1 to finish its eval half (full low buffer ready)
-    while !CORE1_DONE.load(Ordering::SeqCst) {
-        fence(Ordering::SeqCst);
-        core::hint::spin_loop();
-    }
-    CORE1_DONE.store(false, Ordering::SeqCst);
-
-    let eval_ms = t0.elapsed().as_millis();
-
-    let t1 = Instant::now();
-
-    // Now full low is ready — do parallel upscale
-    let mid_out = (LCD_HEIGHT / 2) as usize;
-    UPSCALE_ROW_START.store(mid_out, Ordering::SeqCst);
-    UPSCALE_ROW_END.store(LCD_HEIGHT as usize, Ordering::SeqCst);
-    UPSCALE_CORE1_READY.store(true, Ordering::SeqCst);
-    fence(Ordering::SeqCst);
-
-    // Core0 does its upscale band
-    shader.upscale_rows(framebuffer, 0, mid_out);
-
-    // Wait for core1 upscale band
-    while !UPSCALE_CORE1_DONE.load(Ordering::SeqCst) {
-        fence(Ordering::SeqCst);
-        core::hint::spin_loop();
-    }
-    UPSCALE_CORE1_DONE.store(false, Ordering::SeqCst);
-
-    let upscale_ms = t1.elapsed().as_millis();
-
-    (eval_ms, upscale_ms)
-}
+// render_timed removed for animation-cloud live cloud path (simpler single-core eval for now;
+// full dual-core row split from main branch can be re-applied to Cloud::eval_rows for max FPS).
 
 fn delay_until(deadline: Instant) {
     while Instant::now() < deadline {}

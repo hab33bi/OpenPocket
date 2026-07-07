@@ -8,14 +8,27 @@ version      = "0.1.0"
 name = "pocket-watch-smoke-test"
 path = "./src/bin/main.rs"
 
+[[bin]]
+name = "baker"
+path = "src/bin/baker.rs"
+required-features = ["baker"]
+
+[features]
+default = ["esp"]
+esp = ["dep:esp-hal", "dep:esp-bootloader-esp-idf", "dep:critical-section", "dep:esp-alloc", "dep:esp-println"]
+# prebake enables the high-FPS pre-baked animation player (implies esp)
+prebake = ["esp"]
+# baker enables the host-side asset generator tool (build with host target, NOT the ESP target)
+baker = []
+
 [dependencies]
-esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"] }
+esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"], optional = true }
 
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"], optional = true }
 
-critical-section = "1.2.0"
-esp-alloc        = "0.10.0"
-esp-println = { version = "0.13", features = ["esp32s3", "critical-section"] }
+critical-section = { version = "1.2.0", optional = true }
+esp-alloc        = { version = "0.10.0", optional = true }
+esp-println = { version = "0.13", features = ["esp32s3", "critical-section"], optional = true }
 libm        = "0.2"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
