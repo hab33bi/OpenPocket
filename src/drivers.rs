@@ -3,4 +3,6 @@
 #[cfg(feature = "esp")]
 pub mod axp2101;
 #[cfg(feature = "esp")]
+pub mod cst9217;
+#[cfg(feature = "esp")]
 pub mod pcf85063;

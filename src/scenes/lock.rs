@@ -295,6 +295,24 @@ impl Clock {
         core::str::from_utf8(&self.date_buf[..self.date_len]).unwrap_or("")
     }
 
+    /// Repaint the whole lock scene from scratch (returning from another scene
+    /// that overwrote the canvas). Ring lands complete + static; text redraws
+    /// on the next `render` call (cache invalidated). Marks the frame dirty.
+    pub fn repaint_full(&mut self, wfb: &mut WatchFb) {
+        self.phase = BezelPhase::Static;
+        self.frame_in_phase = 0;
+        self.drawn_centers = self.bezel_offsets_anim.len();
+        self.last_text = (255, 255, -1, 0, 0, 0);
+        self.last_text_bbox = (0, 0, -1, -1);
+
+        let fb = wfb.buf_mut();
+        fb.fill(0);
+        let (hi, lo) = bezel_color_bytes(Q);
+        let mut acc = RectAcc::empty();
+        self.blit_full_ring(fb, hi, lo, &mut acc);
+        wfb.mark_rect(0, 0, W - 1, H - 1);
+    }
+
     /// Advance the bezel animation one frame against its build-time schedule.
     /// Per-frame deltas are bounded by schedule construction — no runtime cap.
     fn step_bezel(

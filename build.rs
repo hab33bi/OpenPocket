@@ -3,6 +3,7 @@ fn main() {
     generate_inter_font();
     generate_bezel_schedules();
     generate_build_time();
+    generate_spike_asset();
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
@@ -61,6 +62,52 @@ fn local_utc_offset_secs() -> i64 {
             .unwrap_or(0),
         _ => 0, // fall back to UTC if the query fails
     }
+}
+
+/// Unlock image (docs/ROADMAP.md M3): decode assets/Spike.jpg at build time,
+/// center-crop to square, resize to the panel, Bayer-4×4 dither to RGB565
+/// big-endian (display-ready), and emit as a raw binary for include_bytes!.
+/// Runtime JPEG decoding was rejected — single fixed asset, 16 MB flash.
+fn generate_spike_asset() {
+    const W: u32 = 466;
+    const H: u32 = 466;
+    // Bayer 4×4 ordered-dither matrix (0..16).
+    const BAYER: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let out_path = std::path::Path::new(&out_dir).join("spike_rgb565.bin");
+    let src_path = std::path::Path::new("assets/Spike.jpg");
+    println!("cargo:rerun-if-changed=assets/Spike.jpg");
+
+    if !src_path.exists() {
+        // Stub: black frame so builds don't hard-fail without the asset.
+        std::fs::write(&out_path, vec![0u8; (W * H * 2) as usize]).expect("write stub spike");
+        println!("cargo:warning=assets/Spike.jpg missing — unlock image is black.");
+        return;
+    }
+
+    let img = image::open(src_path).expect("decode Spike.jpg").to_rgb8();
+    let (iw, ih) = (img.width(), img.height());
+    let side = iw.min(ih);
+    let cropped = image::imageops::crop_imm(&img, (iw - side) / 2, (ih - side) / 2, side, side)
+        .to_image();
+    let resized = image::imageops::resize(&cropped, W, H, image::imageops::FilterType::Lanczos3);
+
+    let mut out = Vec::with_capacity((W * H * 2) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let p = resized.get_pixel(x, y);
+            let d = BAYER[(y % 4) as usize][(x % 4) as usize];
+            // Dither amplitude = one quantization step (8 for 5-bit, 4 for 6-bit).
+            let r = ((p[0] as i32 + (d - 8) * 8 / 16).clamp(0, 255) >> 3) as u16;
+            let g = ((p[1] as i32 + (d - 8) * 4 / 16).clamp(0, 255) >> 2) as u16;
+            let b = ((p[2] as i32 + (d - 8) * 8 / 16).clamp(0, 255) >> 3) as u16;
+            let px = (r << 11) | (g << 5) | b;
+            out.push((px >> 8) as u8);
+            out.push(px as u8);
+        }
+    }
+    std::fs::write(&out_path, out).expect("write spike_rgb565.bin");
 }
 
 /// 512-entry Q14 sine LUT for src/trig.rs.

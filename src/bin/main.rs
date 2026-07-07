@@ -1,8 +1,8 @@
 //! OpenPocket firmware entry — Waveshare ESP32-S3-Touch-AMOLED-1.75 only.
 //!
-//! Boot: PMIC rails → QSPI display init → lock-screen clock loop.
-//! Rendering: single retained WatchFb canvas in PSRAM, incremental deltas,
-//! DMI partial flush, fixed 20 fps cadence (see docs/HARDWARE.md + docs/ROADMAP.md).
+//! Hardware bring-up (PMIC rails → RTC → touch → QSPI display init), then
+//! hands off to the app scene machine (`openpocket::app::App::run`).
+//! Pins and addresses: docs/HARDWARE.md.
 
 #![no_std]
 #![no_main]
@@ -14,7 +14,7 @@ use alloc::vec;
 use esp_hal::clock::CpuClock;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -22,9 +22,14 @@ use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::{Duration, Instant, Rate};
 use esp_println::println;
 
+use openpocket::app::App;
 use openpocket::board::{LCD_COL_OFFSET, LCD_HEIGHT, LCD_WIDTH};
 use openpocket::display::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
-use openpocket::drivers::axp2101;
+use openpocket::display::watch_fb::WatchFb;
+use openpocket::drivers::{axp2101, cst9217};
+use openpocket::input::gestures::SwipeTracker;
+use openpocket::scenes::lock::Clock;
+use openpocket::time::WallClock;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -41,13 +46,11 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // 8 KiB SRAM heap (no format!/alloc in hot paths); framebuffers live in PSRAM.
+    // 8 KiB SRAM heap (no format!/alloc in hot paths); framebuffer in PSRAM.
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 8 * 1024);
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     println!("=== OpenPocket ===");
-    // Hardware: ESP32-S3R8 — 512 KiB SRAM + 384 KiB ROM + stacked 8 MB PSRAM + 16 MB Flash
-    // (https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 
     let mut i2c = I2c::new(
         peripherals.I2C0,
@@ -62,10 +65,25 @@ fn main() -> ! {
         Err(()) => println!("AXP2101: FAIL"),
     }
 
-    // RTC-backed wall clock: reads the PCF85063, seeds it from the build
-    // timestamp when the chip lost power (VL) or lags the build (logs decision).
-    let mut wall = openpocket::time::WallClock::init(&mut i2c);
+    // RTC-backed wall clock: seeds the PCF85063 from the build timestamp when
+    // the chip lost power (VL) or lags the build (logs the decision).
+    let wall = WallClock::init(&mut i2c);
 
+    // CST9217 touch: reset pulse + attribute handshake (chip-ID gate).
+    let mut tp_reset = Output::new(peripherals.GPIO40, Level::High, OutputConfig::default());
+    let tp_int = Input::new(
+        peripherals.GPIO11,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    match cst9217::init(&mut i2c, &mut tp_reset) {
+        Ok(a) => println!(
+            "touch: chip=0x{:04X} res={}x{} fw=0x{:08X}",
+            a.chip_type, a.res_x, a.res_y, a.fw_version
+        ),
+        Err(()) => println!("touch: INIT FAILED"),
+    }
+
+    // QSPI display bus + CO5300 init (Waveshare reference sequence).
     let lcd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
     let mut lcd_reset = Output::new(peripherals.GPIO39, Level::High, OutputConfig::default());
 
@@ -97,7 +115,6 @@ fn main() -> ! {
     lcd_reset.set_high();
     delay_ms(200);
 
-    // CO5300 init sequence (Waveshare reference; see docs/HARDWARE.md).
     bus.write_c8d8(0xFE, 0x20);
     bus.write_c8d8(0x19, 0x10);
     bus.write_c8d8(0x1C, 0xA0);
@@ -120,18 +137,14 @@ fn main() -> ! {
     bus.write_c8d16d16(0x2B, 0, LCD_HEIGHT - 1);
     bus.write_command(0x2C);
 
-    // Lock screen: single retained WatchFb canvas in PSRAM — incremental
-    // ring/text deltas only, no per-frame clear or copy (flush is blocking,
-    // so no tearing). Clean frames skip the flush entirely (the CO5300
-    // retains its GRAM); the loop is paced to a fixed cadence so the
-    // frame-indexed anim schedules run at their designed duration.
+    // Retained framebuffer in PSRAM + lock-screen clock.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
-    let mut fb0 = vec![0u8; byte_count];
+    let fb0 = vec![0u8; byte_count].leak();
 
     println!("Lock screen init...");
     let init_start = Instant::now();
-    let mut wfb = openpocket::display::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
-    let mut clock = openpocket::scenes::lock::Clock::new();
+    let wfb = WatchFb::new(fb0, LCD_WIDTH, LCD_HEIGHT);
+    let clock = Clock::new();
     println!(
         "Clock ready {} ms | bezel anim={} full={} offsets | retained FB {} KiB PSRAM",
         init_start.elapsed().as_millis(),
@@ -140,89 +153,16 @@ fn main() -> ! {
         byte_count / 1024
     );
 
-    let anim_start = Instant::now();
-    // Fixed 20 fps cadence — matches TARGET_FPS in build.rs so the frame-indexed
-    // ease schedules take exactly their designed wall-clock duration.
-    const CLOCK_FRAME_US: u64 = 50_000;
-
-    // Prime: WatchFb::new cleared the canvas and marked it fully dirty.
-    clock.render(&mut wfb, 0, &wall.now());
-    bus.flush_bytes(wfb.bytes());
-    wfb.clear_damage();
-    println!("First frame: {} ms", anim_start.elapsed().as_millis());
-
-    let mut last_report = Instant::now();
-    let mut ema_fps: f32 = 0.0;
-
-    loop {
-        let frame_start = Instant::now();
-        let elapsed = anim_start.elapsed().as_millis() as u32;
-
-        wall.maybe_resync(&mut i2c);
-        let now = wall.now();
-
-        let render_start = Instant::now();
-        clock.render(&mut wfb, elapsed, &now);
-        let render_ms = render_start.elapsed().as_millis() as u32;
-
-        // Skip the flush when nothing changed — panel keeps showing its GRAM.
-        // Otherwise: partial windowed flush of dirty spans when the dirty
-        // area is small; full frame when the DMI overflowed or per-window
-        // overhead would exceed a straight full flush.
-        let mut flush_ms = 0u32;
-        let mut span_count = 0usize;
-        let flush_mode = if wfb.is_clean() {
-            '-'
-        } else {
-            let spans = wfb.dmi.spans();
-            span_count = spans.len();
-            let dirty_bytes: usize = spans
-                .iter()
-                .map(|s| (s.x1 - s.x0 + 1) as usize * 2)
-                .sum();
-            let partial = !wfb.dmi.overflowed() && dirty_bytes < byte_count / 3;
-            let flush_start = Instant::now();
-            if partial {
-                bus.flush_spans(wfb.bytes(), spans, LCD_WIDTH, LCD_COL_OFFSET);
-            } else {
-                // Partial flushes shrink the panel window — restore it first.
-                bus.set_window(LCD_COL_OFFSET, LCD_COL_OFFSET + LCD_WIDTH - 1, 0, LCD_HEIGHT - 1);
-                bus.write_command(0x2C);
-                bus.flush_bytes(wfb.bytes());
-            }
-            flush_ms = flush_start.elapsed().as_millis() as u32;
-            wfb.clear_damage();
-            if partial { 'P' } else { 'F' }
-        };
-        let flushed = flush_mode != '-';
-
-        let work_ms = frame_start.elapsed().as_millis() as u32;
-        delay_until(frame_start + Duration::from_micros(CLOCK_FRAME_US));
-
-        let inst_fps = if work_ms > 0 { 1000.0 / work_ms as f32 } else { 0.0 };
-        if flushed {
-            ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
-        }
-        if last_report.elapsed() >= Duration::from_secs(1) {
-            println!(
-                "clock fps~{:.1} render={}ms flush={}ms({}) spans={} work={}ms | centers={} cdelta={} px_writes={}",
-                ema_fps,
-                render_ms,
-                flush_ms,
-                flush_mode,
-                span_count,
-                work_ms,
-                clock.last_bezel_centers,
-                clock.last_bezel_center_delta,
-                clock.last_bezel_writes
-            );
-            last_report = Instant::now();
-        }
+    App {
+        bus,
+        wfb,
+        i2c,
+        tp_int,
+        wall,
+        clock,
+        swipe: SwipeTracker::new(LCD_HEIGHT),
     }
-}
-
-fn delay_until(deadline: Instant) {
-    while Instant::now() < deadline {}
+    .run()
 }
 
 fn delay_ms(ms: u32) {

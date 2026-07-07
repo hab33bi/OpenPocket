@@ -24,6 +24,7 @@ libm        = "0.2"
 
 [build-dependencies]
 fontdue = "0.7"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]
