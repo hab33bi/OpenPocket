@@ -15,6 +15,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::display::watch_fb::{RectAcc, WatchFb};
+use crate::time::WallTime;
 use crate::trig::lut_sin_cos_q14;
 
 include!(concat!(env!("OUT_DIR"), "/inter_font.rs"));
@@ -87,9 +88,15 @@ pub struct Clock {
     pub bezel_full_len: u32,
     /// Angular center count currently drawn on the retained framebuffer.
     drawn_centers: usize,
-    /// (h, m, fade_q14) of the text currently on the retained canvas —
+    /// (h, m, fade_q14, y, mo, d) of the text currently on the retained canvas —
     /// text is only cleared/redrawn when this changes.
-    last_text: (u8, u8, i32),
+    last_text: (u8, u8, i32, u16, u8, u8),
+    /// Bbox of the text currently on the canvas (cleared before a redraw —
+    /// the date string can change length at midnight).
+    last_text_bbox: (i32, i32, i32, i32),
+    /// Formatted date line, e.g. "July 7th 2026".
+    date_buf: [u8; 24],
+    date_len: usize,
     /// Pixel writes for ring this frame (profiling).
     pub last_bezel_writes: u32,
     /// Center count change this frame (profiling).
@@ -109,7 +116,10 @@ impl Clock {
             bezel_anim_len: 0,
             bezel_full_len: 0,
             drawn_centers: 0,
-            last_text: (255, 255, -1),
+            last_text: (255, 255, -1, 0, 0, 0),
+            last_text_bbox: (0, 0, -1, -1),
+            date_buf: [0; 24],
+            date_len: 0,
             last_bezel_writes: 0,
             last_bezel_center_delta: 0,
             last_bezel_centers: 0,
@@ -168,18 +178,13 @@ impl Clock {
         self.bezel_offsets_full = full_offs;
     }
 
-    fn current_hm(&self, elapsed_ms: u32) -> (u8, u8) {
-        let secs = (elapsed_ms / 1000) as u32;
-        let h = ((secs / 3600) % 24) as u8;
-        let m = ((secs / 60) % 60) as u8;
-        (h, m)
-    }
-
     /// Compose one frame onto the retained `WatchFb` canvas: incremental ring
-    /// deltas + text redraw only when time/fade changed. Damage lands in the DMI;
-    /// a frame that touches nothing leaves the fb clean (caller skips the flush).
-    pub fn render(&mut self, wfb: &mut WatchFb, elapsed_ms: u32) {
-        let (h, m) = self.current_hm(elapsed_ms);
+    /// deltas + text redraw only when time/date/fade changed. Damage lands in the
+    /// DMI; a frame touching nothing leaves the fb clean (caller skips the flush).
+    /// `elapsed_ms` is boot-relative and drives animation schedules + startup
+    /// fade; `now` is the RTC-backed wall time shown on the face.
+    pub fn render(&mut self, wfb: &mut WatchFb, elapsed_ms: u32, now: &WallTime) {
+        let (h, m) = (now.hour, now.minute);
 
         if self.last_minute == 99 {
             self.last_minute = m;
@@ -227,15 +232,67 @@ impl Clock {
         };
 
         // Text is retained on the canvas — only touch it when content changes.
-        if self.last_text != (h, m, fade_q14) {
-            self.last_text = (h, m, fade_q14);
+        let key = (h, m, fade_q14, now.year, now.month, now.day);
+        if self.last_text != key {
+            self.last_text = key;
+            self.format_date(now);
+            let old = self.last_text_bbox;
             let fb = wfb.buf_mut();
-            self.clear_text_region(fb);
+            // Clear the previous text's bbox — the date string can change length.
+            clear_rect(fb, old.0, old.1, old.2, old.3);
             self.draw_time_centered(fb, h, m, fade_q14);
             self.draw_date(fb, fade_q14);
-            let (x0, y0, x1, y1) = self.text_bbox();
-            wfb.mark_rect(x0, y0, x1, y1);
+            let nb = self.text_bbox();
+            self.last_text_bbox = nb;
+            let dirty = if old.2 < old.0 {
+                nb
+            } else {
+                (old.0.min(nb.0), old.1.min(nb.1), old.2.max(nb.2), old.3.max(nb.3))
+            };
+            wfb.mark_rect(dirty.0, dirty.1, dirty.2, dirty.3);
         }
+    }
+
+    /// Format "July 7th 2026" into the retained date buffer.
+    fn format_date(&mut self, now: &WallTime) {
+        let mut buf = [0u8; 24];
+        let mut n = 0usize;
+        let name = MONTH_NAMES[((now.month.max(1) - 1) as usize).min(11)];
+        for b in name.bytes() {
+            buf[n] = b;
+            n += 1;
+        }
+        buf[n] = b' ';
+        n += 1;
+        if now.day >= 10 {
+            buf[n] = b'0' + now.day / 10;
+            n += 1;
+        }
+        buf[n] = b'0' + now.day % 10;
+        n += 1;
+        let suffix: &[u8; 2] = match now.day {
+            11..=13 => b"th",
+            d if d % 10 == 1 => b"st",
+            d if d % 10 == 2 => b"nd",
+            d if d % 10 == 3 => b"rd",
+            _ => b"th",
+        };
+        buf[n] = suffix[0];
+        buf[n + 1] = suffix[1];
+        n += 2;
+        buf[n] = b' ';
+        n += 1;
+        let y = now.year;
+        for div in [1000u16, 100, 10, 1] {
+            buf[n] = b'0' + ((y / div) % 10) as u8;
+            n += 1;
+        }
+        self.date_buf = buf;
+        self.date_len = n;
+    }
+
+    fn date_str(&self) -> &str {
+        core::str::from_utf8(&self.date_buf[..self.date_len]).unwrap_or("")
     }
 
     /// Advance the bezel animation one frame against its build-time schedule.
@@ -470,12 +527,6 @@ impl Clock {
         self.bezel_offsets_full.len()
     }
 
-    /// Black out the text region before redraw (time fade + digit changes).
-    fn clear_text_region(&self, fb: &mut [u8]) {
-        let (x0, y0, x1, y1) = self.text_bbox();
-        clear_rect(fb, x0, y0, x1, y1);
-    }
-
     /// Union bbox of time (3x) + date (1x) with small padding.
     fn text_bbox(&self) -> (i32, i32, i32, i32) {
         let mut x0 = W;
@@ -510,7 +561,7 @@ impl Clock {
         };
 
         absorb("00:00", CY + 5, 3);
-        absorb("July 7th 2026", CY + 70, 1);
+        absorb(self.date_str(), CY + 70, 1);
 
         if x0 > x1 {
             return (0, 0, W - 1, H - 1);
@@ -529,8 +580,7 @@ impl Clock {
     }
 
     fn draw_date(&self, fb: &mut [u8], fade_q14: i32) {
-        let s = "July 7th 2026";
-        self.draw_text_centered(fb, s, CY + 70, fade_q14, 1);
+        self.draw_text_centered(fb, self.date_str(), CY + 70, fade_q14, 1);
     }
 
     fn draw_text_centered(&self, fb: &mut [u8], text: &str, base_y: i32, fade_q14: i32, scale: i32) {

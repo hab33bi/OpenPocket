@@ -62,6 +62,10 @@ fn main() -> ! {
         Err(()) => println!("AXP2101: FAIL"),
     }
 
+    // RTC-backed wall clock: reads the PCF85063, seeds it from the build
+    // timestamp when the chip lost power (VL) or lags the build (logs decision).
+    let mut wall = openpocket::time::WallClock::init(&mut i2c);
+
     let lcd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
     let mut lcd_reset = Output::new(peripherals.GPIO39, Level::High, OutputConfig::default());
 
@@ -142,7 +146,7 @@ fn main() -> ! {
     const CLOCK_FRAME_US: u64 = 50_000;
 
     // Prime: WatchFb::new cleared the canvas and marked it fully dirty.
-    clock.render(&mut wfb, 0);
+    clock.render(&mut wfb, 0, &wall.now());
     bus.flush_bytes(wfb.bytes());
     wfb.clear_damage();
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
@@ -154,8 +158,11 @@ fn main() -> ! {
         let frame_start = Instant::now();
         let elapsed = anim_start.elapsed().as_millis() as u32;
 
+        wall.maybe_resync(&mut i2c);
+        let now = wall.now();
+
         let render_start = Instant::now();
-        clock.render(&mut wfb, elapsed);
+        clock.render(&mut wfb, elapsed, &now);
         let render_ms = render_start.elapsed().as_millis() as u32;
 
         // Skip the flush when nothing changed — panel keeps showing its GRAM.
