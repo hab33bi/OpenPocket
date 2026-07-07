@@ -2,17 +2,23 @@
 //!
 //! - Proper Inter font via "scale to gray" AA (build 72pt 1bpp + runtime 2x2 bitcount -> 5-level alpha).
 //! - Time 3x, date 1x, both centered.
-//! - Bezel: 10px pad solid thick ring, drawn/undrawn with eased curve on startup + every minute change.
+//! - Bezel: 10px pad solid thick ring, drawn/undrawn with eased curve on startup + every minute change,
+//!   rounded faded end caps (comet tips) + seam heal on close.
 //!   Dual precomputed lists: center-pixel angular-order for anim (~1.5 MiB), deduped row-major for static full.
-//!   Incremental delta ring updates (not full prefix replay) + copy-from-prev ping-pong for consistent FPS.
-//! - Reuses: double PSRAM fbs + ping-pong, Q14 + LUT, DMA QSPI flush (direct from PSRAM).
+//!   Anim progress is frame-indexed against build-time ease schedules (build.rs, docs/09 P0):
+//!   per-frame deltas are bounded by schedule construction and phases exit on completion, not wall clock.
+//! - P1: renders into a retained WatchFb canvas — incremental deltas only, no per-frame
+//!   clear/copy; text redrawn only when time or fade changes; damage recorded in the DMI.
+//! - Reuses: Q14 + LUT, DMA QSPI flush (direct from PSRAM).
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::raidal::lut_sin_cos_q14;
+use crate::watch_fb::{RectAcc, WatchFb};
 
 include!(concat!(env!("OUT_DIR"), "/inter_font.rs"));
+include!(concat!(env!("OUT_DIR"), "/watch_anim.rs"));
 
 /// Correct Q14 value for +90° (pi/2).
 const FRAC_PI_2_Q14: i32 = 25736;
@@ -29,29 +35,61 @@ const CY: i32 = H / 2;
 pub const PAD: i32 = 10;
 pub const BEZEL_R: i32 = (W / 2) - PAD; // 223 for 466px with 10px padding
 
-/// Bezel ring precompute + animation tuning (see docs/08-TIME-DISPLAY-HANDOFF.md).
+/// Bezel ring precompute (see docs/08-TIME-DISPLAY-HANDOFF.md).
+/// BEZEL_STEPS × (BEZEL_THICKNESS + 1) taps must equal BEZEL_SCHED_TOTAL in build.rs —
+/// anim durations and the ease curve live there (generate_bezel_schedules).
 const BEZEL_STEPS: i32 = 36_000;
 const BEZEL_THICKNESS: i32 = 10;
-const BEZEL_INITIAL_MS: u32 = 8_000;
-const BEZEL_UNDRAW_MS: u32 = 3_500;
-const BEZEL_REDRAW_MS: u32 = 3_500;
 const FADE_MS: u32 = 2_400;
-/// Cap arc centers processed per frame to bound render time during anim (9 px writes each).
-const MAX_CENTERS_PER_FRAME: usize = 4_500;
+
+/// Anim-list layout: TAPS entries per angle step (dr = -HALF_T ..= HALF_T).
+const TAPS: usize = (BEZEL_THICKNESS + 1) as usize;
+const HALF_T: i32 = BEZEL_THICKNESS / 2;
+/// Rounded end-cap zone in angle steps (~5 px of arc length at r=223): ring
+/// thickness tapers to a point on a semicircular profile at each arc end.
+const CAP_STEPS: i32 = 64;
+/// Faded-edge window at each arc end, in angle steps (100 steps = 1°): alpha
+/// ramps 0 → solid over this span, giving both ends a soft comet tip.
+const FADE_STEPS: i32 = 400;
+/// Frames to blend the two faded rounded ends into a solid seam once the ring
+/// closes (Heal), and back out again on minute change (Unheal).
+const HEAL_FRAMES: u32 = 8;
+
+/// Bezel animation phase, advanced by frame index against the build-time schedules.
+/// A sweep phase exits only when its schedule is consumed AND the ring reached the
+/// schedule's end state — never on wall clock (docs/09 P0).
+#[derive(Clone, Copy, PartialEq)]
+enum BezelPhase {
+    /// Startup sweep: 0 → full ring.
+    Initial,
+    /// Ring just closed: blend both faded rounded ends into a solid seam.
+    Heal,
+    /// Minute change, part 0: blend the solid seam back into two faded ends.
+    Unheal,
+    /// Minute change, part 1: full ring → 0.
+    Undraw,
+    /// Minute change, part 2: 0 → full ring.
+    Redraw,
+    /// Ring complete; pixels carried via ping-pong copy, zero ring writes.
+    Static,
+}
 
 pub struct Clock {
     last_minute: u8,
-    last_change_ms: u32,
+    phase: BezelPhase,
+    /// Frames elapsed within the current anim phase (schedule index).
+    frame_in_phase: u32,
     /// High-res angular-order center offsets for incremental arc anim.
     bezel_offsets_anim: Vec<u32>,
-    /// Deduped row-major offsets (diagnostic / fallback; static uses carried fb pixels).
+    /// Deduped row-major offsets — one-shot solidity blit on static entry.
     bezel_offsets_full: Vec<u32>,
     pub bezel_anim_len: u32,
     pub bezel_full_len: u32,
-    /// Angular center count currently drawn on the carried framebuffer.
+    /// Angular center count currently drawn on the retained framebuffer.
     drawn_centers: usize,
-    /// Ring is complete and carried via ping-pong copy — skip ring draws.
-    ring_static: bool,
+    /// (h, m, fade_q14) of the text currently on the retained canvas —
+    /// text is only cleared/redrawn when this changes.
+    last_text: (u8, u8, i32),
     /// Pixel writes for ring this frame (profiling).
     pub last_bezel_writes: u32,
     /// Center count change this frame (profiling).
@@ -64,13 +102,14 @@ impl Clock {
     pub fn new() -> Self {
         let mut c = Self {
             last_minute: 99,
-            last_change_ms: 0,
+            phase: BezelPhase::Initial,
+            frame_in_phase: 0,
             bezel_offsets_anim: Vec::new(),
             bezel_offsets_full: Vec::new(),
             bezel_anim_len: 0,
             bezel_full_len: 0,
             drawn_centers: 0,
-            ring_static: false,
+            last_text: (255, 255, -1),
             last_bezel_writes: 0,
             last_bezel_center_delta: 0,
             last_bezel_centers: 0,
@@ -136,71 +175,48 @@ impl Clock {
         (h, m)
     }
 
-    #[inline]
-    fn cubic_ease_in_out(t: f32) -> f32 {
-        if t < 0.5 {
-            4.0 * t * t * t
-        } else {
-            let u = -2.0 * t + 2.0;
-            1.0 - (u * u * u) / 2.0
-        }
-    }
-
-    /// Render one frame into `fb`.
-    /// `prev` is the last displayed buffer (ping-pong front); copy it then apply incremental updates.
-    /// Pass `None` only for the first prime frame (black fill).
-    pub fn render_to_fb(&mut self, fb: &mut [u8], prev: Option<&[u8]>, elapsed_ms: u32) {
-        match prev {
-            Some(p) if p.len() == fb.len() => fb.copy_from_slice(p),
-            _ => fb.fill(0),
-        }
-
+    /// Compose one frame onto the retained `WatchFb` canvas: incremental ring
+    /// deltas + text redraw only when time/fade changed. Damage lands in the DMI;
+    /// a frame that touches nothing leaves the fb clean (caller skips the flush).
+    pub fn render(&mut self, wfb: &mut WatchFb, elapsed_ms: u32) {
         let (h, m) = self.current_hm(elapsed_ms);
 
-        let cur_min = m;
         if self.last_minute == 99 {
-            self.last_minute = cur_min;
-            self.last_change_ms = elapsed_ms;
-        }
-        if cur_min != self.last_minute {
-            self.last_minute = cur_min;
-            self.last_change_ms = elapsed_ms;
-            self.ring_static = false;
-            // Ring is fully visible on the carried fb; start undraw from full center count.
-            self.drawn_centers = self.bezel_offsets_anim.len();
+            self.last_minute = m;
+        } else if m != self.last_minute {
+            self.last_minute = m;
+            // Start the unheal→undraw→redraw cycle only from Static; if a prior
+            // cycle is somehow still running, let it finish rather than jumping state.
+            if self.phase == BezelPhase::Static {
+                self.phase = BezelPhase::Unheal;
+                self.frame_in_phase = 0;
+            }
         }
 
+        // Startup fade, quantized to 32 levels: retained text and the ring's fixed
+        // start window only redraw when the level steps (~32× total), not every
+        // frame — keeps fade-period frames inside the 20 fps budget.
         let fade_q14 = if elapsed_ms < FADE_MS {
-            let tp = elapsed_ms as f32 / FADE_MS as f32;
-            (tp * Q as f32) as i32
+            const LEVELS: u32 = 32;
+            let level = (elapsed_ms * LEVELS / FADE_MS).min(LEVELS - 1);
+            (level as i32 * Q) / LEVELS as i32
         } else {
             Q
         };
+        let fade_changed = fade_q14 != self.last_text.2;
 
-        let since = elapsed_ms - self.last_change_ms;
-        let in_initial = elapsed_ms < BEZEL_INITIAL_MS && self.last_change_ms < 100;
-        let in_minute_cycle = since < BEZEL_UNDRAW_MS + BEZEL_REDRAW_MS;
-        let bezel_p = if in_initial {
-            Self::cubic_ease_in_out(elapsed_ms as f32 / BEZEL_INITIAL_MS as f32)
-        } else if since < BEZEL_UNDRAW_MS {
-            1.0 - Self::cubic_ease_in_out(since as f32 / BEZEL_UNDRAW_MS as f32)
-        } else if since < BEZEL_UNDRAW_MS + BEZEL_REDRAW_MS {
-            let t = (since - BEZEL_UNDRAW_MS) as f32 / BEZEL_REDRAW_MS as f32;
-            Self::cubic_ease_in_out(t)
-        } else {
-            1.0
-        };
-
-        let animating = in_initial || in_minute_cycle;
         let prev_centers = self.drawn_centers;
-        let bezel_writes = if !animating && bezel_p >= 1.0 {
-            self.ring_static = true;
-            0
-        } else {
-            self.ring_static = false;
-            let hi_lo = bezel_color_bytes(fade_q14);
-            self.apply_bezel_delta(fb, bezel_p, hi_lo.0, hi_lo.1)
-        };
+        let mut ring_acc = RectAcc::empty();
+        let bezel_writes = self.step_bezel(wfb.buf_mut(), fade_q14, fade_changed, &mut ring_acc);
+        if !ring_acc.is_empty() {
+            // +1 slack: stamps are 3×3 around each accumulated center.
+            wfb.mark_rect(
+                ring_acc.x0 - 1,
+                ring_acc.y0 - 1,
+                ring_acc.x1 + 1,
+                ring_acc.y1 + 1,
+            );
+        }
 
         self.last_bezel_writes = bezel_writes as u32;
         self.last_bezel_centers = self.drawn_centers as u32;
@@ -210,33 +226,248 @@ impl Clock {
             (prev_centers - self.drawn_centers) as u32
         };
 
-        self.clear_text_region(fb);
-        self.draw_time_centered(fb, h, m, fade_q14);
-        self.draw_date(fb, fade_q14);
+        // Text is retained on the canvas — only touch it when content changes.
+        if self.last_text != (h, m, fade_q14) {
+            self.last_text = (h, m, fade_q14);
+            let fb = wfb.buf_mut();
+            self.clear_text_region(fb);
+            self.draw_time_centered(fb, h, m, fade_q14);
+            self.draw_date(fb, fade_q14);
+            let (x0, y0, x1, y1) = self.text_bbox();
+            wfb.mark_rect(x0, y0, x1, y1);
+        }
     }
 
-    /// Incremental ring update: only add/remove the delta arc segment this frame.
-    fn apply_bezel_delta(&mut self, fb: &mut [u8], eased_p: f32, hi: u8, lo: u8) -> usize {
-        let list = &self.bezel_offsets_anim;
-        if list.is_empty() {
-            return 0;
+    /// Advance the bezel animation one frame against its build-time schedule.
+    /// Per-frame deltas are bounded by schedule construction — no runtime cap.
+    fn step_bezel(
+        &mut self,
+        fb: &mut [u8],
+        fade_q14: i32,
+        fade_changed: bool,
+        acc: &mut RectAcc,
+    ) -> usize {
+        match self.phase {
+            BezelPhase::Static => 0,
+            BezelPhase::Heal => {
+                // Ring closed with two faded rounded ends meeting at the seam;
+                // lift both end windows toward solid over HEAL_FRAMES.
+                let lift = (self.frame_in_phase + 1) as i32;
+                let mut writes =
+                    self.redraw_end_windows(fb, fade_q14, lift, HEAL_FRAMES as i32, acc);
+                self.frame_in_phase += 1;
+                if self.frame_in_phase >= HEAL_FRAMES {
+                    // One-shot deduped full blit normalizes solidity/brightness,
+                    // then the complete ring is retained on the canvas.
+                    let (hi, lo) = bezel_color_bytes(fade_q14);
+                    writes += self.blit_full_ring(fb, hi, lo, acc);
+                    self.phase = BezelPhase::Static;
+                }
+                writes
+            }
+            BezelPhase::Unheal => {
+                // Reverse of Heal: solid seam blends back into two faded ends
+                // before the undraw sweep starts.
+                let lift = (HEAL_FRAMES - 1 - self.frame_in_phase) as i32;
+                let writes =
+                    self.redraw_end_windows(fb, fade_q14, lift, HEAL_FRAMES as i32, acc);
+                self.frame_in_phase += 1;
+                if self.frame_in_phase >= HEAL_FRAMES {
+                    self.phase = BezelPhase::Undraw;
+                    self.frame_in_phase = 0;
+                }
+                writes
+            }
+            BezelPhase::Initial | BezelPhase::Undraw | BezelPhase::Redraw => {
+                let schedule: &[u32] = match self.phase {
+                    BezelPhase::Initial => BEZEL_INITIAL_SCHEDULE,
+                    BezelPhase::Undraw => BEZEL_UNDRAW_SCHEDULE,
+                    _ => BEZEL_REDRAW_SCHEDULE,
+                };
+
+                let idx = (self.frame_in_phase as usize).min(schedule.len() - 1);
+                let target = self.scale_sched(schedule[idx]);
+                let writes = self.apply_bezel_target(fb, target, fade_q14, fade_changed, acc);
+                self.frame_in_phase = self.frame_in_phase.saturating_add(1);
+
+                // Exit on completion, never wall clock: schedule consumed AND ring at
+                // the schedule's end state (extra frames clamp idx to the last entry).
+                let end = self.scale_sched(*schedule.last().unwrap());
+                if self.frame_in_phase as usize >= schedule.len() && self.drawn_centers == end
+                {
+                    match self.phase {
+                        BezelPhase::Initial | BezelPhase::Redraw => {
+                            self.phase = BezelPhase::Heal;
+                            self.frame_in_phase = 0;
+                        }
+                        BezelPhase::Undraw => {
+                            self.phase = BezelPhase::Redraw;
+                            self.frame_in_phase = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                writes
+            }
         }
+    }
 
-        let ideal = ((eased_p * list.len() as f32) as usize).min(list.len());
-        let target = clamp_target(self.drawn_centers, ideal, MAX_CENTERS_PER_FRAME);
+    /// Map a schedule center count onto the actual anim list length (identity when the
+    /// precompute matches BEZEL_SCHED_TOTAL; monotonic scaling either way).
+    fn scale_sched(&self, count: u32) -> usize {
+        let len = self.bezel_offsets_anim.len();
+        if len as u32 == BEZEL_SCHED_TOTAL {
+            count as usize
+        } else {
+            ((count as u64 * len as u64) / BEZEL_SCHED_TOTAL as u64) as usize
+        }
+    }
 
+    /// Incremental ring update with rounded faded end caps.
+    /// Grow: redraw [prev_tip_fade_start .. target] so last frame's faded tip
+    /// solidifies as the arc advances. Shrink: black the removed segment, then
+    /// redraw the fade window behind the new tip.
+    fn apply_bezel_target(
+        &mut self,
+        fb: &mut [u8],
+        target: usize,
+        fade_q14: i32,
+        fade_changed: bool,
+        acc: &mut RectAcc,
+    ) -> usize {
+        let len = self.bezel_offsets_anim.len();
+        let target = target.min(len);
+        let prev = self.drawn_centers;
+        let fade_entries = FADE_STEPS as usize * TAPS;
         let mut writes = 0usize;
-        if target > self.drawn_centers {
-            for &off in &list[self.drawn_centers..target] {
-                writes += write_bezel_3x3(fb, off, hi, lo);
+
+        if target > prev {
+            let lo = prev.saturating_sub(fade_entries);
+            writes += self.redraw_arc_range(fb, lo, target, target, fade_q14, 0, 1, acc);
+        } else if target < prev {
+            for i in target..prev {
+                writes += black_bezel_3x3(fb, self.bezel_offsets_anim[i], acc);
             }
-        } else if target < self.drawn_centers {
-            for &off in &list[target..self.drawn_centers] {
-                writes += black_bezel_3x3(fb, off);
-            }
+            let lo = target.saturating_sub(fade_entries);
+            writes += self.redraw_arc_range(fb, lo, target, target, fade_q14, 0, 1, acc);
         }
+
+        // Refresh the fixed start end when the startup fade's brightness level
+        // actually stepped, or while the moving tip's window overlaps it.
+        if target > 0 && (fade_changed || target < 2 * fade_entries) {
+            let hi_end = target.min(fade_entries);
+            writes += self.redraw_arc_range(fb, 0, hi_end, target, fade_q14, 0, 1, acc);
+        }
+
         self.drawn_centers = target;
         writes
+    }
+
+    /// Redraw both end windows of the closed ring (fixed start + tip at list end)
+    /// with the end profile lifted `lift/den` toward solid (Heal/Unheal seam blend).
+    fn redraw_end_windows(
+        &self,
+        fb: &mut [u8],
+        fade_q14: i32,
+        lift: i32,
+        den: i32,
+        acc: &mut RectAcc,
+    ) -> usize {
+        let len = self.bezel_offsets_anim.len();
+        let fade_entries = (FADE_STEPS as usize * TAPS).min(len);
+        let mut writes =
+            self.redraw_arc_range(fb, 0, fade_entries, len, fade_q14, lift, den, acc);
+        writes += self.redraw_arc_range(
+            fb,
+            len - fade_entries,
+            len,
+            len,
+            fade_q14,
+            lift,
+            den,
+            acc,
+        );
+        writes
+    }
+
+    /// Redraw anim-list entries [lo..hi) applying the end profile (alpha fade +
+    /// rounded-cap taper) relative to both arc ends: the fixed start (step 0) and
+    /// the moving tip (entry `arc_end`). `lift/den` blends the profile toward
+    /// solid for the seam heal. Two passes: blacks first so a narrowing cap leaves
+    /// no stale pixels, colors second so they win all 3×3 overlaps.
+    #[allow(clippy::too_many_arguments)]
+    fn redraw_arc_range(
+        &self,
+        fb: &mut [u8],
+        lo: usize,
+        hi: usize,
+        arc_end: usize,
+        fade_q14: i32,
+        lift: i32,
+        den: i32,
+        acc: &mut RectAcc,
+    ) -> usize {
+        let list = &self.bezel_offsets_anim;
+        let hi = hi.min(list.len());
+        if lo >= hi {
+            return 0;
+        }
+        let end_step = (arc_end / TAPS) as i32;
+
+        // Per-step profile, cached across the TAPS-entry runs sharing one angle step.
+        let mut cur_step = i32::MIN;
+        let mut alpha = 0i32;
+        let mut hw = 0i32;
+        let mut col = (0u8, 0u8);
+        let mut profile = |idx: usize, cur_step: &mut i32| {
+            let step = (idx / TAPS) as i32;
+            if step != *cur_step {
+                *cur_step = step;
+                let (a0, h0) = end_profile(step); // fixed start end
+                let (a1, h1) = end_profile(end_step - step); // moving tip end
+                alpha = a0.min(a1);
+                hw = h0.min(h1);
+                if lift > 0 {
+                    alpha += (256 - alpha) * lift / den;
+                    hw += (HALF_T - hw) * lift / den;
+                }
+                col = bezel_color_bytes((fade_q14 * alpha) >> 8);
+            }
+            (alpha, hw, col)
+        };
+
+        let mut writes = 0usize;
+        for idx in lo..hi {
+            let (_, hw, _) = profile(idx, &mut cur_step);
+            let dr = (idx % TAPS) as i32 - HALF_T;
+            if dr.abs() > hw {
+                writes += black_bezel_3x3(fb, list[idx], acc);
+            }
+        }
+        cur_step = i32::MIN;
+        for idx in lo..hi {
+            let (alpha, hw, (hi_b, lo_b)) = profile(idx, &mut cur_step);
+            let dr = (idx % TAPS) as i32 - HALF_T;
+            if dr.abs() <= hw && alpha > 0 {
+                writes += write_bezel_3x3(fb, list[idx], hi_b, lo_b, acc);
+            }
+        }
+        writes
+    }
+
+    /// Blast the deduped row-major ring list at full current color (~19k px).
+    fn blit_full_ring(&self, fb: &mut [u8], hi: u8, lo: u8, acc: &mut RectAcc) -> usize {
+        // Damage = the whole ring annulus bounding box.
+        acc.add(CX - BEZEL_R - HALF_T - 1, CY - BEZEL_R - HALF_T - 1);
+        acc.add(CX + BEZEL_R + HALF_T + 1, CY + BEZEL_R + HALF_T + 1);
+        for &off in &self.bezel_offsets_full {
+            let i = off as usize;
+            if i + 1 < fb.len() {
+                fb[i] = hi;
+                fb[i + 1] = lo;
+            }
+        }
+        self.bezel_offsets_full.len()
     }
 
     /// Black out the text region before redraw (time fade + digit changes).
@@ -372,17 +603,37 @@ impl Clock {
     }
 }
 
+/// (alpha_q8, cap_halfwidth) for an arc entry `d` angle steps from an arc end.
+/// Alpha ramps linearly over FADE_STEPS; thickness follows a semicircular cap
+/// profile over CAP_STEPS (hw = HALF_T·√(d·(2C−d))/C — a round stroke cap).
 #[inline]
-fn clamp_target(drawn: usize, ideal: usize, max_step: usize) -> usize {
-    let diff = ideal.abs_diff(drawn);
-    if diff <= max_step {
-        return ideal;
+fn end_profile(d: i32) -> (i32, i32) {
+    if d >= FADE_STEPS {
+        return (256, HALF_T);
     }
-    if ideal > drawn {
-        drawn + max_step
+    let d = d.max(0);
+    let alpha = d * 256 / FADE_STEPS;
+    let hw = if d >= CAP_STEPS {
+        HALF_T
     } else {
-        drawn.saturating_sub(max_step)
+        isqrt((HALF_T * HALF_T * d * (2 * CAP_STEPS - d)) as u32) as i32 / CAP_STEPS
+    };
+    (alpha, hw)
+}
+
+/// Newton integer square root (inputs here are ≤ ~102k; converges in a few steps).
+#[inline]
+fn isqrt(v: u32) -> u32 {
+    if v == 0 {
+        return 0;
     }
+    let mut x = v;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    x
 }
 
 #[inline]
@@ -413,10 +664,11 @@ fn clear_rect(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
 }
 
 #[inline]
-fn write_bezel_3x3(fb: &mut [u8], byte_off: u32, hi: u8, lo: u8) -> usize {
+fn write_bezel_3x3(fb: &mut [u8], byte_off: u32, hi: u8, lo: u8, acc: &mut RectAcc) -> usize {
     let pix = byte_off as usize / 2;
     let px = (pix % W as usize) as i32;
     let py = (pix / W as usize) as i32;
+    acc.add(px, py);
     let mut writes = 0usize;
     for dy in -1..=1 {
         for dx in -1..=1 {
@@ -437,8 +689,8 @@ fn write_bezel_3x3(fb: &mut [u8], byte_off: u32, hi: u8, lo: u8) -> usize {
 }
 
 #[inline]
-fn black_bezel_3x3(fb: &mut [u8], byte_off: u32) -> usize {
-    write_bezel_3x3(fb, byte_off, 0, 0)
+fn black_bezel_3x3(fb: &mut [u8], byte_off: u32, acc: &mut RectAcc) -> usize {
+    write_bezel_3x3(fb, byte_off, 0, 0, acc)
 }
 
 #[inline]

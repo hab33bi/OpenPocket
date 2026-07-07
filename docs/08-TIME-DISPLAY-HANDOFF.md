@@ -341,3 +341,225 @@ at t=8s: animating=false, static=true      ← drawing stops regardless of actua
 - Remove `MAX_CENTERS_PER_FRAME` once schedule bounds deltas by construction.
 
 **Secondary cost to address in P1:** `copy_from_slice` 434 KiB PSRAM every frame (~part of 66 ms static render). `WatchFb` retained layers eliminate this.
+
+### Update 2026-07-07 — P0 implemented: build-time ease schedules (pending hardware verify)
+
+**Changes (`build.rs`, `src/clock.rs`):**
+
+1. **`build.rs` → `generate_bezel_schedules()`** emits `OUT_DIR/watch_anim.rs` with
+   `BEZEL_SCHED_TOTAL = 396000` and three cumulative center-count tables:
+   - `BEZEL_INITIAL_SCHEDULE` — 88 frames (8000 ms × 11 fps), 0 → 396000
+   - `BEZEL_UNDRAW_SCHEDULE` — 39 frames (3500 ms), 396000 → 0
+   - `BEZEL_REDRAW_SCHEDULE` — 39 frames (3500 ms), 0 → 396000
+   Curve: cubic Bezier ease-in-out P1=(0.25, 0.1) P2=(0.75, 0.9), solved host-side (f64
+   bisection), rounded, forced monotonic with exact endpoints. All ease math is
+   build-time; runtime only indexes the table (no `f32` in the ring hot path).
+2. **`src/clock.rs`** — `BezelPhase { Initial, Undraw, Redraw, Static }` + `frame_in_phase`
+   replace wall-clock `bezel_p` math. Per frame: `target = schedule[frame_in_phase]`
+   (scaled by anim-list length if it ever diverges from `BEZEL_SCHED_TOTAL`), applied as
+   incremental delta. **Removed:** `MAX_CENTERS_PER_FRAME`, `clamp_target`,
+   `cubic_ease_in_out`, `BEZEL_*_MS` wall-clock phase exits.
+3. **Completion-gated phase exit:** a phase ends only when `frame_in_phase >= schedule.len()`
+   AND `drawn_centers == schedule[last]` — extra frames clamp to the last entry (catch-up),
+   so the ring can never freeze incomplete.
+4. **Static entry blit:** one-shot deduped `bezel_offsets_full` blast (19444 px) at
+   full-brightness current color normalizes solidity + fades out the dimmer early-arc
+   pixels drawn during the 2.4 s startup fade, then ring is carried by ping-pong copy.
+
+**Schedule deltas (generated, verified host-side):**
+
+| Schedule | Frames | Min Δ | Max Δ | Avg Δ |
+|----------|--------|-------|-------|-------|
+| Initial  | 88     | 1982  | 5462  | 4552  |
+| Undraw/Redraw | 39 | ~4500 | 12501 | 10285 |
+
+Max initial-frame work: 5462 centers × 9 ≈ 49k px writes (≈ old cap ballpark, curve-true).
+Minute-cycle peak: 12501 × 9 ≈ 112k px writes ≈ +22 ms render in mid-sweep frames
+(extrapolated from profiled ~0.2 µs/write) — expect a brief dip toward ~9 fps at the
+middle of undraw/redraw. If visible, raise UNDRAW/REDRAW_MS in build.rs (fewer centers
+per frame) — durations now live there, not in clock.rs.
+
+**Note on frame indexing:** sweep duration is now `frames / actual_fps`, not wall-clock ms.
+At the measured stable ~11 fps this matches the old 8000/3500/3500 ms feel; if FPS changes
+materially (e.g. after P3 partial flush), update `TARGET_FPS` in build.rs.
+
+**Validation checklist (flash + 30 s serial capture):**
+- `centers` reaches **396000** before `cdelta=0` static
+- `cdelta` follows S-curve: ~2000 at sweep ends, ~5400 mid-sweep (not flat 4500 then stall)
+- `render` flat 50–70 ms through the whole 8 s sweep (no ramp)
+- Visual: **complete** solid ring every time, smooth accel/decel, no 2/3 freeze
+- Minute change: full undraw → full redraw, ring complete after
+
+### P0 VERIFIED on hardware 2026-07-07 ✓
+
+```
+Clock ready 551 ms | bezel anim=396000 full=19444 offsets | 2x FB 848 KiB PSRAM
+First frame: 90 ms
+clock fps~9.3 render=85ms flush=24ms total=109ms | centers=30255  cdelta=3837 px_writes=34533
+clock fps~8.9 render=88ms flush=24ms total=113ms | centers=217103 cdelta=5453 px_writes=49077
+clock fps~9.1 render=83ms flush=24ms total=107ms | centers=389193 cdelta=2786 px_writes=25074
+clock fps~9.5 render=77ms flush=24ms total=102ms | centers=396000 cdelta=0    px_writes=0
+clock fps~9.8 render=77ms flush=24ms total=102ms | centers=396000 cdelta=0    px_writes=0  (stable)
+```
+
+- ✓ Ring completes: `centers=396000` before static — **2/3 freeze eliminated**
+- ✓ `cdelta` follows the S-curve: 3837 → 4786 → 5221 → 5453 (peak mid) → 4300 → 2786 → 0
+- ✓ Render flat 83–88 ms through the sweep, 77 ms static — no ramp
+- ✓ Flush constant 24 ms
+- Note: measured FPS ~9 (not the 11 used for schedule sizing) — render is 77–88 ms in
+  this build, so the 88-frame sweep took ~9.7 s instead of 8. Cosmetic; retune
+  `TARGET_FPS` in build.rs after P1 lowers render time.
+- User visual feedback: faded leading edge during fade-in looks premium — promoted to a
+  designed feature (rounded faded end caps + seam heal, next update).
+
+### Update 2026-07-07 — Rounded faded end caps + seam heal (VERIFIED on hardware ✓)
+
+**Feature (user-requested):** both arc ends get a soft comet tip — alpha fades 0→solid
+over `FADE_STEPS = 400` angle steps (~4°) and ring thickness tapers to a point on a
+semicircular cap profile over `CAP_STEPS = 64` (~5 px arc length). When the ring closes,
+the two faded rounded ends blend smoothly into a solid seam over `HEAL_FRAMES = 8`
+(new `Heal` phase → then one-shot full blit → `Static`). On minute change the seam
+blends back out first (new `Unheal` phase) before the undraw sweep.
+
+**Implementation (`src/clock.rs`):**
+- `end_profile(d)` → (alpha_q8, cap halfwidth); Newton `isqrt` for the cap curve.
+  All integer math; per-step profile cached across the 11-tap runs.
+- `redraw_arc_range(lo, hi, arc_end, fade, lift, den)` — two passes: black stamps for
+  taps outside the (possibly narrowed) cap first, color stamps second so they win all
+  3×3 overlaps. `lift/den` lerps the profile toward solid for Heal/Unheal.
+- Grow frames redraw `[prev_tip − fade_window .. target]` (old tip solidifies);
+  shrink frames black the removed segment then redraw the new tip window.
+- Fixed start window refreshed while the global startup fade ramps or the tip
+  window overlaps it.
+
+**Hardware log (release, 2026-07-07):**
+```
+Initial sweep:  render=104-117ms px_writes≈85-120k → fps~7.6, sweep ≈11.5s
+Heal frame:     px_writes=79200 (2 windows × 4400 entries × 9) — exactly as designed
+Static:         render=78ms → fps~9.7 (unchanged from pre-feature)
+Minute cycle:   unheal 79200 → undraw cdelta peak 12501 (=schedule) render≤124ms fps~6.9
+                → redraw → heal → static 75ms fps~10.0. Ring completes every phase.
+```
+
+**Cost:** fade-window redraw adds ~20–30 ms/frame during anim (tip window ≈4400 entries
+× 9 writes every frame). Fine at ~7.6 fps; P1 removes the 434 KiB copy (~35 ms) which
+more than pays it back. Tunables: `FADE_STEPS` (edge length), `CAP_STEPS` (cap rounding),
+`HEAL_FRAMES` (seam blend time) at the top of `clock.rs`.
+
+### Update 2026-07-07 — P1: WatchFb retained canvas + DmiIndex
+
+**Changes (`src/watch_fb.rs`, `src/dmi.rs`, `src/clock.rs`, `src/bin/main.rs`):**
+
+1. **`WatchFb`** — single retained RGB565-BE PSRAM canvas. The ping-pong double buffer
+   existed only to carry ring pixels between frames; since `QspiBus::flush_bytes` is
+   fully blocking, retention gives that for free. **Per-frame 434 KiB `copy_from_slice`
+   eliminated.** PSRAM freed: 424 KiB (fb1 dropped; P4 pipeline overlap re-adds it with
+   damage replay).
+2. **`DmiIndex`** — 512-span SRAM dirty index (~3 KiB). Composers record damage
+   (ring `RectAcc` bbox + text bbox rects → row spans, coalesced); overflow flag →
+   full-frame flush fallback. Recording only in P1 — the partial windowed flush is P3.
+3. **Text retained too** — cleared/redrawn only when `(h, m, fade_q14)` changes.
+   Static frames render **zero pixels**.
+4. **Flush skipped on clean frames** — the CO5300 retains its GRAM, so a frame that
+   drew nothing doesn't flush. Idle cost drops to ~a comparison per frame.
+5. **Fixed 11 fps cadence** (`CLOCK_FRAME_US = 90_909`) — matches build.rs `TARGET_FPS`,
+   so the frame-indexed ease schedules now take exactly their designed durations
+   (8.0 s initial sweep, 3.5 s undraw/redraw) regardless of how fast render gets.
+6. Log format: `... work=Wms flushed=0|1 | centers=...` (fps EMA only on flushed frames).
+
+**Hardware results (release, 2026-07-07) — P1 VERIFIED ✓**
+
+```
+Clock ready 609 ms | bezel anim=396000 full=19444 offsets | retained FB 424 KiB PSRAM
+First frame: 68 ms
+Sweep (fade):   render=85-88ms work=110-113ms   (text redraw every frame while fade ramps)
+Sweep (after):  render=23-33ms flush=24ms work=47-57ms
+Static:         render=0ms flush=0ms work=0ms flushed=0   ← zero pixels, zero flush
+Minute cycle:   render=13-56ms work≤80ms — even at cdelta=12477 peak
+Two full minute cycles observed: 396000 → 0 → 396000, heal 79200 both times.
+```
+
+| Metric | P0 (ping-pong) | P1 (retained WatchFb) |
+|--------|----------------|------------------------|
+| Sweep render | 104–117 ms | **23–33 ms** (85 ms only during 2.4 s text fade) |
+| Static render | 75–78 ms | **0 ms** (flush skipped entirely) |
+| Minute-cycle peak render | 124 ms | **56 ms** |
+| Worst frame work | 148 ms | **80 ms** — fits the 91 ms cadence |
+| Effective cadence | 6.9–10 fps varying | **11 fps fixed, all phases** |
+| PSRAM framebuffers | 848 KiB | **424 KiB** |
+
+All anim phases now complete inside the fixed 90.9 ms frame budget → consistent 11 fps
+with the designed 8.0 s sweep / 3.5 s undraw / 3.5 s redraw wall-clock durations.
+Note the `fps~` number in the log is work-capacity fps (1000/work_ms EMA over flushed
+frames), not the paced cadence.
+
+**Next:** P2 (per-phase Bezier tuning — infra already in build.rs), P3 (partial flush
+via the DMI spans now being recorded; expect flush 5–15 ms during anim), P4 (pipeline
+overlap using the second buffer + app-core flush worker already present in main.rs).
+
+### Update 2026-07-07 — P2 (per-phase curves) + P3 (partial DMA flush) — VERIFIED ✓
+
+**P2 (`build.rs`):** per-phase cubic Bezier control points, CSS `cubic-bezier` semantics:
+- `INITIAL_BEZIER = (0.25, 0.1, 0.75, 0.9)` — unchanged stately S (hardware-validated)
+- `MINUTE_BEZIER = (0.33, 0.0, 0.67, 1.0)` — snappier mid (max slope 1.5, peak
+  cdelta 15540), still soft ends. Reads as a response to the tick.
+Rule of thumb documented in build.rs: keep max slope ≤ ~1.6 so the worst anim frame
+stays inside the 91 ms cadence. No `src/anim.rs` was created — there is no runtime ease
+math at all (schedules are flash tables), so the curve constants live in build.rs.
+
+**P3 (`src/qspi_bus.rs`, `src/bin/main.rs`):**
+- `QspiBus::flush_spans` — groups runs of consecutive same-x-extent spans (what rect
+  damage decomposes into) into one `0x2A/0x2B/0x2C` window, then streams rows with CS
+  held (first row carries the 0x32 pixel command, rest continue). Command overhead is
+  per rect, not per row.
+- `QspiBus::set_window` — full-frame flush path now restores the full window first
+  (partial flushes leave the panel windowed — forgetting this corrupts the display).
+- Policy in main loop: partial when `!overflowed && dirty_bytes < FB/3`, else full.
+- Log: `flush=Xms(P|F|-) spans=N`.
+
+**Hardware log (release, 2026-07-07):**
+```
+Sweep (during text fade): flush=8ms(P) spans=204 / one 24ms(F) frame (text+ring > FB/3)
+Sweep (after fade):       render=20-32ms flush=0ms(P) spans=14-39 work=20-32ms
+Heal frames:              flush=0ms(P) spans=14 work=29ms
+Minute cycle:             cdelta peak 15456 (new snappier curve) render≤65ms
+                          flush=0ms(P) spans≤66 work≤65ms
+```
+- Partial flush during anim measures **0 ms** (sub-ms) — beats the 5–15 ms target;
+  the dirty ring window is a tiny rect and text rarely changes.
+- Worst frame anywhere: 65 ms work vs 91 ms budget → 11 fps cadence holds everywhere.
+- Full flush now happens only on prime + rare large-dirty frames (correctly detected).
+
+**Remaining:** P4 (pipeline overlap). At the current numbers total work is far under
+budget, so P4 buys headroom for future OS layers rather than FPS — do it when the
+compositor grows layers, or to raise TARGET_FPS beyond ~15.
+
+### Update 2026-07-07 — Window-alignment fix + 20 fps cadence — VERIFIED ✓
+
+**Bug (user-visible):** partial flush produced displaced/stale pixel patches along the
+arc. Root cause: CO5300 windows must be **2-px aligned** (column start even, end odd —
+panel RAM writes in 2-pixel units). The full-frame window (6..471, rows 0..465)
+happens to satisfy this, which is why full flushes were always clean; per-span windows
+used arbitrary coords. **Fix:** `flush_rect` expands every window outward to 2-px
+alignment on both axes (extra flushed pixels carry correct fb data — harmless).
+User-confirmed pattern: if partial flush ever glitches again, check alignment first.
+
+**20 fps cadence** (`TARGET_FPS = 20` in build.rs, `CLOCK_FRAME_US = 50_000`):
+same wall-clock durations (8 s / 3.5 s / 3.5 s), twice the schedule steps → halved
+per-frame deltas (initial peak 2989, minute peak 8566) → visibly smoother motion.
+Startup fade quantized to 32 brightness levels so retained text + ring start window
+redraw ~32× total during the 2.4 s fade instead of every frame.
+
+**Hardware log (release, 2026-07-07):**
+```
+Sweep (after fade): render=21-29ms flush=0ms(P) spans=14-30 work=21-29ms   → 20 fps locked
+Minute cycle:       cdelta peak 8502 render≤41ms flush=0ms(P) work≤41ms   → 20 fps locked
+Heal frames:        29ms
+Fade-level frames:  work=87-90ms (~32 frames over 2.4s) — overrun stretches the
+                    sweep's soft start by ~0.5s; everything else fits 50ms.
+```
+
+If the fade-start stretch ever matters: options are (a) fewer fade levels (16),
+(b) hardware fade via CO5300 brightness register 0x51 ramp (zero pixel writes — draw
+everything at full brightness, ramp the panel; untested, panel curve may be nonlinear),
+or (c) P4 overlap. Not currently worth it.

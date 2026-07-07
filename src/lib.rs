@@ -11,6 +11,8 @@ pub mod cloud;
 pub mod light_rays;
 pub mod gradient;
 pub mod clock;
+pub mod dmi;
+pub mod watch_fb;
 
 #[cfg(feature = "prebake")]
 pub mod prebake;

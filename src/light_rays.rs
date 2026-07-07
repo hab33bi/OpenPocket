@@ -109,10 +109,10 @@ impl LightRays {
                 continue;
             }
 
-            let sy = (ly as i32 - ray_y0) ;  // positive down
+            let sy = ly as i32 - ray_y0;  // positive down
 
             for lx in 0..lw {
-                let sx = (lx as i32 - cx) ;
+                let sx = lx as i32 - cx;
 
                 // approx length
                 let dist = isqrt_approx( (sx as i64 * sx as i64 + sy as i64 * sy as i64) as i32 >> 0 );  // rough
@@ -143,7 +143,7 @@ impl LightRays {
                         let pulse = (10000 + lut_sin_cos_q14( (t * 5) + (r * 1000) )) >> 1 ;
 
                         let mut contrib = (cross * len_f / beam ) * fade / 16384 ;
-                        contrib = (contrib * pulse / 16384 ) ;
+                        contrib = contrib * pulse / 16384;
 
                         intens += contrib ;
                     }

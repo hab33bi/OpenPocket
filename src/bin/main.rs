@@ -23,12 +23,6 @@ use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use pocket_watch_smoke_test::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
 use pocket_watch_smoke_test::raidal::{Scratch, LOW_W};
-#[cfg(not(feature = "prebake"))]
-use pocket_watch_smoke_test::light_rays::LightRays;
-#[cfg(not(feature = "prebake"))]
-use pocket_watch_smoke_test::raidal::{LOW_H, Raidal2Config}; // keep for compat if needed
-#[cfg(not(feature = "prebake"))]
-use pocket_watch_smoke_test::raidal::Raidal2; // optional fallback
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -224,31 +218,36 @@ fn main() -> ! {
 
     #[cfg(not(feature = "prebake"))]
     {
-    // time-display: black background + centered digital time (Inter-style) + startup fade + smooth bezel circle animation.
-    // 30 fps target, 10px bezel padding, beautiful ease curve. Double PSRAM ping-pong + direct render.
+    // time-display (P1): single retained WatchFb canvas in PSRAM — incremental
+    // ring/text deltas only, no per-frame clear or ping-pong copy (flush is
+    // blocking, so no tearing). Clean frames skip the flush entirely (the
+    // CO5300 retains its GRAM); the loop is paced to a fixed cadence so the
+    // frame-indexed anim schedules run at their designed duration.
     let byte_count = (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2;
     let mut fb0 = vec![0u8; byte_count];
-    let mut fb1 = vec![0u8; byte_count];
 
     println!("Entering Time Display (black + scale-to-gray AA Inter text + dual-list solid bezel).");
     println!("Clock (live, no prebake) init...");
     let init_start = Instant::now();
+    let mut wfb = pocket_watch_smoke_test::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
     let mut clock = pocket_watch_smoke_test::clock::Clock::new();
     println!(
-        "Clock ready {} ms | bezel anim={} full={} offsets | 2x FB {} KiB PSRAM",
+        "Clock ready {} ms | bezel anim={} full={} offsets | retained FB {} KiB PSRAM",
         init_start.elapsed().as_millis(),
         clock.bezel_anim_len,
         clock.bezel_full_len,
-        (byte_count * 2) / 1024
+        byte_count / 1024
     );
 
     let anim_start = Instant::now();
-    let mut front = 0usize;
-    const CLOCK_FRAME_US: u64 = 0; // run full speed (as fast as render+DMA flush allows) for substantial higher FPS
+    // Fixed 20 fps cadence — matches TARGET_FPS in build.rs so the frame-indexed
+    // ease schedules take exactly their designed wall-clock duration.
+    const CLOCK_FRAME_US: u64 = 50_000;
 
-    // Prime (no prev buffer — black fill)
-    clock.render_to_fb(&mut fb0, None, 0);
-    bus.flush_bytes(&fb0);
+    // Prime: WatchFb::new cleared the canvas and marked it fully dirty.
+    clock.render(&mut wfb, 0);
+    bus.flush_bytes(wfb.bytes());
+    wfb.clear_damage();
     println!("First frame: {} ms", anim_start.elapsed().as_millis());
 
     let mut last_report = Instant::now();
@@ -258,40 +257,57 @@ fn main() -> ! {
         let frame_start = Instant::now();
         let elapsed = anim_start.elapsed().as_millis() as u32;
 
-        // Ping-pong: copy displayed front into back, apply incremental deltas, flush new front
-        let back = 1 - front;
         let render_start = Instant::now();
-        if front == 0 {
-            clock.render_to_fb(&mut fb1, Some(&fb0), elapsed);
-        } else {
-            clock.render_to_fb(&mut fb0, Some(&fb1), elapsed);
-        }
+        clock.render(&mut wfb, elapsed);
         let render_ms = render_start.elapsed().as_millis() as u32;
 
-        front = back;
-        bus.write_command(0x2C);
-        let front_fb = if front == 0 { &fb0 } else { &fb1 };
-        let flush_start = Instant::now();
-        bus.flush_bytes(front_fb);
-        let flush_ms = flush_start.elapsed().as_millis() as u32;
+        // Skip the flush when nothing changed — panel keeps showing its GRAM.
+        // Otherwise: partial windowed flush of dirty spans (P3) when the dirty
+        // area is small; full frame when the DMI overflowed or per-window
+        // overhead would exceed a straight full flush.
+        let mut flush_ms = 0u32;
+        let mut span_count = 0usize;
+        let flush_mode = if wfb.is_clean() {
+            '-'
+        } else {
+            let spans = wfb.dmi.spans();
+            span_count = spans.len();
+            let dirty_bytes: usize = spans
+                .iter()
+                .map(|s| (s.x1 - s.x0 + 1) as usize * 2)
+                .sum();
+            let partial = !wfb.dmi.overflowed() && dirty_bytes < byte_count / 3;
+            let flush_start = Instant::now();
+            if partial {
+                bus.flush_spans(wfb.bytes(), spans, LCD_WIDTH, LCD_COL_OFFSET);
+            } else {
+                // Partial flushes shrink the panel window — restore it first.
+                bus.set_window(LCD_COL_OFFSET, LCD_COL_OFFSET + LCD_WIDTH - 1, 0, LCD_HEIGHT - 1);
+                bus.write_command(0x2C);
+                bus.flush_bytes(wfb.bytes());
+            }
+            flush_ms = flush_start.elapsed().as_millis() as u32;
+            wfb.clear_damage();
+            if partial { 'P' } else { 'F' }
+        };
+        let flushed = flush_mode != '-';
 
-        // No hard cap delay (CLOCK_FRAME_US=0) — let DMA/PSRAM opts + fast ring draw deliver max FPS
-        // (previous delay_until kept only if >0)
-        if CLOCK_FRAME_US > 0 {
-            let deadline = frame_start + Duration::from_micros(CLOCK_FRAME_US);
-            delay_until(deadline);
+        let work_ms = frame_start.elapsed().as_millis() as u32;
+        delay_until(frame_start + Duration::from_micros(CLOCK_FRAME_US));
+
+        let inst_fps = if work_ms > 0 { 1000.0 / work_ms as f32 } else { 0.0 };
+        if flushed {
+            ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
         }
-
-        let total_ms = frame_start.elapsed().as_millis() as u32;
-        let inst_fps = if total_ms > 0 { 1000.0 / total_ms as f32 } else { 0.0 };
-        ema_fps = if ema_fps < 1.0 { inst_fps } else { ema_fps * 0.9 + inst_fps * 0.1 };
         if last_report.elapsed() >= Duration::from_secs(1) {
             println!(
-                "clock fps~{:.1} render={}ms flush={}ms total={}ms | centers={} cdelta={} px_writes={}",
+                "clock fps~{:.1} render={}ms flush={}ms({}) spans={} work={}ms | centers={} cdelta={} px_writes={}",
                 ema_fps,
                 render_ms,
                 flush_ms,
-                total_ms,
+                flush_mode,
+                span_count,
+                work_ms,
                 clock.last_bezel_centers,
                 clock.last_bezel_center_delta,
                 clock.last_bezel_writes

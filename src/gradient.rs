@@ -7,32 +7,20 @@
 //! - Centered for round display, soft vignette.
 //! - Black/dark edges for contrast.
 //!
-//! PSRAM + Double Buf for smoothness (per plan/research):
-//! - Framebuffers stored in PSRAM (via psram_allocator in main).
-//! - Double buffering (fb0/fb1): render complete to back, flush front (avoids tearing/flashing/lines during update).
-//! - Full res direct render_to_fb (no low-res/upscale) for artifact-free smooth gradient.
-//! - Research on board (Waveshare ESP32-S3 AMOLED): PSRAM double buf + DMA enables 25-60FPS smooth anims (LVGL/custom examples).
-//! - Gradient compute very cheap at full res -> total ~flush time (~25-40ms) => 25-40 FPS easily >20 target.
+//! Simple Blue Gradient - premium diagonal gentle sweeping animation (dark blue to royal blue).
 //!
-//! Strategy (following main branch learnings + cloud/light-rays ports, web research):
-//! - Live only (no prebake, minimal flash).
-//! - Q14 + lut_sin_cos_q14 (best internal "lib") for wave.
-//! - Direct sync flush.
-//! - Extremely efficient: few ops + 1 LUT/pixel.
-//! - Target 30+ FPS (easy; flush limited ~25-40ms).
-//! - Production: dither optional (research: dithereens), but simple noise here.
-//! - No new deps for minimal cost (Animato/dithereens researched but deferred; internal sufficient for simple).
+//! Current implementation (addresses "bands too visible, need to almost blur, 15-20fps smooth slow"):
+//! - Low-res (div=2) eval + bilinear upscale for natural soft blending ("almost blur into each other").
+//! - Cheap per-pixel dither in low eval to further hide RGB565 quantization bands.
+//! - Monotonic Q14 diagonal + slow rot + dual subtle waves.
+//! - Double PSRAM framebuffers + correct ping-pong (render back, flush front).
+//! - Frame rate capped ~15-20 FPS with slow phase advance for smooth slow motion.
+//! - Darker low-sat navy with dark purple hint, vignette.
 //!
-//! Research notes:
-//! - Best internal: Q14 LUT + direct pipeline (from raidal, proven 30FPS+).
-//! - External: embedded-graphics (optional primitives), Animato (tween for future), dithereens (dither).
-//!   For this, custom pixel is lowest cost/highest FPS.
-//! - Diagonal gentle: phase along (x+y), slow speed, low amp wave.
-//! - To 25+FPS: full res ok; optimize DMA if needed (8k chunks already good).
-//! - Premium: high prec lerp, LUT wave, round center, calm params.
-//!
-//! Usage: similar to Cloud/LightRays. Call render_to_fb for full direct.
+//! All math uses Q14 + lut_sin_cos_q14. Reuses project's bilinear + upscale tables.
+//! Live only. Call render_to_fb(fb, t_q) each frame from the main loop.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::raidal::{lut_sin_cos_q14, q14_rgb_to_rgb565};
@@ -44,9 +32,7 @@ pub const LOW_W: u16 = 466 / GRAD_DIV;
 pub const LOW_H: u16 = 466 / GRAD_DIV;
 pub const LOW_PIXELS: usize = (LOW_W as usize) * (LOW_H as usize);
 
-/// Dark blue (deep navy) to Royal blue. Tuned for good 565 contrast.
-const DARK_BLUE: u16 = 0x000B;  // deep dark blue
-const ROYAL_BLUE: u16 = 0x45DF; // rich royal blue
+// (Legacy 565 consts kept for reference; current path uses Q14 component lerp + dither.)
 
 #[derive(Clone, Copy, Debug)]
 pub struct GradientConfig {
@@ -61,8 +47,8 @@ impl Default for GradientConfig {
     fn default() -> Self {
         Self {
             time_scale: 1.0,
-            sweep_speed: 0.2,  // very slow elegant sweep
-            wave_amp: 0.08,    // subtle organic wave
+            sweep_speed: 0.7,  // slow for "smooth slow" visible gentle cycling
+            wave_amp: 0.09,    // subtle for premium blur blend
         }
     }
 }
@@ -75,6 +61,7 @@ pub struct BlueGradient {
     out_h: u16,
     ux: Vec<UpSample1D>,
     uy: Vec<UpSample1D>,
+    low_buf: Vec<u16>,  // internal for low-res eval (blur via upscale)
     t_q: i32,
 }
 
@@ -93,6 +80,7 @@ impl BlueGradient {
         let ux = build_upscale_table(width, low_w, GRAD_DIV);
         let uy = build_upscale_table(height, low_h, GRAD_DIV);
 
+        let low_pixels = (low_w as usize) * (low_h as usize);
         Self {
             config,
             low_w,
@@ -101,6 +89,7 @@ impl BlueGradient {
             out_h: height,
             ux,
             uy,
+            low_buf: vec![0u16; low_pixels],
             t_q: 0,
         }
     }
@@ -110,62 +99,103 @@ impl BlueGradient {
         self.t_q = (t_f * 16384.0) as i32;
     }
 
-    /// Full low-res eval for the diagonal gradient.
-    /// Diagonal sweep: phase along (x + y), gentle wave.
+    /// Low-res eval (div=2) for diagonal gradient + blur via upscale.
+    /// Uses monotonic arithmetic factor (no & fold), rot + dual waves, dither for 565 smooth blend.
     pub fn eval_rows(&self, low_buf: &mut [u16], row_start: usize, row_end: usize) {
-        let lw = self.low_w as usize;
-        let lh = self.low_h as usize;
+        Self::eval_gradient_rows(
+            self.low_w,
+            self.low_h,
+            self.t_q,
+            self.config.sweep_speed,
+            self.config.wave_amp,
+            low_buf,
+            row_start,
+            row_end,
+        );
+    }
+
+    /// Core low-res gradient math. Extracted so render_to_fb can call it without borrow conflicts
+    /// while using the struct's low_buf.
+    fn eval_gradient_rows(
+        low_w: u16,
+        low_h: u16,
+        t: i32,
+        sweep: f32,
+        amp: f32,
+        low_buf: &mut [u16],
+        row_start: usize,
+        row_end: usize,
+    ) {
+        let lw = low_w as usize;
+        let lh = low_h as usize;
         let rs = row_start.min(lh);
         let re = row_end.min(lh);
 
-        let t = self.t_q;
-        let sweep = (self.config.sweep_speed * 16384.0) as i32;
-        let amp = (self.config.wave_amp * 16384.0) as i32;
+        let sweep_q = (sweep * 16384.0) as i32;
+        let amp_q = (amp * 16384.0) as i32;
+
+        // Darker navy + hint dark purple, low sat (scaled to Q14)
+        let dark_r: i32 = 0 * 16384 / 255;
+        let dark_g: i32 = 5 * 16384 / 255;
+        let dark_b: i32 = 28 * 16384 / 255;
+        let purp_r: i32 = 6 * 16384 / 255;
+        let purp_g: i32 = 3 * 16384 / 255;
+        let purp_b: i32 = 50 * 16384 / 255;
 
         let cx = (lw / 2) as i32;
         let cy = (lh / 2) as i32;
 
         for ly in rs..re {
             let y_off = (ly as i32 - cy) * 16384 / (lh as i32);
-
             for lx in 0..lw {
                 let x_off = (lx as i32 - cx) * 16384 / (lw as i32);
 
-                // Diagonal coord (x + y normalized) - full coverage for larger sweep
-                let diag = x_off + y_off;  // larger range for 3x bigger effect
+                // Slow rotation of diagonal for diversity
+                let rot = t >> 9;
+                let c = lut_sin_cos_q14(rot + 4096);
+                let s = lut_sin_cos_q14(rot);
+                let diag = (x_off * c + y_off * s) >> 13;
 
-                // Gentle sweep phase (slow diagonal advance)
-                let phase = t.wrapping_mul(sweep / 800);  // adjusted for larger visible sweep
+                // Slow phase for smooth slow motion
+                let phase = t.wrapping_mul(sweep_q >> 9);
 
-                // Base blend factor with sweep - covers more of the diagonal
-                let mut factor = (diag.wrapping_add(phase) >> 1) & 0x7FFF;
-                factor = factor.clamp(0, 16384);
+                // Monotonic ramp (arithmetic, no fold & causing bands/strips)
+                let pos = diag + phase;
+                let mut factor = ((pos + 32768) >> 1).clamp(0, 16384);
 
-                // Subtle perpendicular wave for premium flowing feel (larger for 3x effect)
+                // Dual subtle waves (organic premium)
                 let perp = (x_off - y_off) / 2;
-                let wave = lut_sin_cos_q14(perp.wrapping_add(phase / 2));
-                let wave_contrib = (wave * amp * 2) >> 14;  // boosted
-                factor = (factor + wave_contrib).clamp(0, 16384);
+                let w1 = lut_sin_cos_q14(perp + (phase >> 1));
+                let w2 = lut_sin_cos_q14((perp >> 1) + (phase >> 3));
+                let w_contrib = ((w1 + (w2 >> 1)) * amp_q) >> 14;
+                factor = (factor + w_contrib).clamp(0, 16384);
 
-                // Lerp colors (Q14 style for smoothness)
-                // Simple lerp between fixed 565 (promote to Q)
-                let dark = (DARK_BLUE as i32) << 9;  // rough scale
-                let royal = (ROYAL_BLUE as i32) << 9;
-                let color = dark + (((royal - dark) * factor) >> 14);
+                // Q14 lerp navy <-> purple
+                let mut r = dark_r + (((purp_r - dark_r) * factor) >> 14);
+                let mut g = dark_g + (((purp_g - dark_g) * factor) >> 14);
+                let mut b = dark_b + (((purp_b - dark_b) * factor) >> 14);
 
-                // Soft vignette for round premium
-                let dist = isqrt_approx((x_off as i64 * x_off as i64 + y_off as i64 * y_off as i64) as i32 >> 8);
-                let vig = (16384 - (dist * 4000 / 16384)).max(8000);  // soft
-                let color = (color * vig) >> 14;
+                // Vignette
+                let dist2 = (x_off as i64 * x_off as i64 + y_off as i64 * y_off as i64) >> 10;
+                let dist = isqrt_approx(dist2 as i32);
+                let vig = (16384 - (dist * 2200 / 16384)).max(7500);
+                r = (r * vig) >> 14;
+                g = (g * vig) >> 14;
+                b = (b * vig) >> 14;
 
-                // To 565 (simplified from q14 helper)
-                let c = (color >> 9) as u16;  // back
-                let r = ((c >> 11) & 0x1F) as u16;
-                let g = ((c >> 5) & 0x3F) as u16;
-                let b = (c & 0x1F) as u16;
-                // slight desat for dark to royal
-                let px = (r << 11) | (g << 5) | b;
+                // Keep dark overall
+                r = (r * 15200) >> 14;
+                g = (g * 15200) >> 14;
+                b = (b * 15200) >> 14;
 
+                // Cheap dither (x^y + t hash) to blur 565 bands further
+                let d = (((lx as i32 * 19) ^ (ly as i32 * 31) + (t >> 8)) & 7) - 3;
+                let dith = d * 210;
+                r = (r + dith).clamp(0, 16384);
+                g = (g + dith).clamp(0, 16384);
+                b = (b + (dith / 2)).clamp(0, 16384);
+
+                let px = q14_rgb_to_rgb565(r, g, b);
                 low_buf[ly * lw + lx] = px;
             }
         }
@@ -175,72 +205,26 @@ impl BlueGradient {
         self.eval_rows(low_buf, 0, self.low_h as usize);
     }
 
-    /// Full resolution direct render to display-ready BE RGB565 framebuffer in PSRAM.
-    /// No low-res/upscale to ensure smooth no-artifact gradient (eliminates lines).
-    /// Diagonal gentle sweep: phase along (x+y), subtle wave.
-    pub fn render_to_fb(&self, fb: &mut [u8], t_q: i32) {
-        let w = self.out_w as usize;
-        let h = self.out_h as usize;
-        let cx = (w / 2) as i32;
-        let cy = (h / 2) as i32;
-
-        let sweep = (self.config.sweep_speed * 16384.0) as i32;
-        let amp = (self.config.wave_amp * 16384.0) as i32;
-
-        // Precompute colors in Q14 for smooth lerp
-        let dark_r: i32 = 0;   // dark blue ~ #000020
-        let dark_g: i32 = 0;
-        let dark_b: i32 = 0x10 * 257; // approx
-
-        let royal_r: i32 = 0x41 * 257;
-        let royal_g: i32 = 0x69 * 257;
-        let royal_b: i32 = 0xE1 * 257;
-
-        for y in 0..h {
-            let y_off = (y as i32 - cy) * 16384 / (h as i32);
-            for x in 0..w {
-                let x_off = (x as i32 - cx) * 16384 / (w as i32);
-
-                // Diagonal: (x + y) for sweep direction
-                let diag = x_off + y_off;
-
-                let phase = t_q.wrapping_mul(sweep >> 10);  // scale for gentle speed
-
-                // Factor for blend, mod for seamless
-                let mut factor = (diag + phase) & 0xFFFF;
-                if factor > 8192 { factor = 16384 - (factor & 0x3FFF); } // triangle wave like for sweep
-                factor = factor.clamp(0, 16384);
-
-                // Gentle wave on perpendicular for smooth organic flow (no hard lines)
-                let perp = x_off - y_off;
-                let wave = lut_sin_cos_q14(perp + (phase >> 1));
-                let wave_contrib = ((wave * amp) >> 14);
-                factor = (factor + wave_contrib).clamp(0, 16384);
-
-                // Smooth Q14 lerp
-                let r = dark_r + (((royal_r - dark_r) * factor) >> 14);
-                let g = dark_g + (((royal_g - dark_g) * factor) >> 14);
-                let b = dark_b + (((royal_b - dark_b) * factor) >> 14);
-
-                // Soft vignette for round display premium look (majority not hard edge)
-                let dist2 = (x_off as i64 * x_off as i64 + y_off as i64 * y_off as i64) >> 10;
-                let dist = isqrt_approx(dist2 as i32);
-                let vig = (16384 - (dist * 3000 / 16384)).max(6000);
-                let r = (r * vig) >> 14;
-                let g = (g * vig) >> 14;
-                let b = (b * vig) >> 14;
-
-                // To RGB565 BE (clamped)
-                let r5 = ((r.max(0).min(16384) * 31) >> 14) as u8;
-                let g6 = ((g.max(0).min(16384) * 63) >> 14) as u8;
-                let b5 = ((b.max(0).min(16384) * 31) >> 14) as u8;
-                let px = ((r5 as u16) << 11) | ((g6 as u16) << 5) | (b5 as u16);
-
-                let idx = (y * w + x) * 2;
-                fb[idx] = (px >> 8) as u8;
-                fb[idx + 1] = px as u8;
-            }
-        }
+    /// Render to BE RGB565 fb (in PSRAM). Uses low-res eval + bilinear upscale for soft blur blending
+    /// that makes colors "almost blur into eachother" and hides 565 bands. Full-res direct replaced to achieve
+    /// Render using low-res + bilinear upscale (provides the soft "almost blur" blending to hide
+    /// RGB565 bands). Delegates to eval_rows (source of truth for dither + factor + waves) then upscale.
+    /// Call with fresh t_q each frame.
+    pub fn render_to_fb(&mut self, fb: &mut [u8], t_q: i32) {
+        self.t_q = t_q;
+        let low_h = self.low_h as usize;
+        let out_h = self.out_h as usize;
+        Self::eval_gradient_rows(
+            self.low_w,
+            self.low_h,
+            t_q,
+            self.config.sweep_speed,
+            self.config.wave_amp,
+            &mut self.low_buf,
+            0,
+            low_h,
+        );
+        self.upscale_rows(&self.low_buf, fb, 0, out_h);
     }
 
     pub fn upscale_rows(&self, low: &[u16], out: &mut [u8], row_start: usize, row_end: usize) {
