@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 #![no_main]
 #![deny(clippy::mem_forget)]
 #![deny(clippy::large_stack_frames)]
@@ -21,8 +21,8 @@ use esp_println::println;
 
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-use pocket_watch_smoke_test::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
-use pocket_watch_smoke_test::raidal::{Scratch, LOW_W};
+use openpocket::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
+use openpocket::raidal::{Scratch, LOW_W};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -90,7 +90,7 @@ fn main() -> ! {
                 if CORE1_READY.load(Ordering::SeqCst) {
                     let rs = EVAL_ROW_START.load(Ordering::SeqCst);
                     let re = EVAL_ROW_END.load(Ordering::SeqCst);
-                    let p = &raw mut pocket_watch_smoke_test::raidal::RAIDAL_PTR;
+                    let p = &raw mut openpocket::raidal::RAIDAL_PTR;
                     let shader_ptr = (*p).load(Ordering::SeqCst);
                     if !shader_ptr.is_null() {
                         let shader = &mut *shader_ptr;
@@ -103,8 +103,8 @@ fn main() -> ! {
                 if UPSCALE_CORE1_READY.load(Ordering::SeqCst) {
                     let rs = UPSCALE_ROW_START.load(Ordering::SeqCst);
                     let re = UPSCALE_ROW_END.load(Ordering::SeqCst);
-                    let shader_p = &raw mut pocket_watch_smoke_test::raidal::RAIDAL_PTR;
-                    let fb_p = &raw mut pocket_watch_smoke_test::raidal::FB_PTR;
+                    let shader_p = &raw mut openpocket::raidal::RAIDAL_PTR;
+                    let fb_p = &raw mut openpocket::raidal::FB_PTR;
                     let shader_ptr = (*shader_p).load(Ordering::SeqCst);
                     let fb_ptr = (*fb_p).load(Ordering::SeqCst);
                     if !shader_ptr.is_null() {
@@ -229,8 +229,8 @@ fn main() -> ! {
     println!("Entering Time Display (black + scale-to-gray AA Inter text + dual-list solid bezel).");
     println!("Clock (live, no prebake) init...");
     let init_start = Instant::now();
-    let mut wfb = pocket_watch_smoke_test::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
-    let mut clock = pocket_watch_smoke_test::clock::Clock::new();
+    let mut wfb = openpocket::watch_fb::WatchFb::new(&mut fb0, LCD_WIDTH, LCD_HEIGHT);
+    let mut clock = openpocket::clock::Clock::new();
     println!(
         "Clock ready {} ms | bezel anim={} full={} offsets | retained FB {} KiB PSRAM",
         init_start.elapsed().as_millis(),
