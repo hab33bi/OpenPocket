@@ -24,3 +24,9 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# Local logs and terminals from development
+terminals/
+
+# Clippy or other local
+.clippy.toml
