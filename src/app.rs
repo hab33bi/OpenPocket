@@ -397,11 +397,23 @@ impl<'a, 'd> App<'a, 'd> {
         // ~one report (~10 ms) of lag; monotonic motion passes unharmed.
         let mut d_hist = [start_dist; 3];
         let mut d_idx = 0usize;
+        // Report-gap instrumentation, split by sheet half: proves/kills the
+        // "report rate collapses as the finger slows near the top" theory.
+        let mut last_move = Instant::now();
+        let (mut gap_bot, mut gap_top) = (0u32, 0u32);
+        let mut prev_target = target_b;
 
         let (dist, vel) = loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragMove { dist, .. } => {
+                    let g = last_move.elapsed().as_millis() as u32;
+                    last_move = Instant::now();
+                    if (target_b as i32) > H / 2 {
+                        gap_bot = gap_bot.max(g);
+                    } else {
+                        gap_top = gap_top.max(g);
+                    }
                     d_hist[d_idx] = dist;
                     d_idx = (d_idx + 1) % 3;
                     target_b = map_target(median3(d_hist));
@@ -417,13 +429,21 @@ impl<'a, 'd> App<'a, 'd> {
             {
                 last_compose = Instant::now();
                 let t0 = Instant::now();
-                // Critically-damped tracking: 2/3 of the remaining distance
-                // per compose — absorbs edge-of-panel sensor jitter while
-                // staying glued to the finger (k=1/2 left a perceptible lag
-                // tail at the end of slow unlocks).
+                // Speed-adaptive pursuit. Fast finger: 2/3 of the remaining
+                // distance per compose — glued, jitter-damped. Slow finger:
+                // the CST9217's report rate collapses at low speeds, so the
+                // target arrives in coarse steps with pauses — detected as a
+                // small per-compose target delta; glide at ≤4 px/compose so
+                // sparse jumps render as continuous motion, not staccato
+                // (lag at those speeds is ~1-2 px, imperceptible).
+                let tstep = (target_b as i32 - prev_target as i32).abs();
+                prev_target = target_b;
                 let diff = target_b as i32 - *sheet_b as i32;
                 let next = if diff.abs() <= 2 {
                     target_b
+                } else if tstep <= 12 {
+                    let step = (diff / 4).clamp(-4, 4);
+                    (*sheet_b as i32 + if step == 0 { diff.signum() } else { step }) as u16
                 } else {
                     (*sheet_b as i32 + diff * 2 / 3) as u16
                 };
@@ -457,7 +477,7 @@ impl<'a, 'd> App<'a, 'd> {
             (SwipeDir::Down, false) => (0, "stay-unlocked"),
         };
         println!(
-            "gesture: release dir={} dist={dist} vel_q8={vel} -> {verdict} (composes={composes} max_step={max_step})",
+            "gesture: release dir={} dist={dist} vel_q8={vel} -> {verdict} (composes={composes} max_step={max_step} gap_bot={gap_bot}ms gap_top={gap_top}ms)",
             dir_str(dir)
         );
         // Carry the drag text bbox into the settle (same composer).
