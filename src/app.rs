@@ -53,12 +53,20 @@ const SETTLE_SNAP_PX: i32 = 6;
 /// Consecutive touch I2C errors before the controller is re-initialized.
 const TOUCH_REINIT_ERRORS: u32 = 5;
 
-/// M5 burn-in mitigation: dim the panel after this long without touch…
+/// M5 burn-in/power ladder: dim after this long without touch…
 const IDLE_DIM_SECS: u64 = 30;
-/// …ramping to this brightness (CO5300 reg 0x51; 0xFF = full).
+/// …ramping to this brightness (CO5300 reg 0x51; 0xFF = full)…
 const IDLE_DIM_LEVEL: u8 = 0x38;
+/// …then AOD (black + drifting HH:MM only, ring off) after this long…
+const AOD_SECS: u64 = 120;
+const AOD_BRIGHTNESS: u8 = 0x18;
+/// …then full display sleep. Touch wakes instantly from every stage.
+const SLEEP_SECS: u64 = 600;
 /// Dim-down ramp step per frame (~1.2 s at 20 fps); wake restores instantly.
 const DIM_STEP: u8 = 8;
+/// Relaxed cadence while in AOD/Sleep (touch polling is unaffected — the
+/// cadence wait loop polls the INT pin continuously either way).
+const IDLE_FRAME_US: u64 = 500_000;
 
 const H: i32 = LCD_HEIGHT as i32;
 const ROW_BYTES: usize = LCD_WIDTH as usize * 2;
@@ -67,6 +75,18 @@ const ROW_BYTES: usize = LCD_WIDTH as usize * 2;
 enum Scene {
     Locked,
     Unlocked,
+}
+
+/// M5 idle ladder. Wake (on any touch) is instant from every state.
+#[derive(Clone, Copy, PartialEq)]
+enum Power {
+    Awake,
+    /// Panel dimmed; scene renders normally, minute sweep suppressed.
+    Dim,
+    /// Black canvas + drifting HH:MM only (Locked only; auto-relock runs first).
+    Aod,
+    /// Panel display off + sleep-in.
+    Sleep,
 }
 
 /// Touch-poll state shared by the cadence wait and the drag session.
@@ -115,6 +135,8 @@ impl<'a, 'd> App<'a, 'd> {
         let mut last_report = Instant::now();
         let mut ema_fps: f32 = 0.0;
         let mut brightness: u8 = 0xFF;
+        let mut power = Power::Awake;
+        let mut aod_minute: u8 = 255;
 
         loop {
             let frame_start = Instant::now();
@@ -133,7 +155,7 @@ impl<'a, 'd> App<'a, 'd> {
             }
 
             let render_start = Instant::now();
-            if scene == Scene::Locked {
+            if scene == Scene::Locked && power != Power::Aod && power != Power::Sleep {
                 self.clock.render(&mut self.wfb, elapsed, &now);
             }
             let render_ms = render_start.elapsed().as_millis() as u32;
@@ -141,20 +163,58 @@ impl<'a, 'd> App<'a, 'd> {
             let (flush_ms, flush_mode, span_count) = self.flush_dirty();
             let flushed = flush_mode != '-';
 
-            // M5 idle dimming: ramp down after IDLE_DIM_SECS without touch,
-            // restore instantly on activity (burn-in + power).
-            let dim_target = if tp.last_activity.elapsed() >= Duration::from_secs(IDLE_DIM_SECS) {
-                IDLE_DIM_LEVEL
+            // M5 idle ladder: Awake → Dim (30 s) → AOD (2 min, Locked only)
+            // → Sleep (10 min). Any touch wakes instantly.
+            let idle = tp.last_activity.elapsed();
+            let desired = if idle < Duration::from_secs(IDLE_DIM_SECS) {
+                Power::Awake
+            } else if idle < Duration::from_secs(AOD_SECS) || scene == Scene::Unlocked {
+                Power::Dim
+            } else if idle < Duration::from_secs(SLEEP_SECS) {
+                Power::Aod
             } else {
-                0xFF
+                Power::Sleep
             };
-            if brightness != dim_target {
-                brightness = if dim_target > brightness {
-                    dim_target
-                } else {
-                    brightness.saturating_sub(DIM_STEP).max(dim_target)
-                };
-                self.bus.write_c8d8(0x51, brightness);
+            match desired {
+                Power::Awake => {
+                    if power != Power::Awake || brightness != 0xFF {
+                        self.wake_display(&mut power, &mut brightness, &now);
+                    }
+                }
+                Power::Dim => {
+                    if power != Power::Dim {
+                        // No ornament animation to an empty room; the time
+                        // itself still updates.
+                        self.clock.set_minute_anim(false);
+                        power = Power::Dim;
+                    }
+                    if brightness > IDLE_DIM_LEVEL {
+                        brightness = brightness.saturating_sub(DIM_STEP).max(IDLE_DIM_LEVEL);
+                        self.bus.write_c8d8(0x51, brightness);
+                    }
+                }
+                Power::Aod => {
+                    if power != Power::Aod {
+                        power = Power::Aod;
+                        aod_minute = 255; // force the first AOD frame
+                        brightness = AOD_BRIGHTNESS;
+                        self.bus.write_c8d8(0x51, brightness);
+                        println!("power: AOD");
+                    }
+                    if aod_minute != now.minute {
+                        aod_minute = now.minute;
+                        self.clock.draw_aod(&mut self.wfb, &now);
+                        self.flush_dirty();
+                    }
+                }
+                Power::Sleep => {
+                    if power != Power::Sleep {
+                        power = Power::Sleep;
+                        println!("power: display sleep");
+                        self.bus.write_command(0x28); // display off
+                        self.bus.write_command(0x10); // sleep in
+                    }
+                }
             }
 
             let work_ms = frame_start.elapsed().as_millis() as u32;
@@ -163,10 +223,10 @@ impl<'a, 'd> App<'a, 'd> {
             // to the drag session (render-on-touch-move).
             let mut start_drag: Option<(SwipeDir, u16, u16)> = None;
             let mut flick: Option<(SwipeDir, u16, i32)> = None;
-            let frame_us = if scene == Scene::Locked && self.clock.is_animating() {
-                CLOCK_ANIM_FRAME_US
-            } else {
-                FRAME_US
+            let frame_us = match power {
+                Power::Aod | Power::Sleep => IDLE_FRAME_US,
+                _ if scene == Scene::Locked && self.clock.is_animating() => CLOCK_ANIM_FRAME_US,
+                _ => FRAME_US,
             };
             let deadline = frame_start + Duration::from_micros(frame_us);
             loop {
@@ -215,10 +275,10 @@ impl<'a, 'd> App<'a, 'd> {
             self.maybe_reinit_touch(&mut tp);
 
             if let Some((dir, dist, start_y)) = start_drag {
-                // A drag can arm while dimmed — restore before it renders.
-                if brightness != 0xFF {
-                    brightness = 0xFF;
-                    self.bus.write_c8d8(0x51, brightness);
+                // A drag can arm while dimmed/AOD — the composer needs the
+                // normal lock canvas and full brightness before it renders.
+                if power != Power::Awake || brightness != 0xFF {
+                    self.wake_display(&mut power, &mut brightness, &now);
                 }
                 scene =
                     self.drag_session(dir, dist, start_y, &mut sheet_b, &now, anim_start, &mut tp);
@@ -228,9 +288,8 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
             if let Some((dir, dist, vel)) = flick {
-                if brightness != 0xFF {
-                    brightness = 0xFF;
-                    self.bus.write_c8d8(0x51, brightness);
+                if power != Power::Awake || brightness != 0xFF {
+                    self.wake_display(&mut power, &mut brightness, &now);
                 }
                 if dist as i32 > COMPLETE_DIST || vel > COMPLETE_VEL_Q8 {
                     let (target, bbox) = match dir {
@@ -624,6 +683,37 @@ impl<'a, 'd> App<'a, 'd> {
             }
         }
         self.swipe.feed(report, now_ms)
+    }
+
+    /// Instant wake from any idle state: sleep-out / AOD repaint as needed,
+    /// full brightness, minute animation re-enabled.
+    fn wake_display(&mut self, power: &mut Power, brightness: &mut u8, now: &WallTime) {
+        match *power {
+            Power::Sleep => {
+                println!("power: wake from sleep");
+                self.bus.write_command(0x11); // sleep out
+                let t0 = Instant::now();
+                // Panel needs ~120 ms after sleep-out before display-on.
+                while t0.elapsed() < Duration::from_millis(120) {
+                    core::hint::spin_loop();
+                }
+                self.clock.repaint_full(&mut self.wfb, now);
+                self.flush_dirty();
+                self.bus.write_command(0x29); // display on
+            }
+            Power::Aod => {
+                println!("power: wake from AOD");
+                self.clock.repaint_full(&mut self.wfb, now);
+                self.flush_dirty();
+            }
+            _ => {}
+        }
+        self.clock.set_minute_anim(true);
+        if *brightness != 0xFF {
+            *brightness = 0xFF;
+            self.bus.write_c8d8(0x51, 0xFF);
+        }
+        *power = Power::Awake;
     }
 
     /// Bus-health recovery: repeated touch read failures → re-init the chip.

@@ -87,6 +87,10 @@ enum BezelPhase {
 
 pub struct Clock {
     last_minute: u8,
+    /// Minute changes trigger the undraw/redraw ring sweep only when true —
+    /// the app disables it while the panel is dimmed (M5: no ornament
+    /// animation playing to an empty room; text still updates).
+    minute_anim: bool,
     phase: BezelPhase,
     /// Frames elapsed within the current anim phase (schedule index).
     frame_in_phase: u32,
@@ -131,6 +135,7 @@ impl Clock {
     pub fn new() -> Self {
         let mut c = Self {
             last_minute: 99,
+            minute_anim: true,
             phase: BezelPhase::Initial,
             frame_in_phase: 0,
             bezel_offsets_anim: Vec::new(),
@@ -248,7 +253,7 @@ impl Clock {
             self.last_minute = m;
             // Start the unheal→undraw→redraw cycle only from Static; if a prior
             // cycle is somehow still running, let it finish rather than jumping state.
-            if self.phase == BezelPhase::Static {
+            if self.minute_anim && self.phase == BezelPhase::Static {
                 self.phase = BezelPhase::Unheal;
                 self.frame_in_phase = 0;
             }
@@ -693,11 +698,12 @@ impl Clock {
             fb,
             core::str::from_utf8(&s).unwrap(),
             CY + 5 + y_shift,
+            0,
             Q,
             &TIME_GLYPHS,
             clip_y,
         );
-        self.draw_text_centered_clipped(fb, self.date_str(), CY + 70 + y_shift, Q, &TEXT_GLYPHS, clip_y);
+        self.draw_text_centered_clipped(fb, self.date_str(), CY + 70 + y_shift, 0, Q, &TEXT_GLYPHS, clip_y);
         let (x0, y0, x1, y1) = self.text_bbox_at(y_shift);
         (x0, y0, x1, y1.min(clip_y - 1))
     }
@@ -757,6 +763,53 @@ impl Clock {
         self.phase != BezelPhase::Static
     }
 
+    /// Enable/disable the minute-change ring sweep (M5: off while dimmed).
+    pub fn set_minute_anim(&mut self, enabled: bool) {
+        self.minute_anim = enabled;
+    }
+
+    /// AOD minimal frame: black canvas, HH:MM only, drifted by a
+    /// minute-indexed pixel offset to spread AMOLED wear. Invalidates the
+    /// retained caches — waking repaints via `repaint_full`.
+    pub fn draw_aod(&mut self, wfb: &mut WatchFb, now: &WallTime) {
+        const DRIFT: [(i32, i32); 8] = [
+            (0, 0),
+            (5, 3),
+            (-4, 6),
+            (3, -5),
+            (-6, -2),
+            (6, 4),
+            (-3, 3),
+            (2, -6),
+        ];
+        let (dx, dy) = DRIFT[(now.minute % 8) as usize];
+        let fb = wfb.buf_mut();
+        fb.fill(0);
+        let mut s = [b'0'; 5];
+        s[0] = b'0' + (now.hour / 10);
+        s[1] = b'0' + (now.hour % 10);
+        s[2] = b':';
+        s[3] = b'0' + (now.minute / 10);
+        s[4] = b'0' + (now.minute % 10);
+        self.draw_text_centered_clipped(
+            fb,
+            core::str::from_utf8(&s).unwrap(),
+            CY + 5 + dy,
+            dx,
+            Q,
+            &TIME_GLYPHS,
+            H,
+        );
+        // Canvas no longer matches the clock scene: invalidate so the wake
+        // repaint starts from scratch, and park the ring machine.
+        self.last_text = (255, 255, -1, 0, 0, 0);
+        self.last_text_bbox = (0, 0, -1, -1);
+        self.phase = BezelPhase::Static;
+        self.frame_in_phase = 0;
+        self.drawn_centers = self.bezel_offsets_anim.len();
+        wfb.mark_rect(0, 0, W - 1, H - 1);
+    }
+
     fn draw_time_centered(&self, fb: &mut [u8], h: u8, m: u8, fade_q14: i32) {
         let mut s = [b'0'; 5];
         s[0] = b'0' + (h / 10);
@@ -779,7 +832,7 @@ impl Clock {
         fade_q14: i32,
         glyphs: &[Option<Glyph>; 128],
     ) {
-        self.draw_text_centered_clipped(fb, text, base_y, fade_q14, glyphs, H);
+        self.draw_text_centered_clipped(fb, text, base_y, 0, fade_q14, glyphs, H);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -788,6 +841,7 @@ impl Clock {
         fb: &mut [u8],
         text: &str,
         base_y: i32,
+        x_shift: i32,
         fade_q14: i32,
         glyphs: &[Option<Glyph>; 128],
         clip_y: i32,
@@ -798,7 +852,7 @@ impl Clock {
                 total_w += g.advance as i32;
             }
         }
-        let start_x = CX - total_w / 2;
+        let start_x = CX - total_w / 2 + x_shift;
 
         let mut x = start_x;
         for ch in text.chars() {

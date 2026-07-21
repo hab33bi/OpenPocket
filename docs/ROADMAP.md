@@ -50,15 +50,21 @@ A pocket watch. **Lock screen** = the existing clock (time, date, animated bezel
 - Re-lock: swipe down from the top in Unlocked (mirror transition) + 60 s auto re-lock; ring heals back via the existing Redraw/Heal phases
 - Verify: serial `drag dy= compose= flush= spans=` — < 20 ms typical, < 50 ms worst; user judges grabber tracking and spring feel
 
-## M5 — Burn-in mitigation & power (in progress)
+## M5 — Burn-in mitigation & power ✅ (2026-07-21)
 
-- **Done (2026-07-21): idle dimming** — 30 s without touch ramps panel
-  brightness to 0x38 (reg 0x51, −8/frame ≈ 1.2 s fade); any touch restores
-  full instantly (a drag arming while dimmed restores before rendering).
-  Applies in both scenes, alongside the 60 s auto-relock.
-- Remaining: subtle content shift for static elements, AOD-style minimal mode
-  (HH:MM, 1 update/min, pixel offset), display sleep after long idle, reduced
-  animation while dimmed (skip the minute undraw/redraw cycle).
+Idle ladder, any touch wakes instantly from every stage (the cadence wait
+loop polls touch continuously, so relaxed frame rates cost no latency):
+
+- **30 s → Dim**: brightness ramps to 0x38 (reg 0x51, −8/frame); the
+  minute-change ring sweep is suppressed while dimmed (text still updates).
+- **2 min → AOD** (Locked only; 60 s auto-relock always runs first): black
+  canvas + HH:MM only at brightness 0x18, redrawn once per minute at a
+  minute-indexed pixel drift (8 positions, ±6 px) to spread AMOLED wear;
+  ring off entirely; 500 ms cadence.
+- **10 min → Sleep**: display off (0x28) + sleep-in (0x10). Wake: sleep-out
+  (0x11) + 120 ms settle → repaint → display on (0x29) → full brightness.
+- Waking from AOD/Sleep repaints the lock scene before any gesture renders,
+  so a swipe straight out of AOD unlocks correctly.
 
 ## Arc rendering v2 (2026-07-21, user-directed — supersedes "arc frozen")
 
