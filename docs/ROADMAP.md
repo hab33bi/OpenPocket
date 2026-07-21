@@ -54,12 +54,48 @@ A pocket watch. **Lock screen** = the existing clock (time, date, animated bezel
 
 Idle dimming, subtle content shift for static elements, AOD-style minimal mode (HH:MM, 1 update/min, pixel offset), display sleep, reduced animation when idle.
 
+## Polish backlog (near-term, after M4)
+
+- **Font anti-aliasing upgrade**: current text uses 1-bpp glyphs + 2×2 box sampling
+  (5 alpha levels) and the time is a 3× nearest-neighbor upscale — edges are steppy.
+  Plan: rasterize each rendered size directly in build.rs with fontdue's native
+  8-bit antialiasing (time glyphs at final pixel size, date at its size), store
+  4-bit alpha atlases in flash, draw with full alpha blending and no runtime
+  scaling. Smoother digits, no upscale blockiness, modest flash cost (~tens of KB).
+
+## M6 — The App Wheel (deferred until last; plan to the T before starting)
+
+Concept (see design reference, 2026-07-21): an app switcher as a **right-aligned
+vertical free-scroll carousel** hugging the round display's edge.
+
+- Each row = app label (left of icon) + icon; the row's right edge follows the
+  **circle's chord at that row's y** — rows at the vertical center reach furthest
+  right; rows above/below indent inward, so the column visually wraps the bezel.
+  The indent must be recomputed continuously during scrolling so rows glide along
+  the curve (scrub-tracked, never stepped).
+- Focused row (vertical center): larger bright label + largest icon (reference:
+  "Activity"). Neighbors: smaller, dimmed, indented per curvature. Scale/alpha
+  interpolate smoothly with scroll position — no discrete focus jumps.
+- Free scroll with momentum + snap-to-row settle (exponential ease-out, matching
+  the unlock animation's feel). Status line top-center (time | battery).
+- v1 apps are placeholders (Phone, Messages, Activity, Settings…); tapping any
+  row just returns to / re-centers the wheel — the wheel itself is the deliverable.
+- Perf plan: rows are icon+text sprites composited onto black; per-frame damage =
+  the rows' bounding band (partial flush); target the same 20 fps cadence with
+  render-on-touch-move during drags. Icons as build.rs-generated RGB565 sprites.
+
+## Storage stage (when needed)
+
+The board has a **TF (microSD) slot** (pins in HARDWARE.md) and a 32 GB card is
+on hand. Bring up SDMMC when flash capacity or dynamic content demands it —
+candidates: image galleries (with runtime JPEG decoding), app assets, logs.
+
 ## Later / parked
 
 - Pipeline overlap (render ‖ flush on core 1) — scaffolding removed; re-add when scenes outgrow the frame budget
-- Runtime JPEG decoding (SD card image sources)
+- Runtime JPEG decoding (TF-card image sources)
 - NTP time sync (needs Wi-Fi), timezone/DST handling
-- IMU (tilt-to-wake), audio, SD — all out of scope until the lock/unlock experience is polished
+- IMU (tilt-to-wake), audio — out of scope until the lock/unlock experience is polished
 
 ## Performance bar (unchanged)
 

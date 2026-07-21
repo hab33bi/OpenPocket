@@ -521,6 +521,11 @@ impl Clock {
 
     /// Union bbox of time (3x) + date (1x) with small padding.
     fn text_bbox(&self) -> (i32, i32, i32, i32) {
+        self.text_bbox_at(0)
+    }
+
+    /// Text bbox with the baseline shifted vertically by `y_shift`.
+    fn text_bbox_at(&self, y_shift: i32) -> (i32, i32, i32, i32) {
         let mut x0 = W;
         let mut y0 = H;
         let mut x1 = 0i32;
@@ -552,13 +557,82 @@ impl Clock {
             }
         };
 
-        absorb("00:00", CY + 5, 3);
-        absorb(self.date_str(), CY + 70, 1);
+        absorb("00:00", CY + 5 + y_shift, 3);
+        absorb(self.date_str(), CY + 70 + y_shift, 1);
 
         if x0 > x1 {
             return (0, 0, W - 1, H - 1);
         }
         (x0.max(0), y0.max(0), x1.min(W - 1), y1.min(H - 1))
+    }
+
+    /// Bbox of the text currently drawn on the retained canvas (for the drag
+    /// composer to erase when it takes over the sheet).
+    pub fn canvas_text_bbox(&self) -> (i32, i32, i32, i32) {
+        self.last_text_bbox
+    }
+
+    /// Draw time + date for the unlock sheet, baseline shifted by `y_shift`
+    /// (negative = up), clipped to rows < `clip_y`. Returns the clipped bbox.
+    /// Used by the drag composer (M4); the lock scene's own path is unchanged.
+    pub fn draw_sheet_text(
+        &mut self,
+        fb: &mut [u8],
+        now: &WallTime,
+        y_shift: i32,
+        clip_y: i32,
+    ) -> (i32, i32, i32, i32) {
+        self.format_date(now);
+        let mut s = [b'0'; 5];
+        s[0] = b'0' + (now.hour / 10);
+        s[1] = b'0' + (now.hour % 10);
+        s[2] = b':';
+        s[3] = b'0' + (now.minute / 10);
+        s[4] = b'0' + (now.minute % 10);
+        self.draw_text_centered_clipped(
+            fb,
+            core::str::from_utf8(&s).unwrap(),
+            CY + 5 + y_shift,
+            Q,
+            3,
+            clip_y,
+        );
+        self.draw_text_centered_clipped(fb, self.date_str(), CY + 70 + y_shift, Q, 1, clip_y);
+        let (x0, y0, x1, y1) = self.text_bbox_at(y_shift);
+        (x0, y0, x1, y1.min(clip_y - 1))
+    }
+
+    /// Redraw the full ring's pixels on rows < `max_y` at the given brightness
+    /// (scrub-tracked fade during the unlock drag). Row-major list → early exit.
+    pub fn draw_ring_rows(
+        &self,
+        fb: &mut [u8],
+        max_y: i32,
+        level_q14: i32,
+        acc: &mut RectAcc,
+    ) -> usize {
+        let (hi, lo) = bezel_color_bytes(level_q14);
+        let row_bytes = (W * 2) as u32;
+        let mut writes = 0usize;
+        for &off in &self.bezel_offsets_full {
+            if off >= max_y.max(0) as u32 * row_bytes {
+                break;
+            }
+            let i = off as usize;
+            if i + 1 < fb.len() {
+                fb[i] = hi;
+                fb[i + 1] = lo;
+                writes += 1;
+            }
+        }
+        if writes > 0 {
+            acc.add(CX - BEZEL_R - HALF_T - 1, 0);
+            acc.add(
+                CX + BEZEL_R + HALF_T + 1,
+                (max_y - 1).min(CY + BEZEL_R + HALF_T + 1),
+            );
+        }
+        writes
     }
 
     fn draw_time_centered(&self, fb: &mut [u8], h: u8, m: u8, fade_q14: i32) {
@@ -576,6 +650,19 @@ impl Clock {
     }
 
     fn draw_text_centered(&self, fb: &mut [u8], text: &str, base_y: i32, fade_q14: i32, scale: i32) {
+        self.draw_text_centered_clipped(fb, text, base_y, fade_q14, scale, H);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_centered_clipped(
+        &self,
+        fb: &mut [u8],
+        text: &str,
+        base_y: i32,
+        fade_q14: i32,
+        scale: i32,
+        clip_y: i32,
+    ) {
         let mut total_w: i32 = 0;
         for ch in text.chars() {
             if let Some(g) = get_glyph(ch) {
@@ -593,14 +680,24 @@ impl Clock {
                 let draw_h = unit_h * scale;
                 let draw_ymin = unit_ymin * scale;
                 let glyph_y = base_y - (draw_h + draw_ymin);
-                self.draw_glyph(fb, x, glyph_y, g, fade_q14, scale);
+                self.draw_glyph(fb, x, glyph_y, g, fade_q14, scale, clip_y);
                 let unit_adv = (g.advance as i32 + 1) / 2;
                 x += unit_adv * scale;
             }
         }
     }
 
-    fn draw_glyph(&self, fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, fade_q14: i32, scale: i32) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph(
+        &self,
+        fb: &mut [u8],
+        ox: i32,
+        oy: i32,
+        g: &Glyph,
+        fade_q14: i32,
+        scale: i32,
+        clip_y: i32,
+    ) {
         let color_r = 240u8;
         let color_g = 240u8;
         let color_b = 245u8;
@@ -620,7 +717,7 @@ impl Clock {
 
                 let x = ox + ox_local;
                 let y = oy + oy_local;
-                if x < 0 || x >= W || y < 0 || y >= H {
+                if x < 0 || x >= W || y < 0 || y >= H || y >= clip_y {
                     continue;
                 }
 
@@ -693,7 +790,7 @@ fn bezel_color_bytes(intensity_q14: i32) -> (u8, u8) {
 }
 
 #[inline]
-fn clear_rect(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
+pub fn clear_rect(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
     for y in y0..=y1 {
         for x in x0..=x1 {
             let idx = ((y * W + x) * 2) as usize;

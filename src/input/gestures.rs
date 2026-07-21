@@ -18,8 +18,9 @@ use crate::drivers::cst9217::TouchPoint;
 
 /// Movement beyond this (px, Chebyshev) reclassifies Pending → Drag/Rejected.
 const MOVE_SLOP_PX: i32 = 14;
-/// Bottom fraction of the panel (in 1/8ths) that arms the swipe-up grabber.
-const ARM_ZONE_EIGHTHS: u32 = 2; // bottom 25%
+/// Edge fraction of the panel (in 1/8ths) that arms a swipe: swipe-up must
+/// start in the bottom zone, swipe-down in the top zone.
+const ARM_ZONE_EIGHTHS: u32 = 2; // 25% at each edge
 /// Refractory window after an emitted tap.
 const TAP_DEBOUNCE_MS: u32 = 350;
 /// Minimum press duration for a tap — controllers can emit sub-frame ghost
@@ -32,16 +33,25 @@ const STARTUP_SUPPRESS_MS: u32 = 800;
 /// Fallback lift-off timeout (explicit lift reports are the normal path).
 const RELEASE_TIMEOUT_MS: u32 = 1_500;
 
+/// Swipe direction (determines which edge zone arms it).
+#[derive(Clone, Copy, PartialEq)]
+pub enum SwipeDir {
+    /// Upward swipe, armed from the bottom zone (unlock).
+    Up,
+    /// Downward swipe, armed from the top zone (relock).
+    Down,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum GestureEvent {
     None,
-    /// Slop exceeded upward from the grabber zone; drag tracking begins.
-    DragStart { x: u16, y: u16 },
-    /// Drag progressed: `dy` = upward distance from touch-down (≥ 0).
-    DragMove { dy: u16 },
-    /// Drag finished. `vel_q8` = upward px/ms in Q8 at release (negative =
-    /// moving back down).
-    DragEnd { dy: u16, vel_q8: i32 },
+    /// Slop exceeded along `dir` from its arm zone; drag tracking begins.
+    DragStart { dir: SwipeDir, x: u16, y: u16 },
+    /// Drag progressed: `dist` = travel along `dir` from touch-down (≥ 0).
+    DragMove { dir: SwipeDir, dist: u16 },
+    /// Drag finished. `vel_q8` = px/ms along `dir` in Q8 at release
+    /// (negative = moving back against the swipe).
+    DragEnd { dir: SwipeDir, dist: u16, vel_q8: i32 },
     /// Press + lift without significant movement (debounced).
     Tap { x: u16, y: u16 },
 }
@@ -63,8 +73,8 @@ enum Phase {
     Idle,
     /// Touched, not yet classified (within slop).
     Pending(Track),
-    /// Classified as the swipe-up drag.
-    Dragging(Track),
+    /// Classified as a swipe drag along a direction.
+    Dragging(Track, SwipeDir),
     /// Classified as neither tap nor drag; swallow until lift.
     Rejected(Track),
 }
@@ -122,12 +132,22 @@ impl SwipeTracker {
                     let dx = t.x as i32 - tr.start_x as i32;
                     let dy_up = tr.start_y as i32 - t.y as i32;
                     if dx.abs().max(dy_up.abs()) > MOVE_SLOP_PX {
-                        let in_zone = tr.start_y as u32
+                        let in_bottom = tr.start_y as u32
                             >= self.height as u32 * (8 - ARM_ZONE_EIGHTHS) / 8;
-                        // Upward-dominant (diagonals allowed).
-                        if in_zone && dy_up > 0 && dy_up * 2 >= dx.abs() {
-                            self.phase = Phase::Dragging(tr);
+                        let in_top =
+                            (tr.start_y as u32) < self.height as u32 * ARM_ZONE_EIGHTHS / 8;
+                        // Direction-dominant (diagonals allowed: primary ≥ |dx|/2).
+                        let dir = if in_bottom && dy_up > 0 && dy_up * 2 >= dx.abs() {
+                            Some(SwipeDir::Up)
+                        } else if in_top && dy_up < 0 && -dy_up * 2 >= dx.abs() {
+                            Some(SwipeDir::Down)
+                        } else {
+                            None
+                        };
+                        if let Some(dir) = dir {
+                            self.phase = Phase::Dragging(tr, dir);
                             return GestureEvent::DragStart {
+                                dir,
                                 x: tr.start_x,
                                 y: tr.start_y,
                             };
@@ -157,24 +177,29 @@ impl SwipeTracker {
                 Input::Nothing => GestureEvent::None,
             },
 
-            Phase::Dragging(mut tr) => match self.classify_input(&tr, report, now_ms) {
+            Phase::Dragging(mut tr, dir) => match self.classify_input(&tr, report, now_ms) {
                 Input::Move(t) => {
                     tr.prev_y = tr.last_y;
                     tr.prev_ms = tr.last_ms;
                     tr.last_x = t.x;
                     tr.last_y = t.y;
                     tr.last_ms = now_ms;
-                    self.phase = Phase::Dragging(tr);
+                    self.phase = Phase::Dragging(tr, dir);
                     GestureEvent::DragMove {
-                        dy: tr.start_y.saturating_sub(tr.last_y),
+                        dir,
+                        dist: dist_along(&tr, dir),
                     }
                 }
                 Input::Lift => {
                     self.phase = Phase::Idle;
                     let dt = tr.last_ms.wrapping_sub(tr.prev_ms).max(1) as i32;
-                    let dpx = tr.prev_y as i32 - tr.last_y as i32;
+                    let dpx = match dir {
+                        SwipeDir::Up => tr.prev_y as i32 - tr.last_y as i32,
+                        SwipeDir::Down => tr.last_y as i32 - tr.prev_y as i32,
+                    };
                     GestureEvent::DragEnd {
-                        dy: tr.start_y.saturating_sub(tr.last_y),
+                        dir,
+                        dist: dist_along(&tr, dir),
                         vel_q8: (dpx << 8) / dt,
                     }
                 }
@@ -213,4 +238,12 @@ enum Input {
     Move(TouchPoint),
     Lift,
     Nothing,
+}
+
+/// Travel from touch-down along the swipe direction, clamped ≥ 0.
+fn dist_along(tr: &Track, dir: SwipeDir) -> u16 {
+    match dir {
+        SwipeDir::Up => tr.start_y.saturating_sub(tr.last_y),
+        SwipeDir::Down => tr.last_y.saturating_sub(tr.start_y),
+    }
 }

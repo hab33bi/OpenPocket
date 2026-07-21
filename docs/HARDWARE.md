@@ -45,7 +45,10 @@ Sources: [Waveshare wiki](https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 ## Other on-board peripherals (out of scope for now)
 
 - ES8311 audio codec + PA (I2S pins 8/9/10/16/45/46, PA enable 46)
-- SD card (SDMMC: CLK 2, CMD 1, DATA 3, CS 41)
+- **TF (microSD) card slot** — SDMMC: CLK=GPIO2, CMD=GPIO1, DATA=GPIO3, CS=GPIO41.
+  The board has a physical TF slot; a 32 GB card is available for this project.
+  Planned as the storage-expansion stage (images, assets, app data) when flash
+  capacity or dynamic content demands it — see ROADMAP "Storage stage".
 - 8-pin header: 3 GPIOs + UART
 
 ## Safety rules (unchanged from day one)
