@@ -131,24 +131,24 @@ impl<'a, 'd> App<'a, 'd> {
 
             // Cadence remainder = touch poll window; a DragStart hands control
             // to the drag session (render-on-touch-move).
-            let mut start_drag: Option<SwipeDir> = None;
+            let mut start_drag: Option<(SwipeDir, u16)> = None;
             let deadline = frame_start + Duration::from_micros(FRAME_US);
             loop {
                 let now_ms = anim_start.elapsed().as_millis() as u32;
                 let ev = self.poll_touch_once(&mut tp, now_ms);
                 match ev {
-                    GestureEvent::DragStart { dir, x, y } => {
+                    GestureEvent::DragStart { dir, x, y, dist } => {
                         let wanted = matches!(
                             (dir, scene),
                             (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked)
                         );
                         println!(
-                            "gesture: drag arm dir={} x={x} y={y}{}",
+                            "gesture: drag arm dir={} x={x} y={y} dist={dist}{}",
                             dir_str(dir),
                             if wanted { "" } else { " (ignored)" }
                         );
                         if wanted {
-                            start_drag = Some(dir);
+                            start_drag = Some((dir, dist));
                         }
                     }
                     GestureEvent::Tap { x, y } => println!("gesture: tap x={x} y={y}"),
@@ -161,8 +161,8 @@ impl<'a, 'd> App<'a, 'd> {
             }
             self.maybe_reinit_touch(&mut tp);
 
-            if let Some(dir) = start_drag {
-                scene = self.drag_session(dir, &mut sheet_b, &now, anim_start, &mut tp);
+            if let Some((dir, dist)) = start_drag {
+                scene = self.drag_session(dir, dist, &mut sheet_b, &now, anim_start, &mut tp);
                 if scene == Scene::Unlocked {
                     unlocked_at = Instant::now();
                 }
@@ -198,6 +198,7 @@ impl<'a, 'd> App<'a, 'd> {
     fn drag_session(
         &mut self,
         dir: SwipeDir,
+        start_dist: u16,
         sheet_b: &mut u16,
         now: &WallTime,
         anim_start: Instant,
@@ -208,7 +209,12 @@ impl<'a, 'd> App<'a, 'd> {
             SwipeDir::Up => self.clock.canvas_text_bbox(),
             SwipeDir::Down => (0, 0, -1, -1),
         };
-        let mut target_b = *sheet_b;
+        // The sheet moves on the very first classified sample — the travel
+        // already covered when the drag armed, not zero.
+        let mut target_b = match dir {
+            SwipeDir::Up => LCD_HEIGHT.saturating_sub(start_dist),
+            SwipeDir::Down => start_dist.min(LCD_HEIGHT),
+        };
         let mut last_compose = Instant::now();
         let mut composes: u32 = 0;
 
@@ -284,6 +290,12 @@ impl<'a, 'd> App<'a, 'd> {
             };
             self.compose_sheet(*sheet_b, next as u16, now, &mut text_bbox);
             *sheet_b = next as u16;
+            if *sheet_b == target {
+                // Final frame: flush together with the normalize below —
+                // two back-to-back full flushes read as an end-of-animation
+                // flicker.
+                break;
+            }
             self.flush_dirty();
             while Instant::now() < frame_start + Duration::from_micros(ANIM_FRAME_US) {
                 core::hint::spin_loop();
@@ -359,15 +371,34 @@ impl<'a, 'd> App<'a, 'd> {
                 lock::clear_rect(fb, old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
             }
 
-            // 3) Ring prefix (rows < bi) whenever brightness stepped, the
-            // sheet grew (new rows need their ring pixels back), or the text
-            // erase reached into the annulus while the ring is visible.
+            // 3) Ring pass — only the rows that actually need ring pixels:
+            //    - brightness stepped → all rows < bi (full recolor),
+            //    - sheet grew → just the fresh band rows [bp..bi),
+            //    - text erase reached the annulus → the erased rows.
+            // Repainting from row 0 every frame marked ~the whole screen and
+            // forced a 24 ms full flush per relock frame (visible flicker) on
+            // top of a 15+ ms PSRAM-cache-thrashing rewrite of 19k scattered
+            // pixels. Skipped entirely while the ring is uniformly faded out
+            // (level 0 → its pixels are black, same as the fresh band fill).
             let erase_hit_ring = erased
                 && lvl > 0
                 && lock::rect_touches_ring(old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
-            if lvl != lvl_prev || bi > bp || erase_hit_ring {
+            let ring_min = if lvl != lvl_prev {
+                0
+            } else {
+                let mut m = i32::MAX;
+                if bi > bp && lvl > 0 {
+                    m = bp;
+                }
+                if erase_hit_ring {
+                    m = m.min(old_text.1.max(0));
+                }
+                m
+            };
+            if ring_min < bi {
                 let mut acc = RectAcc::empty();
-                self.clock.draw_ring_rows(fb, bi, lvl * Q / RING_LEVELS, &mut acc);
+                self.clock
+                    .draw_ring_rows(fb, ring_min, bi, lvl * Q / RING_LEVELS, &mut acc);
                 if !acc.is_empty() {
                     rects[nrects] = (acc.x0 - 1, acc.y0, acc.x1 + 1, acc.y1);
                     nrects += 1;
@@ -428,14 +459,23 @@ impl<'a, 'd> App<'a, 'd> {
         (flush_ms, if partial { 'P' } else { 'F' }, span_count)
     }
 
-    /// One touch poll iteration: INT edge check → rate-limited read → feed the
-    /// recognizer. Returns the recognizer's event.
+    /// One touch poll iteration: read gate → I2C read → feed the recognizer.
+    /// Returns the recognizer's event.
+    ///
+    /// Idle: INT-edge gated (bus hygiene at rest). Finger down: fixed ~10 ms
+    /// timer, no INT gating — composes/flushes block 5–25 ms at a time and
+    /// swallow INT pulses; a missed lift-off would stall the release on the
+    /// 1.5 s fallback timeout (hardware-observed as `vel_q8=0` releases).
     fn poll_touch_once(&mut self, tp: &mut TouchPoll, now_ms: u32) -> GestureEvent {
         let int_low = self.tp_int.is_low();
         let falling_edge = int_low && !tp.int_was_low;
         tp.int_was_low = int_low;
-        let do_read = (falling_edge && tp.last_read.elapsed() >= Duration::from_millis(2))
-            || (int_low && tp.last_read.elapsed() >= Duration::from_millis(20));
+        let do_read = if self.swipe.finger_down() {
+            tp.last_read.elapsed() >= Duration::from_millis(10)
+        } else {
+            (falling_edge && tp.last_read.elapsed() >= Duration::from_millis(2))
+                || (int_low && tp.last_read.elapsed() >= Duration::from_millis(20))
+        };
 
         let report = if do_read {
             tp.last_read = Instant::now();

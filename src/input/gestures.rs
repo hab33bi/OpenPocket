@@ -17,10 +17,10 @@
 use crate::drivers::cst9217::TouchPoint;
 
 /// Movement beyond this (px, Chebyshev) reclassifies Pending → Drag/Rejected.
-const MOVE_SLOP_PX: i32 = 14;
+const MOVE_SLOP_PX: i32 = 10;
 /// Edge fraction of the panel (in 1/8ths) that arms a swipe: swipe-up must
 /// start in the bottom zone, swipe-down in the top zone.
-const ARM_ZONE_EIGHTHS: u32 = 2; // 25% at each edge
+const ARM_ZONE_EIGHTHS: u32 = 3; // 37.5% at each edge — a generous grab
 /// Refractory window after an emitted tap.
 const TAP_DEBOUNCE_MS: u32 = 350;
 /// Minimum press duration for a tap — controllers can emit sub-frame ghost
@@ -46,7 +46,9 @@ pub enum SwipeDir {
 pub enum GestureEvent {
     None,
     /// Slop exceeded along `dir` from its arm zone; drag tracking begins.
-    DragStart { dir: SwipeDir, x: u16, y: u16 },
+    /// `dist` = travel already covered at classification, so the sheet can
+    /// move on the very first classified sample.
+    DragStart { dir: SwipeDir, x: u16, y: u16, dist: u16 },
     /// Drag progressed: `dist` = travel along `dir` from touch-down (≥ 0).
     DragMove { dir: SwipeDir, dist: u16 },
     /// Drag finished. `vel_q8` = px/ms along `dir` in Q8 at release
@@ -93,6 +95,14 @@ impl SwipeTracker {
             height,
             last_tap_ms: 0,
         }
+    }
+
+    /// Whether a touch is currently being tracked (any non-Idle phase). The
+    /// poll loop uses this to switch from INT-gated to fixed-rate reads: INT
+    /// pulses are missed during blocking compose/flush windows, and a missed
+    /// lift-off otherwise stalls the release until the fallback timeout.
+    pub fn finger_down(&self) -> bool {
+        !matches!(self.phase, Phase::Idle)
     }
 
     /// Feed a report (`Some` when INT fired and the read succeeded) or an idle
@@ -150,6 +160,7 @@ impl SwipeTracker {
                                 dir,
                                 x: tr.start_x,
                                 y: tr.start_y,
+                                dist: dist_along(&tr, dir),
                             };
                         }
                         self.phase = Phase::Rejected(tr);

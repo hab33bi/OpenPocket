@@ -602,20 +602,29 @@ impl Clock {
         (x0, y0, x1, y1.min(clip_y - 1))
     }
 
-    /// Redraw the full ring's pixels on rows < `max_y` at the given brightness
-    /// (scrub-tracked fade during the unlock drag). Row-major list → early exit.
+    /// Redraw the ring's pixels on rows `[min_y..max_y)` at the given
+    /// brightness (scrub-tracked fade during the unlock drag). Row-major list
+    /// → skip the prefix below `min_y`, early exit past `max_y`. Restricting
+    /// the row window keeps the damage rect (and PSRAM traffic) proportional
+    /// to what actually changed instead of ~the whole screen.
     pub fn draw_ring_rows(
         &self,
         fb: &mut [u8],
+        min_y: i32,
         max_y: i32,
         level_q14: i32,
         acc: &mut RectAcc,
     ) -> usize {
         let (hi, lo) = bezel_color_bytes(level_q14);
         let row_bytes = (W * 2) as u32;
+        let min_off = min_y.max(0) as u32 * row_bytes;
+        let max_off = max_y.max(0) as u32 * row_bytes;
         let mut writes = 0usize;
         for &off in &self.bezel_offsets_full {
-            if off >= max_y.max(0) as u32 * row_bytes {
+            if off < min_off {
+                continue;
+            }
+            if off >= max_off {
                 break;
             }
             let i = off as usize;
@@ -626,7 +635,7 @@ impl Clock {
             }
         }
         if writes > 0 {
-            acc.add(CX - BEZEL_R - HALF_T - 1, 0);
+            acc.add(CX - BEZEL_R - HALF_T - 1, min_y.max(0));
             acc.add(
                 CX + BEZEL_R + HALF_T + 1,
                 (max_y - 1).min(CY + BEZEL_R + HALF_T + 1),
@@ -708,18 +717,22 @@ impl Clock {
         let out_h = ((src_h + 1) / 2) * scale;
 
         for oy_local in 0..out_h {
+            // Clip before sampling: offscreen/clipped glyph rows (common while
+            // the sheet text slides past the panel edge) must cost nothing.
+            let y = oy + oy_local;
+            if y < 0 || y >= H || y >= clip_y {
+                continue;
+            }
             for ox_local in 0..out_w {
+                let x = ox + ox_local;
+                if x < 0 || x >= W {
+                    continue;
+                }
                 let count = sample_glyph_coverage(g, ox_local, oy_local, scale);
                 if count == 0 {
                     continue;
                 }
                 let alpha = (count * 255) / 4;
-
-                let x = ox + ox_local;
-                let y = oy + oy_local;
-                if x < 0 || x >= W || y < 0 || y >= H || y >= clip_y {
-                    continue;
-                }
 
                 let base = fade_q14 as i64;
                 let a64 = alpha as i64;

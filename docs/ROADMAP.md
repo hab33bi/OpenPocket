@@ -80,6 +80,23 @@ direction-sensitive uses it yet — check with corner taps before M6).
   nothing rests midway — **or a quick flick** (vel > 0.5 px/ms) completes
   regardless of distance. Finger-tracked 1:1 while down; decision at release.
 
+**Round 2 (same day) — release freeze + relock flicker:** serial showed
+`vel_q8=0` releases: lift-off INT pulses were being missed inside blocking
+compose/flush windows, so releases waited on the 1.5 s fallback timeout
+(felt as "sheet freezes near the end, then jumps"). And every relock frame
+was a 24 ms full flush because the ring pass repainted from row 0. Fixes:
+- Finger down → touch reads on a fixed ~10 ms timer (no INT gating); INT
+  edge-gating remains only while idle.
+- Ring pass repaints only the rows that changed (fresh band rows / erased
+  text rows / all rows only on a fade-level step; skipped entirely at level
+  0) — most drag and settle frames are partial flushes again.
+- Settle's final frame flushes together with the end-of-transition
+  normalize (was two back-to-back full flushes = visible flicker).
+- Arm zones widened 25% → 37.5%, slop 14 → 10 px, and the sheet moves on
+  the very first classified sample (DragStart carries its initial travel).
+- Glyph renderer clips rows before coverage sampling (sliding offscreen
+  text was paying full rasterization cost).
+
 ## Polish backlog (near-term, after M4)
 
 - **Font anti-aliasing upgrade**: current text uses 1-bpp glyphs + 2×2 box sampling
