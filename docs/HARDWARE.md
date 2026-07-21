@@ -38,6 +38,18 @@ Sources: [Waveshare wiki](https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 |--------|---------|-------|
 | AXP2101 PMIC | `0x34` | DC1 3.3 V (reg 0x82=18, enable 0x80 bit0), ALDO1 3.3 V (reg 0x92=28, enable 0x90 bit0) power the display path |
 | CST9217 touch | `0x5A` | INT = **GPIO11**, RESET = **GPIO40**. Reference driver: SensorLib `TouchDrvCST92xx` (MIT) in the Waveshare BSP |
+
+**CST9217 field notes (hardware-verified, 2026-07):**
+- Auto low-power scan kicks in ~10 s after boot and starves reports — disable
+  with `[0xD1, 0x06]` at init (done in `drivers/cst9217.rs`).
+- Emits a spurious ghost report while settling after init (observed
+  `x=247,y=16`) — suppress reports for ~800 ms after boot.
+- A **stationary** finger reports only ~once per second; movement streams at
+  scan rate. Lift-off arrives as an explicit evt=0 report — rely on it, keep
+  release timeouts generous (1.5 s).
+- **esp-hal I2C defaults have NO timeouts on the S3** — a wedged transaction
+  blocks forever (froze the whole firmware). Always set `BusTimeout::Maximum`
+  + a software transaction timeout; errors then feed an auto re-init path.
 | PCF85063 RTC | `0x51` | Powered via AXP2101; keeps time while the board has power. Time regs 0x04–0x0A (BCD), VL flag = reg 0x04 bit 7 (clock-integrity lost) |
 | QMI8658 IMU | — | Present on board; unused, kept powered down (out of scope) |
 | TCA9554 expander | — | Present on board; not needed for display/touch/RTC on this board (touch RST is a direct GPIO) |
@@ -45,10 +57,11 @@ Sources: [Waveshare wiki](https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 ## Other on-board peripherals (out of scope for now)
 
 - ES8311 audio codec + PA (I2S pins 8/9/10/16/45/46, PA enable 46)
-- **TF (microSD) card slot** — SDMMC: CLK=GPIO2, CMD=GPIO1, DATA=GPIO3, CS=GPIO41.
-  The board has a physical TF slot; a 32 GB card is available for this project.
-  Planned as the storage-expansion stage (images, assets, app data) when flash
-  capacity or dynamic content demands it — see ROADMAP "Storage stage".
+- **SD card / TF (microSD) slot** — SDMMC pins: CLK=GPIO2, CMD=GPIO1,
+  DATA=GPIO3, CS=GPIO41 (from BSP `pin_config.h`). The board has a physical TF
+  slot; a 32 GB card is available for this project. Planned as the
+  storage-expansion stage (images, assets, app data) when flash capacity or
+  dynamic content demands it — see ROADMAP "Storage stage".
 - 8-pin header: 3 GPIOs + UART
 
 ## Safety rules (unchanged from day one)

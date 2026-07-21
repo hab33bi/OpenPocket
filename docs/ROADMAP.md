@@ -54,6 +54,30 @@ A pocket watch. **Lock screen** = the existing clock (time, date, animated bezel
 
 Idle dimming, subtle content shift for static elements, AOD-style minimal mode (HH:MM, 1 update/min, pixel offset), display sleep, reduced animation when idle.
 
+## M4 status (2026-07-21): implemented, responsiveness fix pending
+
+The sheet composer, drag sessions, settle animation, swipe-down relock, and
+60 s auto-relock are implemented and flashed. **User verdict: drag grab is
+sluggish/glitchy — sometimes doesn't engage — while the old tap-to-switch felt
+instant.**
+
+**Diagnosis (to execute next):** touch reads are edge-triggered on the INT pin
+with a 20 ms level fallback. During a drag, composes+flushes block the CPU for
+5–25 ms at a time; the CST9217's short INT pulses land inside those windows and
+are missed, so reports (and therefore sheet updates) arrive erratically. The
+M3 tap path never needed a report *stream*, which is why it felt fine.
+
+**Fix plan:**
+1. While the recognizer is in Pending/Dragging (finger down), read the chip
+   **unconditionally on a timer** (~every 10 ms, latest-wins) — no INT gating.
+   Edge-gating remains only for the Idle phase (bus hygiene at rest).
+2. Consider: arm zone bottom 25% → ~37% ("fairly large segment of the bottom
+   edge"), slop 14 px → 10 px for a faster grab, and emit the first DragMove
+   together with DragStart so the sheet moves on the very first classified
+   sample.
+3. Measure with the drag log line (`drag b= compose= flush= spans=`): target
+   compose+flush < 20 ms typical and report intervals ≤ 20 ms during movement.
+
 ## Polish backlog (near-term, after M4)
 
 - **Font anti-aliasing upgrade**: current text uses 1-bpp glyphs + 2×2 box sampling
