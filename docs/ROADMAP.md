@@ -128,10 +128,10 @@ rough order of expected payoff if we revisit:
 1. **Compose cap 16 ms → ~10 ms** (`COMPOSE_MIN_US`): composes are cheap now;
    a 60→100 Hz render-on-move cap tightens finger tracking. One-line change,
    measure first that fade-zone frames stay under the cap.
-2. **Target smoothing**: a small critically-damped filter on `target_b`
-   (e.g. `b += (target − b) · k` per compose with k ≈ 0.5–0.7) absorbs touch
-   sample jitter without adding perceptible lag — the "glued to the finger
-   but never trembling" premium feel.
+2. ~~**Target smoothing**~~ — DONE 2026-07-21 (k=0.5 per compose), together
+   with edge-travel mapping: the reachable finger travel (touch-down → panel
+   edge) maps onto the full sheet travel, fixing the ~90% stall/stagger on
+   slow drags; release verdict now evaluates sheet travel, not finger px.
 3. **Ring damage as per-run row spans**: the fade recolor currently marks the
    annulus bounding rect (~60% of the screen → full flush on level-step
    frames). Marking each run's row span instead keeps level-step frames

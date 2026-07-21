@@ -161,7 +161,7 @@ impl<'a, 'd> App<'a, 'd> {
 
             // Cadence remainder = touch poll window; a DragStart hands control
             // to the drag session (render-on-touch-move).
-            let mut start_drag: Option<(SwipeDir, u16)> = None;
+            let mut start_drag: Option<(SwipeDir, u16, u16)> = None;
             let mut flick: Option<(SwipeDir, u16, i32)> = None;
             let frame_us = if scene == Scene::Locked && self.clock.is_animating() {
                 CLOCK_ANIM_FRAME_US
@@ -184,7 +184,7 @@ impl<'a, 'd> App<'a, 'd> {
                             if wanted { "" } else { " (ignored)" }
                         );
                         if wanted {
-                            start_drag = Some((dir, dist));
+                            start_drag = Some((dir, dist, y));
                         }
                     }
                     // DragEnd without a preceding DragStart: the whole swipe
@@ -214,13 +214,14 @@ impl<'a, 'd> App<'a, 'd> {
             }
             self.maybe_reinit_touch(&mut tp);
 
-            if let Some((dir, dist)) = start_drag {
+            if let Some((dir, dist, start_y)) = start_drag {
                 // A drag can arm while dimmed — restore before it renders.
                 if brightness != 0xFF {
                     brightness = 0xFF;
                     self.bus.write_c8d8(0x51, brightness);
                 }
-                scene = self.drag_session(dir, dist, &mut sheet_b, &now, anim_start, &mut tp);
+                scene =
+                    self.drag_session(dir, dist, start_y, &mut sheet_b, &now, anim_start, &mut tp);
                 if scene == Scene::Unlocked {
                     unlocked_at = Instant::now();
                 }
@@ -274,6 +275,7 @@ impl<'a, 'd> App<'a, 'd> {
         &mut self,
         dir: SwipeDir,
         start_dist: u16,
+        start_y: u16,
         sheet_b: &mut u16,
         now: &WallTime,
         anim_start: Instant,
@@ -284,12 +286,25 @@ impl<'a, 'd> App<'a, 'd> {
             SwipeDir::Up => self.clock.canvas_text_bbox(),
             SwipeDir::Down => (0, 0, -1, -1),
         };
+        // Map the REACHABLE finger travel (touch-down point → panel edge) onto
+        // the full sheet travel: 1:1 mapping stalled the sheet at ~85-90% with
+        // the finger ground against the edge (a drag starting inside the arm
+        // zone can never physically travel the full H) — the user felt it as a
+        // stagger right at the end of slow unlocks.
+        let avail = match dir {
+            SwipeDir::Up => (start_y as i32).max(1),
+            SwipeDir::Down => (H - start_y as i32).max(1),
+        };
+        let map_target = |dist: u16| -> u16 {
+            let d = ((dist as i32 * H + avail / 2) / avail).min(H) as u16;
+            match dir {
+                SwipeDir::Up => LCD_HEIGHT - d,
+                SwipeDir::Down => d,
+            }
+        };
         // The sheet moves on the very first classified sample — the travel
         // already covered when the drag armed, not zero.
-        let mut target_b = match dir {
-            SwipeDir::Up => LCD_HEIGHT.saturating_sub(start_dist),
-            SwipeDir::Down => start_dist.min(LCD_HEIGHT),
-        };
+        let mut target_b = map_target(start_dist);
         let mut last_compose = Instant::now();
         let mut composes: u32 = 0;
 
@@ -297,20 +312,30 @@ impl<'a, 'd> App<'a, 'd> {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragMove { dist, .. } => {
-                    target_b = match dir {
-                        SwipeDir::Up => LCD_HEIGHT.saturating_sub(dist),
-                        SwipeDir::Down => dist.min(LCD_HEIGHT),
-                    };
+                    target_b = map_target(dist);
                 }
-                GestureEvent::DragEnd { dist, vel_q8, .. } => break (dist as i32, vel_q8),
+                GestureEvent::DragEnd { dist, vel_q8, .. } => {
+                    target_b = map_target(dist);
+                    break (dist as i32, vel_q8);
+                }
                 _ => {}
             }
             if target_b != *sheet_b && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
             {
                 last_compose = Instant::now();
                 let t0 = Instant::now();
-                self.compose_sheet(*sheet_b, target_b, now, &mut text_bbox);
-                *sheet_b = target_b;
+                // Critically-damped tracking: half the remaining distance per
+                // compose (~25 ms time constant at the 60 Hz compose cap) —
+                // absorbs the touch sensor's edge-of-panel jitter without
+                // perceptible lag.
+                let diff = target_b as i32 - *sheet_b as i32;
+                let next = if diff.abs() <= 2 {
+                    target_b
+                } else {
+                    (*sheet_b as i32 + diff / 2) as u16
+                };
+                self.compose_sheet(*sheet_b, next, now, &mut text_bbox);
+                *sheet_b = next;
                 let compose_ms = t0.elapsed().as_millis() as u32;
                 let (flush_ms, mode, spans) = self.flush_dirty();
                 composes += 1;
@@ -325,7 +350,12 @@ impl<'a, 'd> App<'a, 'd> {
             core::hint::spin_loop();
         };
 
-        let complete = dist > COMPLETE_DIST || vel > COMPLETE_VEL_Q8;
+        // Verdict on SHEET travel (post-mapping), so "past 50% of the screen"
+        // means what the eye sees; a fast flick completes regardless.
+        let complete = match dir {
+            SwipeDir::Up => (target_b as i32) < H / 2,
+            SwipeDir::Down => (target_b as i32) > H / 2,
+        } || vel > COMPLETE_VEL_Q8;
         let (target, verdict) = match (dir, complete) {
             (SwipeDir::Up, true) => (0, "unlock"),
             (SwipeDir::Up, false) => (LCD_HEIGHT, "springback"),
