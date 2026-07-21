@@ -160,7 +160,17 @@ rough order of expected payoff if we revisit:
   4-bit alpha atlases in flash, draw with full alpha blending and no runtime
   scaling. Smoother digits, no upscale blockiness, modest flash cost (~tens of KB).
 
-## M6 — The App Wheel (deferred until last; plan to the T before starting)
+## PWR button features (2026-07-21, research done)
+
+`docs/research/BUTTONS-RESEARCH.md` has the register-level plan (poll AXP2101
+reg 0x49 per frame — no IRQ GPIO on this board; battery % at 0xA4; never
+touch 0x22/0x27/rails). Behaviors: **Locked + PWR → lightsaber ring
+flourish** (a ~1 s premium ignition animation, REAL glow — pre-rendered
+intensity, AMOLED-aware, unlike the removed subtle ring glow); **Unlocked →
+App Wheel** navigation (open/back per M6 plan). Also pending: **unlock
+end-of-travel lag** fix (suspect: damped-tracking tail near b=0).
+
+## M6 — The App Wheel (planned to the T — see docs/M6-APPWHEEL-PLAN.md)
 
 Concept (see design reference, 2026-07-21): an app switcher as a **right-aligned
 vertical free-scroll carousel** hugging the round display's edge.
