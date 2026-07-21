@@ -222,16 +222,22 @@ impl<'a, 'd> App<'a, 'd> {
                 }
             }
 
-            // W0: PWR-key events, log-only until the App Wheel lands. The
-            // chip latches presses, so once-per-frame polling never misses
-            // one. A press counts as activity — PWR wakes from dim/AOD/sleep.
+            // PWR key: while locked, a short press ignites the lightsaber
+            // flourish (waking the display first if idle). Unlocked presses
+            // stay log-only until the App Wheel lands. The chip latches
+            // presses, so once-per-frame polling never misses one.
             match axp2101::poll_power_key(&mut self.i2c) {
                 axp2101::PowerKey::ShortPress => {
                     tp.last_activity = Instant::now();
-                    println!(
-                        "pwr: short press (scene={})",
-                        if scene == Scene::Locked { "locked" } else { "unlocked" }
-                    );
+                    if power != Power::Awake || brightness != 0xFF {
+                        self.wake_display(&mut power, &mut brightness, &now);
+                    }
+                    if scene == Scene::Locked {
+                        self.clock.start_flourish();
+                        println!("pwr: short press -> flourish");
+                    } else {
+                        println!("pwr: short press (scene=unlocked)");
+                    }
                 }
                 axp2101::PowerKey::LongPress => {
                     tp.last_activity = Instant::now();
@@ -303,6 +309,7 @@ impl<'a, 'd> App<'a, 'd> {
                 if power != Power::Awake || brightness != 0xFF {
                     self.wake_display(&mut power, &mut brightness, &now);
                 }
+                self.abort_flourish();
                 scene =
                     self.drag_session(dir, dist, start_y, &mut sheet_b, &now, anim_start, &mut tp);
                 if scene == Scene::Unlocked {
@@ -314,6 +321,7 @@ impl<'a, 'd> App<'a, 'd> {
                 if power != Power::Awake || brightness != 0xFF {
                     self.wake_display(&mut power, &mut brightness, &now);
                 }
+                self.abort_flourish();
                 if dist as i32 > COMPLETE_DIST || vel > COMPLETE_VEL_Q8 {
                     let (target, bbox) = match dir {
                         SwipeDir::Up => (0, self.clock.canvas_text_bbox()),
@@ -738,6 +746,19 @@ impl<'a, 'd> App<'a, 'd> {
             }
         }
         self.swipe.feed(report, now_ms)
+    }
+
+    /// A gesture takes over mid-flourish: write the flourish's zero-glow
+    /// closing frame (exact resting ring) so the drag composer starts from a
+    /// clean canvas. The damage flushes with the gesture's first frame.
+    fn abort_flourish(&mut self) {
+        if self.clock.flourish_active() {
+            let mut acc = RectAcc::empty();
+            self.clock.cancel_flourish(self.wfb.buf_mut(), &mut acc);
+            if !acc.is_empty() {
+                self.wfb.mark_rect(acc.x0, acc.y0, acc.x1, acc.y1);
+            }
+        }
     }
 
     /// Instant wake from any idle state: sleep-out / AOD repaint as needed,

@@ -66,6 +66,17 @@ const CAP_STEPS: i32 = FADE_STEPS;
 /// 10 frames = 250 ms at the 40 fps anim cadence — a swift, decisive merge.
 const HEAL_FRAMES: u32 = 10;
 
+/// Lightsaber flourish (PWR press while locked): ignition sweep → flare
+/// pulses → retraction, ~1.5 s at the anim cadence. Real, visible glow —
+/// peak intensities 60-100% over a wide band (the earlier always-on ring
+/// glow at ≤27% vanished into the AMOLED black floor; a transient effect can
+/// afford to burn bright).
+const FLOURISH_BAND_PX: i32 = 14; // radial half-width of the effect band
+const FL_SWEEP_F: u32 = 18;
+const FL_FLARE_F: u32 = 12;
+const FL_RETRACT_F: u32 = 14;
+const FL_TOTAL_F: u32 = FL_SWEEP_F + FL_FLARE_F + FL_RETRACT_F;
+
 /// Bezel animation phase, advanced by frame index against the build-time schedules.
 /// A sweep phase exits only when its schedule is consumed AND the ring reached the
 /// schedule's end state — never on wall clock (docs/09 P0).
@@ -110,6 +121,18 @@ pub struct Clock {
     ring_alpha: Vec<u8>,
     /// intensity (0..=255) → RGB565-BE ring color bytes.
     ring_lut: [(u8, u8); 256],
+    /// Lightsaber flourish: row-major runs over the ±FLOURISH_BAND_PX
+    /// annulus band, with per-pixel radial distance (Q3) and angle (0..=255,
+    /// 0 at 12 o'clock, clockwise) in parallel arrays.
+    flourish_runs: Vec<(u32, u16)>,
+    flourish_d: Vec<u8>,
+    flourish_ang: Vec<u8>,
+    /// Frame counter; u32::MAX = inactive.
+    flourish_frame: u32,
+    /// Saber gradient: black → deep electric blue → ice blue → white-hot.
+    /// Its top end matches the normal ring hue so the closing frame hands
+    /// back to the resting ring pixel-identically.
+    flourish_lut: [(u8, u8); 256],
     pub bezel_anim_len: u32,
     pub bezel_full_len: u32,
     /// Angular center count currently drawn on the retained framebuffer.
@@ -143,6 +166,11 @@ impl Clock {
             bezel_runs: Vec::new(),
             ring_alpha: Vec::new(),
             ring_lut: [(0, 0); 256],
+            flourish_runs: Vec::new(),
+            flourish_d: Vec::new(),
+            flourish_ang: Vec::new(),
+            flourish_frame: u32::MAX,
+            flourish_lut: [(0, 0); 256],
             bezel_anim_len: 0,
             bezel_full_len: 0,
             drawn_centers: 0,
@@ -232,6 +260,60 @@ impl Clock {
             self.ring_lut[i] = bezel_color_bytes(Q * i as i32 / 255);
         }
 
+        // Lightsaber flourish band: per-pixel radial distance + angle over a
+        // ±FLOURISH_BAND_PX annulus, as row-major runs (sequential writes).
+        let r_out = BEZEL_R + FLOURISH_BAND_PX;
+        let r_in = BEZEL_R - FLOURISH_BAND_PX;
+        let (r_out2, r_in2) = (r_out * r_out, r_in * r_in);
+        let mut fruns: Vec<(u32, u16)> = Vec::with_capacity(2_048);
+        let mut fd: Vec<u8> = Vec::with_capacity(44_000);
+        let mut fang: Vec<u8> = Vec::with_capacity(44_000);
+        for py in 0..H {
+            let dy = py - CY;
+            for px in 0..W {
+                let dx = px - CX;
+                let r2 = dx * dx + dy * dy;
+                if r2 < r_in2 || r2 > r_out2 {
+                    continue;
+                }
+                let r_q4 = isqrt((r2 as u32) * 256) as i32;
+                let d_q3 = (((r_q4 - BEZEL_R * 16).abs() / 2).min(127)) as u8;
+                let off = ((py * W + px) * 2) as u32;
+                match fruns.last_mut() {
+                    Some((st, len)) if *st + (*len as u32) * 2 == off && *len < u16::MAX => {
+                        *len += 1
+                    }
+                    _ => fruns.push((off, 1)),
+                }
+                fd.push(d_q3);
+                // Rotate so the ignition starts at 12 o'clock.
+                fang.push(angle256(dx, dy).wrapping_sub(192));
+            }
+        }
+        self.flourish_runs = fruns;
+        self.flourish_d = fd;
+        self.flourish_ang = fang;
+
+        // Saber gradient. Top end (205,220,255) ≈ the resting ring's
+        // full-brightness hue, so the handback is seamless.
+        for i in 0..256usize {
+            let v = i as i32;
+            let (r, g, b) = if v < 96 {
+                (v * 24 / 96, v * 64 / 96, v * 220 / 96)
+            } else if v < 192 {
+                let t = v - 96;
+                (24 + t * 86 / 96, 64 + t * 106 / 96, 220 + t * 35 / 96)
+            } else {
+                let t = v - 192;
+                (110 + t * 95 / 64, 170 + t * 50 / 64, 255)
+            };
+            let r5 = ((r as u16) * 31 / 255) & 0x1F;
+            let g6 = ((g as u16) * 63 / 255) & 0x3F;
+            let b5 = ((b as u16) * 31 / 255) & 0x1F;
+            let px = (r5 << 11) | (g6 << 5) | b5;
+            self.flourish_lut[i] = ((px >> 8) as u8, px as u8);
+        }
+
         self.bezel_anim_len = anim_offs.len() as u32;
         self.bezel_full_len = full_offs.len() as u32;
         self.bezel_offsets_anim = anim_offs;
@@ -253,7 +335,8 @@ impl Clock {
             self.last_minute = m;
             // Start the unheal→undraw→redraw cycle only from Static; if a prior
             // cycle is somehow still running, let it finish rather than jumping state.
-            if self.minute_anim && self.phase == BezelPhase::Static {
+            if self.minute_anim && self.phase == BezelPhase::Static && self.flourish_frame == u32::MAX
+            {
                 self.phase = BezelPhase::Unheal;
                 self.frame_in_phase = 0;
             }
@@ -276,7 +359,11 @@ impl Clock {
 
         let prev_centers = self.drawn_centers;
         let mut ring_acc = RectAcc::empty();
-        let bezel_writes = self.step_bezel(wfb.buf_mut(), &mut ring_acc);
+        let bezel_writes = if self.flourish_frame != u32::MAX {
+            self.step_flourish(wfb.buf_mut(), &mut ring_acc)
+        } else {
+            self.step_bezel(wfb.buf_mut(), &mut ring_acc)
+        };
         if !ring_acc.is_empty() {
             // +1 slack: stamps are 3×3 around each accumulated center.
             wfb.mark_rect(
@@ -760,12 +847,116 @@ impl Clock {
     /// Whether the bezel is mid-animation — the app runs a faster frame
     /// cadence (matching the 40 fps build-time schedules) while true.
     pub fn is_animating(&self) -> bool {
-        self.phase != BezelPhase::Static
+        self.phase != BezelPhase::Static || self.flourish_frame != u32::MAX
     }
 
     /// Enable/disable the minute-change ring sweep (M5: off while dimmed).
     pub fn set_minute_anim(&mut self, enabled: bool) {
         self.minute_anim = enabled;
+    }
+
+    /// Start the lightsaber flourish (PWR press while locked). Only from a
+    /// resting ring; ignored while any ring animation runs.
+    pub fn start_flourish(&mut self) {
+        if self.phase == BezelPhase::Static && self.flourish_frame == u32::MAX {
+            self.flourish_frame = 0;
+        }
+    }
+
+    pub fn flourish_active(&self) -> bool {
+        self.flourish_frame != u32::MAX
+    }
+
+    /// Abort the flourish by writing its zero-glow closing frame (exact
+    /// resting ring), so a drag can take over a clean canvas immediately.
+    pub fn cancel_flourish(&mut self, fb: &mut [u8], acc: &mut RectAcc) {
+        if self.flourish_frame != u32::MAX {
+            self.flourish_frame = FL_TOTAL_F - 1;
+            self.step_flourish(fb, acc);
+        }
+    }
+
+    /// One flourish frame: ignition sweep → flare pulses → retraction.
+    /// Per pixel: val = max(resting ring alpha, angular-mask × radial glow),
+    /// through the saber gradient LUT — so unswept regions show the (blue-
+    /// energized) resting ring and the final retract frame IS the resting
+    /// ring, pixel-identical.
+    fn step_flourish(&mut self, fb: &mut [u8], acc: &mut RectAcc) -> usize {
+        let fr = self.flourish_frame;
+
+        // Per-frame radial glow profile (peak 0..=255, width in Q3 px past
+        // the stroke core at d≈34).
+        let (peak, width_q3): (i32, i32) = if fr < FL_SWEEP_F {
+            (200, 52) // ignition: bright 6.5 px corona
+        } else if fr < FL_SWEEP_F + FL_FLARE_F {
+            // Two breathing pulses.
+            const P: [i32; 12] = [210, 235, 255, 245, 220, 195, 205, 225, 210, 190, 175, 160];
+            const W: [i32; 12] = [52, 60, 70, 66, 58, 50, 54, 60, 54, 48, 44, 40];
+            let i = (fr - FL_SWEEP_F) as usize;
+            (P[i], W[i])
+        } else {
+            // Quadratic collapse to exactly zero on the last frame.
+            let i = (fr - FL_SWEEP_F - FL_FLARE_F) as i32;
+            let n = FL_RETRACT_F as i32 - 1;
+            let q = ((n - i) * (n - i) * 256) / (n * n).max(1);
+            ((160 * q) >> 8, (44 * q) >> 8)
+        };
+        let mut radial = [0u8; 128];
+        for (d, r) in radial.iter_mut().enumerate() {
+            let d = d as i32;
+            *r = if d <= 34 {
+                255
+            } else if width_q3 > 0 && d - 34 < width_q3 {
+                let t = width_q3 - (d - 34);
+                ((peak * t * t) / (width_q3 * width_q3)).min(255) as u8
+            } else {
+                0
+            };
+        }
+
+        // Ignition front (0..=256 around the ring), quadratic ease-out:
+        // strikes fast, lands smoothly. ≥512 = fully swept.
+        let front: i32 = if fr < FL_SWEEP_F {
+            let rem = (FL_SWEEP_F - fr) as i32;
+            256 - (256 * rem * rem) / (FL_SWEEP_F * FL_SWEEP_F) as i32
+        } else {
+            512
+        };
+
+        let mut writes = 0usize;
+        let mut pi = 0usize;
+        for &(start, len) in &self.flourish_runs {
+            let s = start as usize;
+            let n = len as usize;
+            let px_base = s / 2;
+            for k in 0..n {
+                let d = self.flourish_d[pi + k] as usize;
+                let sab = radial[d & 127] as i32;
+                let f = if front >= 512 {
+                    256
+                } else {
+                    ((front - self.flourish_ang[pi + k] as i32) * 13).clamp(0, 256)
+                };
+                let p = px_base + k;
+                let val = (self.ring_alpha[p] as i32).max((sab * f) >> 8) as usize;
+                let (hi, lo) = self.flourish_lut[val.min(255)];
+                let idx = p * 2;
+                if idx + 1 < fb.len() {
+                    fb[idx] = hi;
+                    fb[idx + 1] = lo;
+                }
+            }
+            pi += n;
+            writes += n;
+        }
+        acc.add(CX - BEZEL_R - FLOURISH_BAND_PX - 1, CY - BEZEL_R - FLOURISH_BAND_PX - 1);
+        acc.add(CX + BEZEL_R + FLOURISH_BAND_PX + 1, CY + BEZEL_R + FLOURISH_BAND_PX + 1);
+
+        self.flourish_frame += 1;
+        if self.flourish_frame >= FL_TOTAL_F {
+            self.flourish_frame = u32::MAX;
+        }
+        writes
     }
 
     /// AOD minimal frame: black canvas, HH:MM only, drifted by a
@@ -931,6 +1122,35 @@ fn end_profile(d: i32) -> (i32, i32) {
         isqrt((HALF_T * HALF_T * d * (2 * CAP_STEPS - d)) as u32) as i32 / CAP_STEPS
     };
     (alpha, hw)
+}
+
+/// Octant-based integer angle, 0..=255 (0 = +x axis, increasing toward +y =
+/// screen-clockwise). Linear in-octant approximation (max ~4° error) — the
+/// flourish front's soft ramp absorbs it invisibly.
+#[inline]
+fn angle256(dx: i32, dy: i32) -> u8 {
+    let ax = dx.abs();
+    let ay = dy.abs();
+    if ax == 0 && ay == 0 {
+        return 0;
+    }
+    let t = (ay.min(ax) * 32) / ax.max(ay);
+    let oct = if ax >= ay {
+        if dx >= 0 {
+            if dy >= 0 { t } else { 256 - t }
+        } else if dy >= 0 {
+            128 - t
+        } else {
+            128 + t
+        }
+    } else if dy >= 0 {
+        if dx >= 0 { 64 - t } else { 64 + t }
+    } else if dx >= 0 {
+        192 + t
+    } else {
+        192 - t
+    };
+    (oct & 255) as u8
 }
 
 /// Newton integer square root (inputs here are ≤ ~102k; converges in a few steps).
