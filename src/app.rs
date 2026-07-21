@@ -403,19 +403,12 @@ impl<'a, 'd> App<'a, 'd> {
         // stalls) — single-sample spikes and direction flapping showed as
         // sheet stagger near the end of unlocks. The median kills both with
         // ~one report (~10 ms) of lag; monotonic motion passes unharmed.
-        let mut d_hist = [start_dist; 3];
-        let mut d_idx = 0usize;
-        // Report-gap instrumentation, split by sheet half (confirmed: the
-        // CST9217's report rate collapses as the finger slows near the top).
+        // Tracking is the simple pre-filter version (user-directed revert):
+        // raw mapped target, plain 2/3 pursuit — no median, no hysteresis,
+        // no regime switching. The sensor's flaky top edge is handled by the
+        // unlock auto-commit alone.
         let mut last_move = Instant::now();
         let (mut gap_bot, mut gap_top) = (0u32, 0u32);
-        let mut last_gap: u32 = 0;
-        // Expected direction of target motion (hysteresis state): for an Up
-        // drag the sheet target decreases.
-        let mut motion_sign: i32 = match dir {
-            SwipeDir::Up => -1,
-            SwipeDir::Down => 1,
-        };
 
         let (dist, vel) = loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
@@ -423,25 +416,12 @@ impl<'a, 'd> App<'a, 'd> {
                 GestureEvent::DragMove { dist, .. } => {
                     let g = (last_move.elapsed().as_millis() as u32).max(1);
                     last_move = Instant::now();
-                    last_gap = g;
                     if (target_b as i32) > H / 2 {
                         gap_bot = gap_bot.max(g);
                     } else {
                         gap_top = gap_top.max(g);
                     }
-                    d_hist[d_idx] = dist;
-                    d_idx = (d_idx + 1) % 3;
-                    let t = map_target(median3(d_hist));
-                    // Direction hysteresis: near the sensor edge the chip's
-                    // coordinates are BISTABLE — they flap between two fixed
-                    // spots. A reversal must exceed 12 px to move the sheet
-                    // backward; motion along the current direction passes
-                    // instantly (a gate, not a filter — zero added lag).
-                    let d = t as i32 - target_b as i32;
-                    if d != 0 && (d.signum() == motion_sign || d.abs() > 12) {
-                        motion_sign = d.signum();
-                        target_b = t;
-                    }
+                    target_b = map_target(dist);
                 }
                 GestureEvent::DragEnd { dist, vel_q8, .. } => {
                     // Lift uses the raw final travel (lift-report coords).
@@ -450,43 +430,25 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 _ => {}
             }
-            // AUTO-COMMIT: past 80% travel the transition completes itself —
-            // the terminal zone of the sensor is untrustworthy (bistable,
-            // sparse), so the sheet never depends on it. Industry-standard
-            // terminal-zone handling; the lift's DragEnd is ignored by the
-            // main loop because the scene has already changed.
-            let committed = match dir {
-                SwipeDir::Up => (target_b as i32) < H / 5,
-                SwipeDir::Down => (target_b as i32) > H * 4 / 5,
-            };
-            if committed {
+            // AUTO-COMMIT (unlock only, 85% travel): the transition completes
+            // itself before the finger reaches the sensor's untrustworthy top
+            // edge. The eventual lift's DragEnd is scene-filtered by the main
+            // loop (the scene has already changed).
+            if dir == SwipeDir::Up && (target_b as i32) < H * 3 / 20 {
                 println!(
-                    "gesture: auto-commit dir={} b={} (composes={composes} gap_bot={gap_bot}ms gap_top={gap_top}ms)",
-                    dir_str(dir),
+                    "gesture: auto-commit b={} (composes={composes} gap_bot={gap_bot}ms gap_top={gap_top}ms)",
                     target_b
                 );
-                let target = match dir {
-                    SwipeDir::Up => 0,
-                    SwipeDir::Down => LCD_HEIGHT,
-                };
-                return self.settle_from(sheet_b, target, now, text_bbox);
+                return self.settle_from(sheet_b, 0, now, text_bbox);
             }
             if target_b != *sheet_b
                 && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
             {
                 last_compose = Instant::now();
                 let t0 = Instant::now();
-                // Pursuit by report DENSITY: dense stream → 2/3 tracking,
-                // glued to the finger; sparse stream (slow finger — the
-                // chip's report rate collapses) → glide ≤4 px/compose so
-                // coarse steps render as continuous motion.
-                let sparse = last_gap > 40 || last_move.elapsed().as_millis() as u64 > 40;
                 let diff = target_b as i32 - *sheet_b as i32;
                 let next = if diff.abs() <= 2 {
                     target_b
-                } else if sparse {
-                    let step = (diff / 4).clamp(-4, 4);
-                    (*sheet_b as i32 + if step == 0 { diff.signum() } else { step }) as u16
                 } else {
                     (*sheet_b as i32 + diff * 2 / 3) as u16
                 };
@@ -843,12 +805,6 @@ fn ring_level_idx(b: u16) -> i32 {
     let x = b as i32 - (H - RING_FADE_RANGE);
     let f = x.clamp(0, RING_FADE_RANGE);
     (f * RING_LEVELS + RING_FADE_RANGE / 2) / RING_FADE_RANGE
-}
-
-/// Median of three (branchless-ish): kills single-sample coordinate spikes.
-fn median3(v: [u16; 3]) -> u16 {
-    let (a, b, c) = (v[0], v[1], v[2]);
-    a.max(b).min(a.min(b).max(c))
 }
 
 fn dir_str(dir: SwipeDir) -> &'static str {
