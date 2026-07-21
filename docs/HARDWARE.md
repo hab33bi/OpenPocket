@@ -53,6 +53,11 @@ Sources: [Waveshare wiki](https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 - **esp-hal I2C defaults have NO timeouts on the S3** — a wedged transaction
   blocks forever (froze the whole firmware). Always set `BusTimeout::Maximum`
   + a software transaction timeout; errors then feed an auto re-init path.
+- The chip **clock-stretches/wedges transactions when a finger sits at the
+  panel edge** (hardware-observed: reads hitting the full software timeout
+  at the end of edge-to-edge drags). All legitimate transactions on this bus
+  finish in <1 ms, so the software timeout is set to 5 ms — it bounds the
+  stall to sub-perceptible instead of a visible drag hitch.
 | PCF85063 RTC | `0x51` | Powered via AXP2101; keeps time while the board has power. Time regs 0x04–0x0A (BCD), VL flag = reg 0x04 bit 7 (clock-integrity lost) |
 | QMI8658 IMU | — | Present on board; unused, kept powered down (out of scope) |
 | TCA9554 expander | — | Present on board; not needed for display/touch/RTC on this board (touch RST is a direct GPIO) |

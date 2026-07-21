@@ -64,7 +64,12 @@ fn main() -> ! {
         I2cConfig::default()
             .with_frequency(Rate::from_khz(400))
             .with_timeout(BusTimeout::Maximum)
-            .with_software_timeout(SoftwareTimeout::Transaction(Duration::from_millis(20))),
+            // 5 ms: every transaction on this bus (touch 15 B, PMIC 2 B, RTC
+            // 7 B) completes in <1 ms at 400 kHz — 5 ms is ~10× margin. The
+            // CST9217 clock-stretches/wedges transactions when a finger sits
+            // at the panel edge (hardware-observed); the timeout caps that
+            // stall, and 20 ms of it was a visible hitch at the end of drags.
+            .with_software_timeout(SoftwareTimeout::Transaction(Duration::from_millis(5))),
     )
     .unwrap()
     .with_sda(peripherals.GPIO15)
