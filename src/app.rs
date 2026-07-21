@@ -410,10 +410,12 @@ impl<'a, 'd> App<'a, 'd> {
         let mut last_move = Instant::now();
         let (mut gap_bot, mut gap_top) = (0u32, 0u32);
         let mut last_gap: u32 = 0;
-        // Dead-reckoning through report gaps: estimated target velocity
-        // (Q8 px/ms, smoothed) carries the sheet between sparse reports.
-        let mut trk_vel_q8: i32 = 0;
-        let mut last_target = target_b;
+        // Expected direction of target motion (hysteresis state): for an Up
+        // drag the sheet target decreases.
+        let mut motion_sign: i32 = match dir {
+            SwipeDir::Up => -1,
+            SwipeDir::Down => 1,
+        };
 
         let (dist, vel) = loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
@@ -429,10 +431,17 @@ impl<'a, 'd> App<'a, 'd> {
                     }
                     d_hist[d_idx] = dist;
                     d_idx = (d_idx + 1) % 3;
-                    target_b = map_target(median3(d_hist));
-                    let dv = ((target_b as i32 - last_target as i32) << 8) / (g.min(500) as i32);
-                    trk_vel_q8 = (trk_vel_q8 * 3 + dv) / 4;
-                    last_target = target_b;
+                    let t = map_target(median3(d_hist));
+                    // Direction hysteresis: near the sensor edge the chip's
+                    // coordinates are BISTABLE — they flap between two fixed
+                    // spots. A reversal must exceed 12 px to move the sheet
+                    // backward; motion along the current direction passes
+                    // instantly (a gate, not a filter — zero added lag).
+                    let d = t as i32 - target_b as i32;
+                    if d != 0 && (d.signum() == motion_sign || d.abs() > 12) {
+                        motion_sign = d.signum();
+                        target_b = t;
+                    }
                 }
                 GestureEvent::DragEnd { dist, vel_q8, .. } => {
                     // Lift uses the raw final travel (lift-report coords).
@@ -441,35 +450,40 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 _ => {}
             }
-            // Dead-reckoning: during a report gap, pursue an extrapolated
-            // target advancing at the finger's estimated velocity (bounded
-            // to ±16 px past the last real position; velocity decays if the
-            // finger truly stops) — the sheet keeps MOVING through gaps
-            // instead of freeze-then-snap. Fresh reports correct it via the
-            // glide below.
-            let gap_ms = last_move.elapsed().as_millis() as i32;
-            if gap_ms > 200 {
-                trk_vel_q8 -= trk_vel_q8 / 8;
-            }
-            let pursue: u16 = if gap_ms > 30 && trk_vel_q8 != 0 {
-                let ext = ((trk_vel_q8 * gap_ms) >> 8).clamp(-16, 16);
-                (last_target as i32 + ext).clamp(0, H) as u16
-            } else {
-                target_b
+            // AUTO-COMMIT: past 80% travel the transition completes itself —
+            // the terminal zone of the sensor is untrustworthy (bistable,
+            // sparse), so the sheet never depends on it. Industry-standard
+            // terminal-zone handling; the lift's DragEnd is ignored by the
+            // main loop because the scene has already changed.
+            let committed = match dir {
+                SwipeDir::Up => (target_b as i32) < H / 5,
+                SwipeDir::Down => (target_b as i32) > H * 4 / 5,
             };
-            if pursue != *sheet_b && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
+            if committed {
+                println!(
+                    "gesture: auto-commit dir={} b={} (composes={composes} gap_bot={gap_bot}ms gap_top={gap_top}ms)",
+                    dir_str(dir),
+                    target_b
+                );
+                let target = match dir {
+                    SwipeDir::Up => 0,
+                    SwipeDir::Down => LCD_HEIGHT,
+                };
+                return self.settle_from(sheet_b, target, now, text_bbox);
+            }
+            if target_b != *sheet_b
+                && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
             {
                 last_compose = Instant::now();
                 let t0 = Instant::now();
-                // Pursuit regime by report DENSITY, not step size (a large
-                // step after a long gap is still a slow finger — snapping
-                // 2/3 of it was the residual jag): dense stream → 2/3
-                // tracking, glued; sparse stream → glide ≤4 px/compose so
-                // corrections render as continuous motion.
-                let sparse = last_gap > 40 || gap_ms > 40;
-                let diff = pursue as i32 - *sheet_b as i32;
+                // Pursuit by report DENSITY: dense stream → 2/3 tracking,
+                // glued to the finger; sparse stream (slow finger — the
+                // chip's report rate collapses) → glide ≤4 px/compose so
+                // coarse steps render as continuous motion.
+                let sparse = last_gap > 40 || last_move.elapsed().as_millis() as u64 > 40;
+                let diff = target_b as i32 - *sheet_b as i32;
                 let next = if diff.abs() <= 2 {
-                    pursue
+                    target_b
                 } else if sparse {
                     let step = (diff / 4).clamp(-4, 4);
                     (*sheet_b as i32 + if step == 0 { diff.signum() } else { step }) as u16
