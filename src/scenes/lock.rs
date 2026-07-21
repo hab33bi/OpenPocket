@@ -789,6 +789,17 @@ fn bezel_color_bytes(intensity_q14: i32) -> (u8, u8) {
     ((px >> 8) as u8, px as u8)
 }
 
+/// Whether a rect could contain bezel-ring pixels: true when its farthest
+/// corner from the ring center reaches the annulus (conservative bbox test).
+/// Used by the drag composer to know a text erase clobbered ring pixels.
+#[inline]
+pub fn rect_touches_ring(x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+    let inner = BEZEL_R - HALF_T - 2;
+    let dx = (CX - x0).max(x1 - CX).max(0);
+    let dy = (CY - y0).max(y1 - CY).max(0);
+    dx * dx + dy * dy >= inner * inner
+}
+
 #[inline]
 pub fn clear_rect(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
     for y in y0..=y1 {

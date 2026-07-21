@@ -40,6 +40,9 @@ Sources: [Waveshare wiki](https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75)
 | CST9217 touch | `0x5A` | INT = **GPIO11**, RESET = **GPIO40**. Reference driver: SensorLib `TouchDrvCST92xx` (MIT) in the Waveshare BSP |
 
 **CST9217 field notes (hardware-verified, 2026-07):**
+- **Y axis is inverted vs the panel**: raw y=0 = physical *bottom*. The driver
+  flips it (`read_touch` returns display coordinates). X orientation is
+  unverified — confirm with corner taps before anything X-direction-sensitive.
 - Auto low-power scan kicks in ~10 s after boot and starves reports — disable
   with `[0xD1, 0x06]` at init (done in `drivers/cst9217.rs`).
 - Emits a spurious ghost report while settling after init (observed

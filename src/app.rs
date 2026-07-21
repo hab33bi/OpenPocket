@@ -33,9 +33,11 @@ const FRAME_US: u64 = 50_000;
 const ANIM_FRAME_US: u64 = 40_000;
 /// Minimum gap between drag composes (≈60 Hz render-on-touch-move cap).
 const COMPOSE_MIN_US: u64 = 16_000;
-/// Release verdict: complete the transition when the drag traveled this far…
-const COMPLETE_DIST: i32 = LCD_HEIGHT as i32 / 4;
-/// …or released with at least this velocity along the swipe (Q8 px/ms ≈ 0.5).
+/// Release verdict ("magnetic snap"): past half the screen the transition
+/// always completes; under half it always retracts — nothing rests midway…
+const COMPLETE_DIST: i32 = LCD_HEIGHT as i32 / 2;
+/// …except a quick flick: at least this velocity along the swipe at release
+/// (Q8 px/ms ≈ 0.5) completes regardless of distance.
 const COMPLETE_VEL_Q8: i32 = 128;
 /// Ring fade completes over the first third of sheet travel, in 16 steps.
 const RING_FADE_RANGE: i32 = LCD_HEIGHT as i32 / 3;
@@ -347,9 +349,23 @@ impl<'a, 'd> App<'a, 'd> {
                 nrects += 1;
             }
 
-            // 2) Ring prefix (rows < bi) whenever brightness stepped or the
-            // sheet grew (new rows need their ring pixels back).
-            if lvl != lvl_prev || bi > bp {
+            // 2) Erase the text at its old spot (sheet rows only — image rows
+            // were just overwritten by the band blit). Must run BEFORE the ring
+            // pass: the erase is a black rect, and when the sliding text
+            // crosses the annulus it would otherwise punch a black box out of
+            // freshly drawn ring pixels (visible during relock).
+            let erased = old_text.2 >= old_text.0 && old_text.1 < bi;
+            if erased {
+                lock::clear_rect(fb, old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
+            }
+
+            // 3) Ring prefix (rows < bi) whenever brightness stepped, the
+            // sheet grew (new rows need their ring pixels back), or the text
+            // erase reached into the annulus while the ring is visible.
+            let erase_hit_ring = erased
+                && lvl > 0
+                && lock::rect_touches_ring(old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
+            if lvl != lvl_prev || bi > bp || erase_hit_ring {
                 let mut acc = RectAcc::empty();
                 self.clock.draw_ring_rows(fb, bi, lvl * Q / RING_LEVELS, &mut acc);
                 if !acc.is_empty() {
@@ -358,11 +374,7 @@ impl<'a, 'd> App<'a, 'd> {
                 }
             }
 
-            // 3) Text: erase at the old spot (sheet rows only — image rows were
-            // just overwritten by the band blit), redraw at the new shift.
-            if old_text.2 >= old_text.0 && old_text.1 < bi {
-                lock::clear_rect(fb, old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
-            }
+            // 4) Text: redraw at the new shift.
             let nb = self.clock.draw_sheet_text(fb, now, bi - H, bi);
             let dirty_text = if old_text.2 < old_text.0 {
                 nb

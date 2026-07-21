@@ -9,6 +9,8 @@
 //! - Report: write `[0xD0,0x00]`, read 15 bytes, then ack `[0xD0,0x00,0xAB]`.
 //!   buf[6] must be 0xAB; finger count = buf[5] & 0x7F; finger 0 in buf[0..5]:
 //!   evt = b0 & 0x0F (0x06 = contact), x = b1<<4 | b3>>4, y = b2<<4 | b3&0x0F.
+//!   The raw Y axis is inverted vs the panel — `read_touch` flips it so
+//!   callers always get display coordinates (y=0 at the physical top).
 //! - INT (GPIO11) pulses per report; it is not a continuous level.
 
 use esp_hal::gpio::Output;
@@ -16,7 +18,7 @@ use esp_hal::i2c::master::I2c;
 use esp_hal::time::{Duration, Instant};
 use esp_hal::Blocking;
 
-use crate::board::CST9217_ADDR;
+use crate::board::{CST9217_ADDR, LCD_HEIGHT};
 
 const CHIP_ID_CST9217: u16 = 0x9217;
 const CHIP_ID_CST9220: u16 = 0x9220;
@@ -115,7 +117,14 @@ pub fn read_touch(i2c: &mut I2c<'_, Blocking>) -> Result<Option<TouchPoint>, ()>
     }
     let evt = buf[0] & 0x0F;
     let x = ((buf[1] as u16) << 4) | ((buf[3] as u16) >> 4);
-    let y = ((buf[2] as u16) << 4) | ((buf[3] as u16) & 0x0F);
+    let y_raw = ((buf[2] as u16) << 4) | ((buf[3] as u16) & 0x0F);
+    // The controller's Y axis is inverted relative to the panel on this board
+    // (raw y=0 = physical BOTTOM; hardware-verified 2026-07-21: a physical
+    // bottom-edge swipe-up read as a top-zone swipe-down). Flip here so every
+    // consumer sees panel-true coordinates. X orientation is unverified —
+    // nothing direction-sensitive reads it yet (drag classification is
+    // Y-dominant; X only feeds the symmetric |dx| slop check).
+    let y = (LCD_HEIGHT - 1).saturating_sub(y_raw);
     Ok(Some(TouchPoint {
         x,
         y,

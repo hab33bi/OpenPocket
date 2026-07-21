@@ -54,29 +54,31 @@ A pocket watch. **Lock screen** = the existing clock (time, date, animated bezel
 
 Idle dimming, subtle content shift for static elements, AOD-style minimal mode (HH:MM, 1 update/min, pixel offset), display sleep, reduced animation when idle.
 
-## M4 status (2026-07-21): implemented, responsiveness fix pending
+## M4 status (2026-07-21): direction + polish fixes applied
 
 The sheet composer, drag sessions, settle animation, swipe-down relock, and
-60 s auto-relock are implemented and flashed. **User verdict: drag grab is
-sluggish/glitchy — sometimes doesn't engage — while the old tap-to-switch felt
-instant.**
+60 s auto-relock are implemented and flashed.
 
-**Diagnosis (to execute next):** touch reads are edge-triggered on the INT pin
-with a 20 ms level fallback. During a drag, composes+flushes block the CPU for
-5–25 ms at a time; the CST9217's short INT pulses land inside those windows and
-are missed, so reports (and therefore sheet updates) arrive erratically. The
-M3 tap path never needed a report *stream*, which is why it felt fine.
+**The "sluggish/glitchy grab" root cause was NOT latency** (the earlier
+INT-starvation diagnosis is superseded): the CST9217's **Y axis is inverted
+relative to the panel** (raw y=0 = physical bottom). The user's physical
+bottom-up swipes landed in the code's *top* arm zone and classified as
+swipe-*down*, which Locked ignores — while a physical top-down swipe unlocked
+(and, notably, felt responsive, clearing the latency theory). Fixed in
+`drivers/cst9217.rs::read_touch`: Y flipped once at the driver boundary so all
+consumers see display coordinates. X orientation unverified (nothing
+direction-sensitive uses it yet — check with corner taps before M6).
 
-**Fix plan:**
-1. While the recognizer is in Pending/Dragging (finger down), read the chip
-   **unconditionally on a timer** (~every 10 ms, latest-wins) — no INT gating.
-   Edge-gating remains only for the Idle phase (bus hygiene at rest).
-2. Consider: arm zone bottom 25% → ~37% ("fairly large segment of the bottom
-   edge"), slop 14 px → 10 px for a faster grab, and emit the first DragMove
-   together with DragStart so the sheet moves on the very first classified
-   sample.
-3. Measure with the drag log line (`drag b= compose= flush= spans=`): target
-   compose+flush < 20 ms typical and report intervals ≤ 20 ms during movement.
+**Also fixed (user-reported):**
+- Black box punched out of the ring by the sliding digits during relock: the
+  compose order was ring-then-text-erase; the erase (a black rect at the old
+  text spot) clobbered freshly drawn ring pixels. Reordered erase → ring →
+  text, with `rect_touches_ring` forcing a ring repaint when the erase reaches
+  the annulus while the ring is visible.
+- Magnetic snap (user-confirmed model): release verdict is now **50% of the
+  screen** (was 25%) — past half always completes, under half always retracts,
+  nothing rests midway — **or a quick flick** (vel > 0.5 px/ms) completes
+  regardless of distance. Finger-tracked 1:1 while down; decision at release.
 
 ## Polish backlog (near-term, after M4)
 
