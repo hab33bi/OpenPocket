@@ -154,11 +154,12 @@ fn generate_sin_lut() {
 /// semantics (P2, docs/09). Peak per-frame delta ≈ avg × curve's max slope —
 /// keep max slope ≤ ~1.6 so the worst anim frame stays inside the 91 ms cadence.
 ///
-/// Startup sweep: gentle stately S-curve (validated on hardware — "lovely").
-const INITIAL_BEZIER: (f64, f64, f64, f64) = (0.25, 0.1, 0.75, 0.9);
-/// Minute change: snappier mid (max slope 1.5), still soft at both ends —
-/// reads as a responsive reaction to the tick rather than a slow ornament.
-const MINUTE_BEZIER: (f64, f64, f64, f64) = (0.33, 0.0, 0.67, 1.0);
+/// Startup sweep: pronounced cubic ease — patient wind-up, swift middle, long
+/// graceful landing (2026-07-21: deepened from (0.25,0.1,0.75,0.9) which read
+/// nearly linear; max slope ~1.8 — budget-checked against the faster stamps).
+const INITIAL_BEZIER: (f64, f64, f64, f64) = (0.45, 0.0, 0.25, 1.0);
+/// Minute change: snappier still — quick reaction to the tick, soft landing.
+const MINUTE_BEZIER: (f64, f64, f64, f64) = (0.4, 0.0, 0.2, 1.0);
 
 /// Bezel ring animation schedules (docs/09 P0): cumulative arc-center counts per frame.
 ///
@@ -166,8 +167,10 @@ const MINUTE_BEZIER: (f64, f64, f64, f64) = (0.33, 0.0, 0.67, 1.0);
 /// frame, so per-frame deltas are bounded by construction (no runtime cap needed) and
 /// the ring always reaches the schedule's end state before the phase can exit.
 fn generate_bezel_schedules() {
-    // Must equal src/clock.rs precompute size: BEZEL_STEPS (36000) × thickness taps (11).
-    const TOTAL: u32 = 396_000;
+    // Must equal the lock-scene precompute size: BEZEL_STEPS (36000) × TAPS (19,
+    // stroke ± glow reach). scale_sched in lock.rs tolerates a mismatch, but
+    // identity keeps per-frame deltas exactly as constructed.
+    const TOTAL: u32 = 684_000;
     // The main loop paces frames to exactly this rate (CLOCK_FRAME_US in main.rs),
     // so schedules take precisely their designed wall-clock duration. More fps =
     // more, smaller schedule steps over the same duration = smoother motion;

@@ -50,6 +50,13 @@ const SETTLE_SNAP_PX: i32 = 6;
 /// Consecutive touch I2C errors before the controller is re-initialized.
 const TOUCH_REINIT_ERRORS: u32 = 5;
 
+/// M5 burn-in mitigation: dim the panel after this long without touch…
+const IDLE_DIM_SECS: u64 = 30;
+/// …ramping to this brightness (CO5300 reg 0x51; 0xFF = full).
+const IDLE_DIM_LEVEL: u8 = 0x38;
+/// Dim-down ramp step per frame (~1.2 s at 20 fps); wake restores instantly.
+const DIM_STEP: u8 = 8;
+
 const H: i32 = LCD_HEIGHT as i32;
 const ROW_BYTES: usize = LCD_WIDTH as usize * 2;
 
@@ -66,6 +73,8 @@ struct TouchPoll {
     i2c_errors: u32,
     consec_errors: u32,
     int_was_low: bool,
+    /// Last touch report of any kind — drives M5 idle dimming.
+    last_activity: Instant,
 }
 
 pub struct App<'a, 'd> {
@@ -98,9 +107,11 @@ impl<'a, 'd> App<'a, 'd> {
             i2c_errors: 0,
             consec_errors: 0,
             int_was_low: false,
+            last_activity: Instant::now(),
         };
         let mut last_report = Instant::now();
         let mut ema_fps: f32 = 0.0;
+        let mut brightness: u8 = 0xFF;
 
         loop {
             let frame_start = Instant::now();
@@ -126,6 +137,22 @@ impl<'a, 'd> App<'a, 'd> {
 
             let (flush_ms, flush_mode, span_count) = self.flush_dirty();
             let flushed = flush_mode != '-';
+
+            // M5 idle dimming: ramp down after IDLE_DIM_SECS without touch,
+            // restore instantly on activity (burn-in + power).
+            let dim_target = if tp.last_activity.elapsed() >= Duration::from_secs(IDLE_DIM_SECS) {
+                IDLE_DIM_LEVEL
+            } else {
+                0xFF
+            };
+            if brightness != dim_target {
+                brightness = if dim_target > brightness {
+                    dim_target
+                } else {
+                    brightness.saturating_sub(DIM_STEP).max(dim_target)
+                };
+                self.bus.write_c8d8(0x51, brightness);
+            }
 
             let work_ms = frame_start.elapsed().as_millis() as u32;
 
@@ -180,6 +207,11 @@ impl<'a, 'd> App<'a, 'd> {
             self.maybe_reinit_touch(&mut tp);
 
             if let Some((dir, dist)) = start_drag {
+                // A drag can arm while dimmed — restore before it renders.
+                if brightness != 0xFF {
+                    brightness = 0xFF;
+                    self.bus.write_c8d8(0x51, brightness);
+                }
                 scene = self.drag_session(dir, dist, &mut sheet_b, &now, anim_start, &mut tp);
                 if scene == Scene::Unlocked {
                     unlocked_at = Instant::now();
@@ -187,6 +219,10 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
             if let Some((dir, dist, vel)) = flick {
+                if brightness != 0xFF {
+                    brightness = 0xFF;
+                    self.bus.write_c8d8(0x51, brightness);
+                }
                 if dist as i32 > COMPLETE_DIST || vel > COMPLETE_VEL_Q8 {
                     let (target, bbox) = match dir {
                         SwipeDir::Up => (0, self.clock.canvas_text_bbox()),
@@ -540,6 +576,7 @@ impl<'a, 'd> App<'a, 'd> {
             None
         };
         if let Some(t) = report {
+            tp.last_activity = Instant::now();
             tp.log_ctr += 1;
             if tp.log_ctr % 32 == 0 {
                 println!(

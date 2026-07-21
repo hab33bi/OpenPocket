@@ -43,9 +43,19 @@ const BEZEL_STEPS: i32 = 36_000;
 const BEZEL_THICKNESS: i32 = 10;
 const FADE_MS: u32 = 2_400;
 
-/// Anim-list layout: TAPS entries per angle step (dr = -HALF_T ..= HALF_T).
-const TAPS: usize = (BEZEL_THICKNESS + 1) as usize;
+/// Anim-list layout: TAPS entries per angle step (dr = -TAP_HALF ..= TAP_HALF).
+/// The taps reach past the stroke (HALF_T) so the sweep also carries the glow.
+const TAPS: usize = (2 * TAP_HALF + 1) as usize;
 const HALF_T: i32 = BEZEL_THICKNESS / 2;
+/// Radial reach of the anim taps: stroke half-thickness + glow tail.
+const TAP_HALF: i32 = 9;
+
+/// Radial alpha profile (Q4 subpixel px from the stroke centerline):
+/// solid core → antialiased edge → soft glow tail.
+const AA_CORE_Q4: i32 = 64; // solid to 4.0 px
+const AA_EDGE_Q4: i32 = 92; // stroke alpha reaches 0 at 5.75 px
+const GLOW_END_Q4: i32 = 152; // glow tail fades out by 9.5 px
+const GLOW_PEAK: i32 = 70; // glow strength at the stroke edge (0..255)
 /// Faded-edge window at each arc end, in angle steps (100 steps = 1°): alpha
 /// ramps 0 → solid over this span, giving both ends a soft comet tip.
 const FADE_STEPS: i32 = 400;
@@ -56,7 +66,8 @@ const FADE_STEPS: i32 = 400;
 const CAP_STEPS: i32 = FADE_STEPS;
 /// Frames to blend the two faded rounded ends into a solid seam once the ring
 /// closes (Heal), and back out again on minute change (Unheal).
-const HEAL_FRAMES: u32 = 12;
+/// 6 frames = 300 ms at 20 fps — a swift, decisive merge (was 600 ms).
+const HEAL_FRAMES: u32 = 6;
 
 /// Bezel animation phase, advanced by frame index against the build-time schedules.
 /// A sweep phase exits only when its schedule is consumed AND the ring reached the
@@ -92,6 +103,12 @@ pub struct Clock {
     /// PSRAM cache (measured 15+ ms → ~1 ms) — the scrub-fade recolors the
     /// whole ring once per level step during drags.
     bezel_runs: Vec<(u32, u16)>,
+    /// Per-pixel radial alpha (W×H): AA stroke edges + glow tail. Every ring
+    /// write path modulates through this so the look is identical whether a
+    /// pixel was painted by the sweep, the full blit, or the scrub fade.
+    ring_alpha: Vec<u8>,
+    /// intensity (0..=255) → RGB565-BE ring color bytes.
+    ring_lut: [(u8, u8); 256],
     pub bezel_anim_len: u32,
     pub bezel_full_len: u32,
     /// Angular center count currently drawn on the retained framebuffer.
@@ -122,6 +139,8 @@ impl Clock {
             bezel_offsets_anim: Vec::new(),
             bezel_offsets_full: Vec::new(),
             bezel_runs: Vec::new(),
+            ring_alpha: Vec::new(),
+            ring_lut: [(0, 0); 256],
             bezel_anim_len: 0,
             bezel_full_len: 0,
             drawn_centers: 0,
@@ -150,7 +169,7 @@ impl Clock {
             let phase = (i as i64 * TAU_Q14 as i64 / steps as i64) as i32;
             let c = lut_sin_cos_q14(phase);
             let s = lut_sin_cos_q14(phase + FRAC_PI_2_Q14);
-            for dr in (-thickness / 2)..=(thickness / 2) {
+            for dr in -TAP_HALF..=TAP_HALF {
                 let rr = r + dr;
                 let xx = CX + (((rr as i64 * c as i64) + 8192) >> 14) as i32;
                 let yy = CY + (((rr as i64 * s as i64) + 8192) >> 14) as i32;
@@ -159,8 +178,13 @@ impl Clock {
                 }
                 let center_idx = (yy * W + xx) as usize;
                 anim_offs.push((center_idx as u32) * 2);
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
+                // Coverage mirrors the runtime stamps exactly: 3×3 for stroke
+                // taps, 1×1 for glow taps (the heavy angular oversampling
+                // makes 1×1 gap-free there) — so the static blit and the
+                // sweep always touch the same pixel set.
+                let sr = stamp_r(dr);
+                for dy in -sr..=sr {
+                    for dx in -sr..=sr {
                         let pxx = xx + dx;
                         let pyy = yy + dy;
                         if pxx >= 0 && pxx < W && pyy >= 0 && pyy < H {
@@ -189,6 +213,26 @@ impl Clock {
                 Some((start, len)) if *start + (*len as u32) * 2 == off => *len += 1,
                 _ => runs.push((off, 1)),
             }
+        }
+
+        // Per-pixel radial alpha for every covered pixel (AA edges + glow),
+        // and the shared intensity→color LUT: one multiply + lookup per pixel
+        // at runtime, no per-pixel color math.
+        let mut alpha = vec![0u8; (W * H) as usize];
+        for (pix, &cov) in covered.iter().enumerate() {
+            if !cov {
+                continue;
+            }
+            let px = (pix as i32) % W;
+            let py = (pix as i32) / W;
+            let dx = px - CX;
+            let dy = py - CY;
+            let r_q4 = isqrt(((dx * dx + dy * dy) as u32) * 256) as i32;
+            alpha[pix] = ring_alpha_profile((r_q4 - BEZEL_R * 16).abs());
+        }
+        self.ring_alpha = alpha;
+        for i in 0..256 {
+            self.ring_lut[i] = bezel_color_bytes(Q * i as i32 / 255);
         }
 
         self.bezel_anim_len = anim_offs.len() as u32;
@@ -332,9 +376,8 @@ impl Clock {
         self.format_date(now);
         let fb = wfb.buf_mut();
         fb.fill(0);
-        let (hi, lo) = bezel_color_bytes(Q);
         let mut acc = RectAcc::empty();
-        self.blit_full_ring(fb, hi, lo, &mut acc);
+        self.blit_full_ring(fb, 256, &mut acc);
         self.draw_time_centered(fb, now.hour, now.minute, Q);
         self.draw_date(fb, Q);
         self.last_text = (now.hour, now.minute, Q, now.year, now.month, now.day);
@@ -358,8 +401,7 @@ impl Clock {
                     // One-shot deduped full blit normalizes solidity, then the
                     // complete ring is retained on the canvas. Invisible as a
                     // brightness change — the body was drawn at full color.
-                    let (hi, lo) = bezel_color_bytes(Q);
-                    writes += self.blit_full_ring(fb, hi, lo, acc);
+                    writes += self.blit_full_ring(fb, 256, acc);
                     self.phase = BezelPhase::Static;
                 }
                 writes
@@ -437,7 +479,8 @@ impl Clock {
             writes += self.redraw_arc_range(fb, lo, target, target, 0, 1, acc);
         } else if target < prev {
             for i in target..prev {
-                writes += black_bezel_3x3(fb, self.bezel_offsets_anim[i], acc);
+                let dr = (i % TAPS) as i32 - TAP_HALF;
+                writes += black_stamp(fb, self.bezel_offsets_anim[i], stamp_r(dr), acc);
             }
             let lo = target.saturating_sub(fade_entries);
             writes += self.redraw_arc_range(fb, lo, target, target, 0, 1, acc);
@@ -480,61 +523,105 @@ impl Clock {
         den: i32,
         acc: &mut RectAcc,
     ) -> usize {
-        let list = &self.bezel_offsets_anim;
-        let hi = hi.min(list.len());
+        let hi = hi.min(self.bezel_offsets_anim.len());
         if lo >= hi {
             return 0;
         }
         let end_step = (arc_end / TAPS) as i32;
 
-        // Per-step profile, cached across the TAPS-entry runs sharing one angle step.
-        let mut cur_step = i32::MIN;
-        let mut alpha = 0i32;
-        let mut hw = 0i32;
-        let mut col = (0u8, 0u8);
-        let mut profile = |idx: usize, cur_step: &mut i32| {
-            let step = (idx / TAPS) as i32;
-            if step != *cur_step {
-                *cur_step = step;
-                let (a0, h0) = end_profile(step); // fixed start end
-                let (a1, h1) = end_profile(end_step - step); // moving tip end
-                alpha = a0.min(a1);
-                hw = h0.min(h1);
-                if lift > 0 {
-                    alpha += (256 - alpha) * lift / den;
-                    hw += (HALF_T - hw) * lift / den;
-                }
-                col = bezel_color_bytes((Q * alpha) >> 8);
+        // Per-step (alpha, hw) profile, cached across the TAPS-entry runs
+        // sharing one angle step.
+        let step_profile = |step: i32| {
+            let (a0, h0) = end_profile(step); // fixed start end
+            let (a1, h1) = end_profile(end_step - step); // moving tip end
+            let mut alpha = a0.min(a1);
+            let mut hw = h0.min(h1);
+            if lift > 0 {
+                alpha += (256 - alpha) * lift / den;
+                hw += (HALF_T - hw) * lift / den;
             }
-            (alpha, hw, col)
+            (alpha, hw)
         };
 
         let mut writes = 0usize;
+        // Pass 1: blacks — a narrowing cap must leave no stale pixels.
+        let mut cur_step = i32::MIN;
+        let (mut alpha, mut hw) = (0i32, 0i32);
         for idx in lo..hi {
-            let (_, hw, _) = profile(idx, &mut cur_step);
-            let dr = (idx % TAPS) as i32 - HALF_T;
-            if dr.abs() > hw {
-                writes += black_bezel_3x3(fb, list[idx], acc);
+            let step = (idx / TAPS) as i32;
+            if step != cur_step {
+                cur_step = step;
+                (alpha, hw) = step_profile(step);
+            }
+            let dr = (idx % TAPS) as i32 - TAP_HALF;
+            if !cap_allows(dr, hw) {
+                writes += black_stamp(fb, self.bezel_offsets_anim[idx], stamp_r(dr), acc);
             }
         }
+        // Pass 2: colors — so they win all stamp overlaps.
         cur_step = i32::MIN;
         for idx in lo..hi {
-            let (alpha, hw, (hi_b, lo_b)) = profile(idx, &mut cur_step);
-            let dr = (idx % TAPS) as i32 - HALF_T;
-            if dr.abs() <= hw && alpha > 0 {
-                writes += write_bezel_3x3(fb, list[idx], hi_b, lo_b, acc);
+            let step = (idx / TAPS) as i32;
+            if step != cur_step {
+                cur_step = step;
+                (alpha, hw) = step_profile(step);
+            }
+            let dr = (idx % TAPS) as i32 - TAP_HALF;
+            if alpha > 0 && cap_allows(dr, hw) {
+                writes +=
+                    self.stamp_ring(fb, self.bezel_offsets_anim[idx], alpha, stamp_r(dr), acc);
             }
         }
         writes
     }
 
-    /// Blast the deduped row-major ring list at full current color (~19k px).
-    fn blit_full_ring(&self, fb: &mut [u8], hi: u8, lo: u8, acc: &mut RectAcc) -> usize {
+    /// Stamp a ring tap (3×3 stroke / 1×1 glow) at `step_alpha_q8` (0..=256),
+    /// each pixel modulated by its precomputed radial alpha (AA + glow).
+    fn stamp_ring(
+        &self,
+        fb: &mut [u8],
+        byte_off: u32,
+        step_alpha_q8: i32,
+        r: i32,
+        acc: &mut RectAcc,
+    ) -> usize {
+        let pix = byte_off as usize / 2;
+        let px = (pix % W as usize) as i32;
+        let py = (pix / W as usize) as i32;
+        acc.add(px, py);
+        let mut writes = 0usize;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let x = px + dx;
+                let y = py + dy;
+                if x < 0 || x >= W || y < 0 || y >= H {
+                    continue;
+                }
+                let p = (y * W + x) as usize;
+                let pa = self.ring_alpha[p] as i32;
+                let (hi, lo) = self.ring_lut[(((step_alpha_q8 * pa) >> 8).min(255)) as usize];
+                let i = p * 2;
+                if i + 1 < fb.len() {
+                    fb[i] = hi;
+                    fb[i + 1] = lo;
+                    writes += 1;
+                }
+            }
+        }
+        writes
+    }
+
+    /// Blast the deduped row-major ring list at `level_q8` (256 = full),
+    /// each pixel modulated by its radial alpha (AA + glow).
+    fn blit_full_ring(&self, fb: &mut [u8], level_q8: i32, acc: &mut RectAcc) -> usize {
         // Damage = the whole ring annulus bounding box.
-        acc.add(CX - BEZEL_R - HALF_T - 1, CY - BEZEL_R - HALF_T - 1);
-        acc.add(CX + BEZEL_R + HALF_T + 1, CY + BEZEL_R + HALF_T + 1);
+        acc.add(CX - BEZEL_R - TAP_HALF - 1, CY - BEZEL_R - TAP_HALF - 1);
+        acc.add(CX + BEZEL_R + TAP_HALF + 1, CY + BEZEL_R + TAP_HALF + 1);
         for &off in &self.bezel_offsets_full {
             let i = off as usize;
+            let p = i / 2;
+            let pa = self.ring_alpha[p] as i32;
+            let (hi, lo) = self.ring_lut[(((level_q8 * pa) >> 8).min(255)) as usize];
             if i + 1 < fb.len() {
                 fb[i] = hi;
                 fb[i + 1] = lo;
@@ -635,7 +722,7 @@ impl Clock {
         level_q14: i32,
         acc: &mut RectAcc,
     ) -> usize {
-        let (hi, lo) = bezel_color_bytes(level_q14);
+        let level_q8 = (level_q14 >> 6).clamp(0, 256);
         let row_bytes = (W * 2) as u32;
         let min_off = min_y.max(0) as u32 * row_bytes;
         let max_off = max_y.max(0) as u32 * row_bytes;
@@ -651,17 +738,21 @@ impl Clock {
             }
             let s = start as usize;
             let e = (s + len as usize * 2).min(fb.len());
+            let mut p = s / 2;
             for px in fb[s..e].chunks_exact_mut(2) {
+                let pa = self.ring_alpha[p] as i32;
+                let (hi, lo) = self.ring_lut[(((level_q8 * pa) >> 8).min(255)) as usize];
                 px[0] = hi;
                 px[1] = lo;
+                p += 1;
             }
             writes += (e - s) / 2;
         }
         if writes > 0 {
-            acc.add(CX - BEZEL_R - HALF_T - 1, min_y.max(0));
+            acc.add(CX - BEZEL_R - TAP_HALF - 1, min_y.max(0));
             acc.add(
-                CX + BEZEL_R + HALF_T + 1,
-                (max_y - 1).min(CY + BEZEL_R + HALF_T + 1),
+                CX + BEZEL_R + TAP_HALF + 1,
+                (max_y - 1).min(CY + BEZEL_R + TAP_HALF + 1),
             );
         }
         writes
@@ -842,15 +933,29 @@ pub fn clear_rect(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
     }
 }
 
+/// Stamp radius per tap: 3×3 for stroke taps, 1×1 for glow taps.
 #[inline]
-fn write_bezel_3x3(fb: &mut [u8], byte_off: u32, hi: u8, lo: u8, acc: &mut RectAcc) -> usize {
+fn stamp_r(dr: i32) -> i32 {
+    if dr.abs() <= HALF_T { 1 } else { 0 }
+}
+
+/// Rounded-cap taper: stroke taps obey the semicircular half-width `hw`
+/// directly; glow taps taper proportionally (scaled to their wider reach).
+#[inline]
+fn cap_allows(dr: i32, hw: i32) -> bool {
+    let reach = if dr.abs() <= HALF_T { HALF_T } else { TAP_HALF };
+    dr.abs() * HALF_T <= hw * reach
+}
+
+#[inline]
+fn black_stamp(fb: &mut [u8], byte_off: u32, r: i32, acc: &mut RectAcc) -> usize {
     let pix = byte_off as usize / 2;
     let px = (pix % W as usize) as i32;
     let py = (pix / W as usize) as i32;
     acc.add(px, py);
     let mut writes = 0usize;
-    for dy in -1..=1 {
-        for dx in -1..=1 {
+    for dy in -r..=r {
+        for dx in -r..=r {
             let x = px + dx;
             let y = py + dy;
             if x < 0 || x >= W || y < 0 || y >= H {
@@ -858,8 +963,8 @@ fn write_bezel_3x3(fb: &mut [u8], byte_off: u32, hi: u8, lo: u8, acc: &mut RectA
             }
             let i = ((y * W + x) * 2) as usize;
             if i + 1 < fb.len() {
-                fb[i] = hi;
-                fb[i + 1] = lo;
+                fb[i] = 0;
+                fb[i + 1] = 0;
                 writes += 1;
             }
         }
@@ -867,9 +972,27 @@ fn write_bezel_3x3(fb: &mut [u8], byte_off: u32, hi: u8, lo: u8, acc: &mut RectA
     writes
 }
 
+/// Radial alpha profile: solid core, ~1.75 px antialiased stroke edge, then a
+/// quadratic glow tail. Stroke + glow are summed (clamped) so the shoulder
+/// where the edge hands over to the glow blends smoothly.
 #[inline]
-fn black_bezel_3x3(fb: &mut [u8], byte_off: u32, acc: &mut RectAcc) -> usize {
-    write_bezel_3x3(fb, byte_off, 0, 0, acc)
+fn ring_alpha_profile(d_q4: i32) -> u8 {
+    let stroke = if d_q4 <= AA_CORE_Q4 {
+        255
+    } else if d_q4 < AA_EDGE_Q4 {
+        255 * (AA_EDGE_Q4 - d_q4) / (AA_EDGE_Q4 - AA_CORE_Q4)
+    } else {
+        0
+    };
+    let glow = if d_q4 <= AA_CORE_Q4 {
+        GLOW_PEAK
+    } else if d_q4 < GLOW_END_Q4 {
+        let t_q8 = ((GLOW_END_Q4 - d_q4) << 8) / (GLOW_END_Q4 - AA_CORE_Q4);
+        (GLOW_PEAK * ((t_q8 * t_q8) >> 8)) >> 8
+    } else {
+        0
+    };
+    (stroke + glow).min(255) as u8
 }
 
 fn get_glyph<'a>(glyphs: &'a [Option<Glyph>; 128], ch: char) -> Option<&'a Glyph> {

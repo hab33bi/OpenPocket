@@ -50,9 +50,25 @@ A pocket watch. **Lock screen** = the existing clock (time, date, animated bezel
 - Re-lock: swipe down from the top in Unlocked (mirror transition) + 60 s auto re-lock; ring heals back via the existing Redraw/Heal phases
 - Verify: serial `drag dy= compose= flush= spans=` — < 20 ms typical, < 50 ms worst; user judges grabber tracking and spring feel
 
-## M5 — Burn-in mitigation & power (deferred, from the old plan)
+## M5 — Burn-in mitigation & power (in progress)
 
-Idle dimming, subtle content shift for static elements, AOD-style minimal mode (HH:MM, 1 update/min, pixel offset), display sleep, reduced animation when idle.
+- **Done (2026-07-21): idle dimming** — 30 s without touch ramps panel
+  brightness to 0x38 (reg 0x51, −8/frame ≈ 1.2 s fade); any touch restores
+  full instantly (a drag arming while dimmed restores before rendering).
+  Applies in both scenes, alongside the 60 s auto-relock.
+- Remaining: subtle content shift for static elements, AOD-style minimal mode
+  (HH:MM, 1 update/min, pixel offset), display sleep after long idle, reduced
+  animation while dimmed (skip the minute undraw/redraw cycle).
+
+## Arc rendering v2 (2026-07-21, user-directed — supersedes "arc frozen")
+
+Per-pixel radial alpha map: solid core → ~1.75 px antialiased stroke edge →
+soft quadratic glow tail (to ±9.5 px, peak ~27%). All ring paths (sweep
+stamps, static blit, scrub-fade runs) share the map + a 256-entry intensity
+LUT, so appearance is path-independent. Taps widened to ±9 (glow taps stamp
+1×1). Ease deepened: startup (0.45,0,0.25,1), minute (0.4,0,0.2,1); seam
+heal 600 → 300 ms. Measured: worst sweep frame 51 ms (brief dip to ~21 fps
+at peak slope), idle frames 0 ms.
 
 ## M4 status (2026-07-21): direction + polish fixes applied
 
