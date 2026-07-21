@@ -21,7 +21,7 @@ use esp_println::println;
 use crate::board::{LCD_COL_OFFSET, LCD_HEIGHT, LCD_WIDTH};
 use crate::display::qspi_bus::QspiBus;
 use crate::display::watch_fb::{RectAcc, WatchFb};
-use crate::drivers::cst9217;
+use crate::drivers::{axp2101, cst9217};
 use crate::input::gestures::{GestureEvent, SwipeDir, SwipeTracker};
 use crate::scenes::{lock, unlocked};
 use crate::time::{WallClock, WallTime};
@@ -32,10 +32,12 @@ const FRAME_US: u64 = 50_000;
 /// frame-indexed ease schedules take exactly their designed duration, at
 /// double the temporal resolution of the old 20 fps sweep.
 const CLOCK_ANIM_FRAME_US: u64 = 25_000;
-/// Settle-animation cadence (25 fps; frames are cheap during the transition).
-const ANIM_FRAME_US: u64 = 40_000;
-/// Minimum gap between drag composes (≈60 Hz render-on-touch-move cap).
-const COMPOSE_MIN_US: u64 = 16_000;
+/// Settle-animation cadence (40 fps — matches the bezel anim cadence; the
+/// worst settle frame is a 24 ms full flush, inside the budget). Was 25 fps,
+/// which read as end-of-unlock lag.
+const ANIM_FRAME_US: u64 = 25_000;
+/// Minimum gap between drag composes (≈80 Hz render-on-touch-move cap).
+const COMPOSE_MIN_US: u64 = 12_000;
 /// Release verdict ("magnetic snap"): past half the screen the transition
 /// always completes; under half it always retracts — nothing rests midway…
 const COMPLETE_DIST: i32 = LCD_HEIGHT as i32 / 2;
@@ -217,6 +219,24 @@ impl<'a, 'd> App<'a, 'd> {
                 }
             }
 
+            // W0: PWR-key events, log-only until the App Wheel lands. The
+            // chip latches presses, so once-per-frame polling never misses
+            // one. A press counts as activity — PWR wakes from dim/AOD/sleep.
+            match axp2101::poll_power_key(&mut self.i2c) {
+                axp2101::PowerKey::ShortPress => {
+                    tp.last_activity = Instant::now();
+                    println!(
+                        "pwr: short press (scene={})",
+                        if scene == Scene::Locked { "locked" } else { "unlocked" }
+                    );
+                }
+                axp2101::PowerKey::LongPress => {
+                    tp.last_activity = Instant::now();
+                    println!("pwr: long press");
+                }
+                axp2101::PowerKey::None => {}
+            }
+
             let work_ms = frame_start.elapsed().as_millis() as u32;
 
             // Cadence remainder = touch poll window; a DragStart hands control
@@ -383,15 +403,15 @@ impl<'a, 'd> App<'a, 'd> {
             {
                 last_compose = Instant::now();
                 let t0 = Instant::now();
-                // Critically-damped tracking: half the remaining distance per
-                // compose (~25 ms time constant at the 60 Hz compose cap) —
-                // absorbs the touch sensor's edge-of-panel jitter without
-                // perceptible lag.
+                // Critically-damped tracking: 2/3 of the remaining distance
+                // per compose — absorbs edge-of-panel sensor jitter while
+                // staying glued to the finger (k=1/2 left a perceptible lag
+                // tail at the end of slow unlocks).
                 let diff = target_b as i32 - *sheet_b as i32;
                 let next = if diff.abs() <= 2 {
                     target_b
                 } else {
-                    (*sheet_b as i32 + diff / 2) as u16
+                    (*sheet_b as i32 + diff * 2 / 3) as u16
                 };
                 self.compose_sheet(*sheet_b, next, now, &mut text_bbox);
                 *sheet_b = next;

@@ -74,6 +74,17 @@ fn main() -> ! {
         Ok(()) => println!("AXP2101: OK"),
         Err(()) => println!("AXP2101: FAIL"),
     }
+    // PWR-key events (W0): enable PWRON short/long IRQs, clear stale latched
+    // flags (ordering matters — see drivers/axp2101.rs). Poll-only: the IRQ
+    // line is not wired to a GPIO on this board.
+    match axp2101::init_power_key(&mut i2c) {
+        Ok(()) => println!(
+            "AXP2101 key: OK batt={:?}% charging={}",
+            axp2101::battery_percent(&mut i2c),
+            axp2101::is_charging(&mut i2c) as u8
+        ),
+        Err(()) => println!("AXP2101 key: FAIL"),
+    }
 
     // RTC-backed wall clock: seeds the PCF85063 from the build timestamp when
     // the chip lost power (VL) or lags the build (logs the decision).
