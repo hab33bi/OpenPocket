@@ -405,18 +405,23 @@ impl<'a, 'd> App<'a, 'd> {
         // ~one report (~10 ms) of lag; monotonic motion passes unharmed.
         let mut d_hist = [start_dist; 3];
         let mut d_idx = 0usize;
-        // Report-gap instrumentation, split by sheet half: proves/kills the
-        // "report rate collapses as the finger slows near the top" theory.
+        // Report-gap instrumentation, split by sheet half (confirmed: the
+        // CST9217's report rate collapses as the finger slows near the top).
         let mut last_move = Instant::now();
         let (mut gap_bot, mut gap_top) = (0u32, 0u32);
-        let mut prev_target = target_b;
+        let mut last_gap: u32 = 0;
+        // Dead-reckoning through report gaps: estimated target velocity
+        // (Q8 px/ms, smoothed) carries the sheet between sparse reports.
+        let mut trk_vel_q8: i32 = 0;
+        let mut last_target = target_b;
 
         let (dist, vel) = loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragMove { dist, .. } => {
-                    let g = last_move.elapsed().as_millis() as u32;
+                    let g = (last_move.elapsed().as_millis() as u32).max(1);
                     last_move = Instant::now();
+                    last_gap = g;
                     if (target_b as i32) > H / 2 {
                         gap_bot = gap_bot.max(g);
                     } else {
@@ -425,6 +430,9 @@ impl<'a, 'd> App<'a, 'd> {
                     d_hist[d_idx] = dist;
                     d_idx = (d_idx + 1) % 3;
                     target_b = map_target(median3(d_hist));
+                    let dv = ((target_b as i32 - last_target as i32) << 8) / (g.min(500) as i32);
+                    trk_vel_q8 = (trk_vel_q8 * 3 + dv) / 4;
+                    last_target = target_b;
                 }
                 GestureEvent::DragEnd { dist, vel_q8, .. } => {
                     // Lift uses the raw final travel (lift-report coords).
@@ -433,23 +441,36 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 _ => {}
             }
-            if target_b != *sheet_b && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
+            // Dead-reckoning: during a report gap, pursue an extrapolated
+            // target advancing at the finger's estimated velocity (bounded
+            // to ±16 px past the last real position; velocity decays if the
+            // finger truly stops) — the sheet keeps MOVING through gaps
+            // instead of freeze-then-snap. Fresh reports correct it via the
+            // glide below.
+            let gap_ms = last_move.elapsed().as_millis() as i32;
+            if gap_ms > 200 {
+                trk_vel_q8 -= trk_vel_q8 / 8;
+            }
+            let pursue: u16 = if gap_ms > 30 && trk_vel_q8 != 0 {
+                let ext = ((trk_vel_q8 * gap_ms) >> 8).clamp(-16, 16);
+                (last_target as i32 + ext).clamp(0, H) as u16
+            } else {
+                target_b
+            };
+            if pursue != *sheet_b && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
             {
                 last_compose = Instant::now();
                 let t0 = Instant::now();
-                // Speed-adaptive pursuit. Fast finger: 2/3 of the remaining
-                // distance per compose — glued, jitter-damped. Slow finger:
-                // the CST9217's report rate collapses at low speeds, so the
-                // target arrives in coarse steps with pauses — detected as a
-                // small per-compose target delta; glide at ≤4 px/compose so
-                // sparse jumps render as continuous motion, not staccato
-                // (lag at those speeds is ~1-2 px, imperceptible).
-                let tstep = (target_b as i32 - prev_target as i32).abs();
-                prev_target = target_b;
-                let diff = target_b as i32 - *sheet_b as i32;
+                // Pursuit regime by report DENSITY, not step size (a large
+                // step after a long gap is still a slow finger — snapping
+                // 2/3 of it was the residual jag): dense stream → 2/3
+                // tracking, glued; sparse stream → glide ≤4 px/compose so
+                // corrections render as continuous motion.
+                let sparse = last_gap > 40 || gap_ms > 40;
+                let diff = pursue as i32 - *sheet_b as i32;
                 let next = if diff.abs() <= 2 {
-                    target_b
-                } else if tstep <= 12 {
+                    pursue
+                } else if sparse {
                     let step = (diff / 4).clamp(-4, 4);
                     (*sheet_b as i32 + if step == 0 { diff.signum() } else { step }) as u16
                 } else {

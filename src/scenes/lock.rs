@@ -129,10 +129,14 @@ pub struct Clock {
     flourish_ang: Vec<u8>,
     /// Frame counter; u32::MAX = inactive.
     flourish_frame: u32,
-    /// Saber gradient: black → deep electric blue → ice blue → white-hot.
-    /// Its top end matches the normal ring hue so the closing frame hands
-    /// back to the resting ring pixel-identically.
+    /// Saber gradient, packed RGB565-BE: black → electric blue → neon azure
+    /// → electric cyan → white-hot. Used directly at full effect strength.
     flourish_lut: [(u8, u8); 256],
+    /// Same gradient as RGB tuples, for the per-frame crossfade between the
+    /// resting ring hue and the neon (fade-in at ignition, fade-out at the
+    /// end of retraction — the final frame is the pure ring LUT, so the
+    /// handback is pixel-exact by construction).
+    saber_rgb: [(u8, u8, u8); 256],
     pub bezel_anim_len: u32,
     pub bezel_full_len: u32,
     /// Angular center count currently drawn on the retained framebuffer.
@@ -171,6 +175,7 @@ impl Clock {
             flourish_ang: Vec::new(),
             flourish_frame: u32::MAX,
             flourish_lut: [(0, 0); 256],
+            saber_rgb: [(0, 0, 0); 256],
             bezel_anim_len: 0,
             bezel_full_len: 0,
             drawn_centers: 0,
@@ -294,19 +299,24 @@ impl Clock {
         self.flourish_d = fd;
         self.flourish_ang = fang;
 
-        // Saber gradient. Top end (205,220,255) ≈ the resting ring's
-        // full-brightness hue, so the handback is seamless.
+        // Neon saber gradient: black → electric blue → neon azure → electric
+        // cyan → white-hot. Deliberately hotter/more saturated than the ring;
+        // the crossfade in step_flourish handles color continuity.
         for i in 0..256usize {
             let v = i as i32;
-            let (r, g, b) = if v < 96 {
-                (v * 24 / 96, v * 64 / 96, v * 220 / 96)
-            } else if v < 192 {
-                let t = v - 96;
-                (24 + t * 86 / 96, 64 + t * 106 / 96, 220 + t * 35 / 96)
+            let (r, g, b) = if v < 64 {
+                (0, v * 60 / 64, v * 255 / 64)
+            } else if v < 176 {
+                let t = v - 64;
+                (0, 60 + t * 110 / 112, 255)
+            } else if v < 232 {
+                let t = v - 176;
+                (t * 110 / 56, 170 + t * 70 / 56, 255)
             } else {
-                let t = v - 192;
-                (110 + t * 95 / 64, 170 + t * 50 / 64, 255)
+                let t = v - 232;
+                (110 + t * 75 / 23, 240 + t * 15 / 23, 255)
             };
+            self.saber_rgb[i] = (r as u8, g as u8, b as u8);
             let r5 = ((r as u16) * 31 / 255) & 0x1F;
             let g6 = ((g as u16) * 63 / 255) & 0x3F;
             let b5 = ((b as u16) * 31 / 255) & 0x1F;
@@ -923,6 +933,36 @@ impl Clock {
             512
         };
 
+        // Color crossfade: the whole ring FADES INTO the neon over the first
+        // 8 frames and melts back to the pure ring hue over the last 8, so
+        // the effect blooms in rather than snapping, and the closing frame
+        // is the resting ring LUT exactly.
+        const FL_FADE_F: u32 = 8;
+        let g_in = (((fr + 1) * 256) / FL_FADE_F).min(256) as i32;
+        let g_out = (((FL_TOTAL_F - 1 - fr) * 256) / FL_FADE_F).min(256) as i32;
+        let g = g_in.min(g_out);
+        let mut lut_local = [(0u8, 0u8); 256];
+        let lut: &[(u8, u8); 256] = if g >= 256 {
+            &self.flourish_lut
+        } else if g <= 0 {
+            &self.ring_lut
+        } else {
+            for (i, e) in lut_local.iter_mut().enumerate() {
+                let (sr, sg, sb) = self.saber_rgb[i];
+                let i = i as i32;
+                let (rr, rg, rb) = (200 * i / 255, 215 * i / 255, i);
+                let r = rr + (((sr as i32 - rr) * g) >> 8);
+                let gg = rg + (((sg as i32 - rg) * g) >> 8);
+                let b = rb + (((sb as i32 - rb) * g) >> 8);
+                let r5 = ((r as u16) * 31 / 255) & 0x1F;
+                let g6 = ((gg as u16) * 63 / 255) & 0x3F;
+                let b5 = ((b as u16) * 31 / 255) & 0x1F;
+                let px = (r5 << 11) | (g6 << 5) | b5;
+                *e = ((px >> 8) as u8, px as u8);
+            }
+            &lut_local
+        };
+
         let mut writes = 0usize;
         let mut pi = 0usize;
         for &(start, len) in &self.flourish_runs {
@@ -939,7 +979,7 @@ impl Clock {
                 };
                 let p = px_base + k;
                 let val = (self.ring_alpha[p] as i32).max((sab * f) >> 8) as usize;
-                let (hi, lo) = self.flourish_lut[val.min(255)];
+                let (hi, lo) = lut[val.min(255)];
                 let idx = p * 2;
                 if idx + 1 < fb.len() {
                     fb[idx] = hi;
