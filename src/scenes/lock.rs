@@ -1275,7 +1275,7 @@ fn ring_alpha_profile(d_q4: i32) -> u8 {
     }
 }
 
-fn get_glyph<'a>(glyphs: &'a [Option<Glyph>; 128], ch: char) -> Option<&'a Glyph> {
+pub fn get_glyph<'a>(glyphs: &'a [Option<Glyph>; 128], ch: char) -> Option<&'a Glyph> {
     let idx = ch as usize;
     if idx < 128 { glyphs[idx].as_ref() } else { None }
 }

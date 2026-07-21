@@ -23,7 +23,7 @@ use crate::display::qspi_bus::QspiBus;
 use crate::display::watch_fb::{RectAcc, WatchFb};
 use crate::drivers::{axp2101, cst9217};
 use crate::input::gestures::{GestureEvent, SwipeDir, SwipeTracker};
-use crate::scenes::{lock, unlocked};
+use crate::scenes::{lock, unlocked, wheel};
 use crate::time::{WallClock, WallTime};
 
 /// Fixed 20 fps cadence while the clock is static (idle frames cost ~0).
@@ -80,6 +80,8 @@ const ROW_BYTES: usize = LCD_WIDTH as usize * 2;
 enum Scene {
     Locked,
     Unlocked,
+    /// M6 W1: static App Wheel (PWR toggles from/to Unlocked).
+    Wheel,
 }
 
 /// M5 idle ladder. Wake (on any touch) is instant from every state.
@@ -150,8 +152,8 @@ impl<'a, 'd> App<'a, 'd> {
             self.wall.maybe_resync(&mut self.i2c);
             let now = self.wall.now();
 
-            // Auto-relock: sheet slides back down after a minute on the image.
-            if scene == Scene::Unlocked
+            // Auto-relock: sheet slides back down after a minute unlocked.
+            if scene != Scene::Locked
                 && unlocked_at.elapsed() >= Duration::from_secs(AUTO_RELOCK_SECS)
             {
                 println!("scene: auto-relock");
@@ -173,7 +175,7 @@ impl<'a, 'd> App<'a, 'd> {
             let idle = tp.last_activity.elapsed();
             let desired = if idle < Duration::from_secs(IDLE_DIM_SECS) {
                 Power::Awake
-            } else if idle < Duration::from_secs(AOD_SECS) || scene == Scene::Unlocked {
+            } else if idle < Duration::from_secs(AOD_SECS) || scene != Scene::Locked {
                 Power::Dim
             } else if idle < Duration::from_secs(SLEEP_SECS) {
                 Power::Aod
@@ -232,11 +234,26 @@ impl<'a, 'd> App<'a, 'd> {
                     if power != Power::Awake || brightness != 0xFF {
                         self.wake_display(&mut power, &mut brightness, &now);
                     }
-                    if scene == Scene::Locked {
-                        self.clock.start_flourish();
-                        println!("pwr: short press -> flourish");
-                    } else {
-                        println!("pwr: short press (scene=unlocked)");
+                    match scene {
+                        Scene::Locked => {
+                            self.clock.start_flourish();
+                            println!("pwr: short press -> flourish");
+                        }
+                        Scene::Unlocked => {
+                            let batt = axp2101::battery_percent(&mut self.i2c);
+                            wheel::draw(&mut self.wfb, &now, batt, 0);
+                            self.flush_dirty();
+                            scene = Scene::Wheel;
+                            unlocked_at = Instant::now();
+                            println!("pwr: short press -> wheel");
+                        }
+                        Scene::Wheel => {
+                            unlocked::draw(&mut self.wfb);
+                            self.flush_dirty();
+                            scene = Scene::Unlocked;
+                            unlocked_at = Instant::now();
+                            println!("pwr: short press -> unlocked");
+                        }
                     }
                 }
                 axp2101::PowerKey::LongPress => {
