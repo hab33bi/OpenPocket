@@ -50,8 +50,11 @@ const RING_LEVELS: i32 = 16;
 const Q: i32 = 16384;
 /// Auto-relock after this long in Unlocked.
 const AUTO_RELOCK_SECS: u64 = 60;
-/// Exponential settle: b += diff·3/8 per frame; snap when |diff| ≤ this.
-const SETTLE_SNAP_PX: i32 = 6;
+/// Exponential settle: b += diff/2 per frame; snap when |diff| ≤ this.
+/// (Was 3/8 with snap 6 — the ease-out tail crawled through near-black image
+/// regions where the boundary is invisible, reading as end-of-unlock
+/// stagger; 1/2 + snap 8 lands decisively.)
+const SETTLE_SNAP_PX: i32 = 8;
 /// Consecutive touch I2C errors before the controller is re-initialized.
 const TOUCH_REINIT_ERRORS: u32 = 5;
 
@@ -386,14 +389,25 @@ impl<'a, 'd> App<'a, 'd> {
         let mut target_b = map_target(start_dist);
         let mut last_compose = Instant::now();
         let mut composes: u32 = 0;
+        let mut max_step: i32 = 0;
+        // Median-of-3 on the raw travel: the CST9217's coordinates tremble
+        // when the finger sits at the panel edge (same regime as its bus
+        // stalls) — single-sample spikes and direction flapping showed as
+        // sheet stagger near the end of unlocks. The median kills both with
+        // ~one report (~10 ms) of lag; monotonic motion passes unharmed.
+        let mut d_hist = [start_dist; 3];
+        let mut d_idx = 0usize;
 
         let (dist, vel) = loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragMove { dist, .. } => {
-                    target_b = map_target(dist);
+                    d_hist[d_idx] = dist;
+                    d_idx = (d_idx + 1) % 3;
+                    target_b = map_target(median3(d_hist));
                 }
                 GestureEvent::DragEnd { dist, vel_q8, .. } => {
+                    // Lift uses the raw final travel (lift-report coords).
                     target_b = map_target(dist);
                     break (dist as i32, vel_q8);
                 }
@@ -413,6 +427,7 @@ impl<'a, 'd> App<'a, 'd> {
                 } else {
                     (*sheet_b as i32 + diff * 2 / 3) as u16
                 };
+                max_step = max_step.max((next as i32 - *sheet_b as i32).abs());
                 self.compose_sheet(*sheet_b, next, now, &mut text_bbox);
                 *sheet_b = next;
                 let compose_ms = t0.elapsed().as_millis() as u32;
@@ -442,7 +457,7 @@ impl<'a, 'd> App<'a, 'd> {
             (SwipeDir::Down, false) => (0, "stay-unlocked"),
         };
         println!(
-            "gesture: release dir={} dist={dist} vel_q8={vel} -> {verdict}",
+            "gesture: release dir={} dist={dist} vel_q8={vel} -> {verdict} (composes={composes} max_step={max_step})",
             dir_str(dir)
         );
         // Carry the drag text bbox into the settle (same composer).
@@ -472,7 +487,7 @@ impl<'a, 'd> App<'a, 'd> {
                 target as i32
             } else {
                 // Exponential ease-out; the ±1 floor guarantees progress.
-                let step = diff * 3 / 8;
+                let step = diff / 2;
                 *sheet_b as i32 + if step == 0 { diff.signum() } else { step }
             };
             self.compose_sheet(*sheet_b, next as u16, now, &mut text_bbox);
@@ -752,6 +767,12 @@ fn ring_level_idx(b: u16) -> i32 {
     let x = b as i32 - (H - RING_FADE_RANGE);
     let f = x.clamp(0, RING_FADE_RANGE);
     (f * RING_LEVELS + RING_FADE_RANGE / 2) / RING_FADE_RANGE
+}
+
+/// Median of three (branchless-ish): kills single-sample coordinate spikes.
+fn median3(v: [u16; 3]) -> u16 {
+    let (a, b, c) = (v[0], v[1], v[2]);
+    a.max(b).min(a.min(b).max(c))
 }
 
 fn dir_str(dir: SwipeDir) -> &'static str {
