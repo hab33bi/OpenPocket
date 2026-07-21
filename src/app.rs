@@ -132,6 +132,7 @@ impl<'a, 'd> App<'a, 'd> {
             // Cadence remainder = touch poll window; a DragStart hands control
             // to the drag session (render-on-touch-move).
             let mut start_drag: Option<(SwipeDir, u16)> = None;
+            let mut flick: Option<(SwipeDir, u16, i32)> = None;
             let deadline = frame_start + Duration::from_micros(FRAME_US);
             loop {
                 let now_ms = anim_start.elapsed().as_millis() as u32;
@@ -151,10 +152,27 @@ impl<'a, 'd> App<'a, 'd> {
                             start_drag = Some((dir, dist));
                         }
                     }
+                    // DragEnd without a preceding DragStart: the whole swipe
+                    // fit inside one poll gap (fast flick) — the recognizer
+                    // classified it from touch-down + lift-report coordinates.
+                    GestureEvent::DragEnd { dir, dist, vel_q8 } => {
+                        let wanted = matches!(
+                            (dir, scene),
+                            (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked)
+                        );
+                        println!(
+                            "gesture: flick dir={} dist={dist} vel_q8={vel_q8}{}",
+                            dir_str(dir),
+                            if wanted { "" } else { " (ignored)" }
+                        );
+                        if wanted {
+                            flick = Some((dir, dist, vel_q8));
+                        }
+                    }
                     GestureEvent::Tap { x, y } => println!("gesture: tap x={x} y={y}"),
                     _ => {}
                 }
-                if start_drag.is_some() || Instant::now() >= deadline {
+                if start_drag.is_some() || flick.is_some() || Instant::now() >= deadline {
                     break;
                 }
                 core::hint::spin_loop();
@@ -167,6 +185,19 @@ impl<'a, 'd> App<'a, 'd> {
                     unlocked_at = Instant::now();
                 }
                 continue;
+            }
+            if let Some((dir, dist, vel)) = flick {
+                if dist as i32 > COMPLETE_DIST || vel > COMPLETE_VEL_Q8 {
+                    let (target, bbox) = match dir {
+                        SwipeDir::Up => (0, self.clock.canvas_text_bbox()),
+                        SwipeDir::Down => (LCD_HEIGHT, (0, 0, -1, -1)),
+                    };
+                    scene = self.settle_from(&mut sheet_b, target, &now, bbox);
+                    if scene == Scene::Unlocked {
+                        unlocked_at = Instant::now();
+                    }
+                    continue;
+                }
             }
 
             let inst_fps = if work_ms > 0 { 1000.0 / work_ms as f32 } else { 0.0 };
@@ -278,7 +309,10 @@ impl<'a, 'd> App<'a, 'd> {
         now: &WallTime,
         mut text_bbox: (i32, i32, i32, i32),
     ) -> Scene {
+        let settle_start = Instant::now();
+        let mut settle_frames = 0u32;
         while *sheet_b != target {
+            settle_frames += 1;
             let frame_start = Instant::now();
             let diff = target as i32 - *sheet_b as i32;
             let next = if diff.abs() <= SETTLE_SNAP_PX {
@@ -306,14 +340,27 @@ impl<'a, 'd> App<'a, 'd> {
             // Fully locked: normalize the canvas (full ring + text at rest) and
             // resume the clock. A minute change during the drag re-animates.
             self.clock.repaint_full(&mut self.wfb);
+            // repaint_full leaves the canvas textless (the clock redraws its
+            // text next render via the invalidated cache) — flushing that
+            // as-is blanks the digits for one frame (visible blink at relock).
+            // Paint them now so the normalize flush is seamless.
+            self.clock.draw_sheet_text(self.wfb.buf_mut(), now, 0, H);
             self.flush_dirty();
-            println!("scene: -> Locked");
+            println!(
+                "scene: -> Locked (settle {} frames in {}ms)",
+                settle_frames,
+                settle_start.elapsed().as_millis()
+            );
             Scene::Locked
         } else {
             // Fully unlocked: normalize to the pristine image.
             unlocked::draw(&mut self.wfb);
             self.flush_dirty();
-            println!("scene: -> Unlocked");
+            println!(
+                "scene: -> Unlocked (settle {} frames in {}ms)",
+                settle_frames,
+                settle_start.elapsed().as_millis()
+            );
             Scene::Unlocked
         }
     }
@@ -453,9 +500,6 @@ impl<'a, 'd> App<'a, 'd> {
         }
         let flush_ms = flush_start.elapsed().as_millis() as u32;
         self.wfb.clear_damage();
-        if !partial {
-            println!("flush: full frame {flush_ms}ms");
-        }
         (flush_ms, if partial { 'P' } else { 'F' }, span_count)
     }
 

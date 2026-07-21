@@ -142,19 +142,7 @@ impl SwipeTracker {
                     let dx = t.x as i32 - tr.start_x as i32;
                     let dy_up = tr.start_y as i32 - t.y as i32;
                     if dx.abs().max(dy_up.abs()) > MOVE_SLOP_PX {
-                        let in_bottom = tr.start_y as u32
-                            >= self.height as u32 * (8 - ARM_ZONE_EIGHTHS) / 8;
-                        let in_top =
-                            (tr.start_y as u32) < self.height as u32 * ARM_ZONE_EIGHTHS / 8;
-                        // Direction-dominant (diagonals allowed: primary ≥ |dx|/2).
-                        let dir = if in_bottom && dy_up > 0 && dy_up * 2 >= dx.abs() {
-                            Some(SwipeDir::Up)
-                        } else if in_top && dy_up < 0 && -dy_up * 2 >= dx.abs() {
-                            Some(SwipeDir::Down)
-                        } else {
-                            None
-                        };
-                        if let Some(dir) = dir {
+                        if let Some(dir) = self.classify_dir(tr.start_y, dx, dy_up) {
                             self.phase = Phase::Dragging(tr, dir);
                             return GestureEvent::DragStart {
                                 dir,
@@ -169,8 +157,34 @@ impl SwipeTracker {
                     }
                     GestureEvent::None
                 }
-                Input::Lift => {
+                Input::Lift(lift) => {
                     self.phase = Phase::Idle;
+                    // Flick salvage: a fast swipe can fit entirely inside one
+                    // blocked compose/flush window, so the only samples seen
+                    // are the latched touch-down and this lift report. The
+                    // lift report carries the release coordinates — classify
+                    // the whole gesture from them instead of degrading to a
+                    // tap at the touch-down point.
+                    if let Some(t) = lift {
+                        let dx = t.x as i32 - tr.start_x as i32;
+                        let dy_up = tr.start_y as i32 - t.y as i32;
+                        if dx.abs().max(dy_up.abs()) > MOVE_SLOP_PX {
+                            if let Some(dir) = self.classify_dir(tr.start_y, dx, dy_up) {
+                                let dist = match dir {
+                                    SwipeDir::Up => tr.start_y.saturating_sub(t.y),
+                                    SwipeDir::Down => t.y.saturating_sub(tr.start_y),
+                                };
+                                let dt = now_ms.wrapping_sub(tr.start_ms).max(1) as i32;
+                                return GestureEvent::DragEnd {
+                                    dir,
+                                    dist,
+                                    vel_q8: ((dist as i32) << 8) / dt,
+                                };
+                            }
+                            // Moved past slop but not a swipe: not a tap either.
+                            return GestureEvent::None;
+                        }
+                    }
                     // Ghost filter: sub-40ms press/lift pairs aren't human.
                     if now_ms.wrapping_sub(tr.start_ms) < MIN_TAP_MS {
                         return GestureEvent::None;
@@ -201,8 +215,20 @@ impl SwipeTracker {
                         dist: dist_along(&tr, dir),
                     }
                 }
-                Input::Lift => {
+                Input::Lift(lift) => {
                     self.phase = Phase::Idle;
+                    // Fold the lift report's coordinates in as the final
+                    // movement sample — a fast swipe's last real travel often
+                    // arrives only in the lift report.
+                    if let Some(t) = lift {
+                        if t.x != tr.last_x || t.y != tr.last_y {
+                            tr.prev_y = tr.last_y;
+                            tr.prev_ms = tr.last_ms;
+                            tr.last_x = t.x;
+                            tr.last_y = t.y;
+                            tr.last_ms = now_ms;
+                        }
+                    }
                     let dt = tr.last_ms.wrapping_sub(tr.prev_ms).max(1) as i32;
                     let dpx = match dir {
                         SwipeDir::Up => tr.prev_y as i32 - tr.last_y as i32,
@@ -218,7 +244,7 @@ impl SwipeTracker {
             },
 
             Phase::Rejected(tr) => match self.classify_input(&tr, report, now_ms) {
-                Input::Lift => {
+                Input::Lift(_) => {
                     self.phase = Phase::Idle;
                     GestureEvent::None
                 }
@@ -238,16 +264,33 @@ impl SwipeTracker {
     fn classify_input(&self, tr: &Track, report: Option<TouchPoint>, now_ms: u32) -> Input {
         match report {
             Some(t) if t.pressed => Input::Move(t),
-            Some(_) => Input::Lift, // explicit lift-off report (evt != contact)
-            None if now_ms.wrapping_sub(tr.last_ms) > RELEASE_TIMEOUT_MS => Input::Lift,
+            // Explicit lift-off report (evt != contact) — carries the release
+            // coordinates.
+            Some(t) => Input::Lift(Some(t)),
+            None if now_ms.wrapping_sub(tr.last_ms) > RELEASE_TIMEOUT_MS => Input::Lift(None),
             None => Input::Nothing,
+        }
+    }
+
+    /// Zone + direction-dominance classification (diagonals allowed: primary
+    /// axis ≥ |dx|/2). Swipe-up arms from the bottom zone, swipe-down from the
+    /// top zone.
+    fn classify_dir(&self, start_y: u16, dx: i32, dy_up: i32) -> Option<SwipeDir> {
+        let in_bottom = start_y as u32 >= self.height as u32 * (8 - ARM_ZONE_EIGHTHS) / 8;
+        let in_top = (start_y as u32) < self.height as u32 * ARM_ZONE_EIGHTHS / 8;
+        if in_bottom && dy_up > 0 && dy_up * 2 >= dx.abs() {
+            Some(SwipeDir::Up)
+        } else if in_top && dy_up < 0 && -dy_up * 2 >= dx.abs() {
+            Some(SwipeDir::Down)
+        } else {
+            None
         }
     }
 }
 
 enum Input {
     Move(TouchPoint),
-    Lift,
+    Lift(Option<TouchPoint>),
     Nothing,
 }
 
