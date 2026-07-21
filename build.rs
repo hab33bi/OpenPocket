@@ -327,7 +327,8 @@ fn generate_inter_font() {
         // Stub so builds don't hard-fail before user places the font.
         body.push_str("pub const INTER_FONT_PRESENT: bool = false;\n");
         body.push_str("#[derive(Copy, Clone)]\npub struct Glyph { pub width: u8, pub height: u8, pub advance: u8, pub ymin: i16, pub data: &'static [u8] }\n");
-        body.push_str("pub static GLYPHS: [Option<Glyph>; 128] = [None; 128];\n");
+        body.push_str("pub static TIME_GLYPHS: [Option<Glyph>; 128] = [None; 128];\n");
+        body.push_str("pub static TEXT_GLYPHS: [Option<Glyph>; 128] = [None; 128];\n");
         let path = std::path::Path::new(&out_dir).join("inter_font.rs");
         std::fs::write(&path, body).expect("write stub inter_font.rs");
         println!("cargo:warning=assets/InterDisplay-Bold.ttf not found. Place your Inter Display Bold .ttf there. Using stub.");
@@ -354,44 +355,65 @@ fn generate_inter_font() {
     body.push_str(&format!(
         "/// Month names (shared with the build-time glyph subset).\npub static MONTH_NAMES: [&str; 12] = {MONTHS:?};\n"
     ));
+    // Glyphs carry fontdue's native 8-bit edge coverage quantized to 4-bit
+    // alpha (16 levels), rasterized at the FINAL rendered pixel size — the
+    // runtime blends directly, no scaling, no coverage reconstruction.
+    // data: row-major, 2 px/byte, high nibble = left pixel, stride (w+1)/2.
     body.push_str("#[derive(Copy, Clone)]\npub struct Glyph { pub width: u8, pub height: u8, pub advance: u8, pub ymin: i16, pub data: &'static [u8] }\n");
-    body.push_str("pub static GLYPHS: [Option<Glyph>; 128] = [\n");
 
+    // Time digits render at 78 px (was: 72 px raster halved then 3× nearest);
+    // 108 pt reproduces that final size exactly. Date text renders at half
+    // the old raster → 36 pt.
+    let time_chars: Vec<char> = "0123456789:".chars().collect();
+    emit_glyph_set(&mut body, &font, "TIME_GLYPHS", &time_chars, 108.0);
+    emit_glyph_set(&mut body, &font, "TEXT_GLYPHS", &needed, 36.0);
+
+    let path = std::path::Path::new(&out_dir).join("inter_font.rs");
+    std::fs::write(&path, body).expect("write inter_font.rs");
+    println!("cargo:rerun-if-changed=assets/InterDisplay-Bold.ttf");
+    println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Emit one `[Option<Glyph>; 128]` set rasterized at `px`, 4-bit alpha packed
+/// 2 px/byte (high nibble first).
+fn emit_glyph_set(body: &mut String, font: &fontdue::Font, name: &str, chars: &[char], px: f32) {
+    body.push_str(&format!("pub static {name}: [Option<Glyph>; 128] = [\n"));
     for c in 0u8..128 {
         let ch = c as char;
-        if needed.contains(&ch) {
-            let (metrics, bitmap) = font.rasterize(ch, 72.0); // 2x raster for "scale to gray" AA (see quote in clock.rs)
-            let w = metrics.width as u8;
-            let h = metrics.height as u8;
-            let adv = metrics.advance_width.round() as u8;
-            let ymin = metrics.ymin as i16;  // from font metrics - negative for descenders like 'y' to position lower relative to baseline
+        if chars.contains(&ch) {
+            let (metrics, bitmap) = font.rasterize(ch, px);
+            let w = metrics.width;
+            let h = metrics.height;
+            let adv = metrics.advance_width.round() as i32;
+            assert!(
+                w < 256 && h < 256 && (0..256).contains(&adv),
+                "glyph '{ch}' at {px}px exceeds u8 metrics (w={w} h={h} adv={adv})"
+            );
+            let ymin = metrics.ymin as i16;
 
-            if std::env::var("FONT_DEBUG").is_ok()
-                && (ch.is_alphabetic() || ch == ':' || ch.is_digit(10))
-            {
-                println!(
-                    "cargo:warning=FONT_METRICS {}: xmin={} ymin={} w={} h={} adv={}",
-                    ch, metrics.xmin, metrics.ymin, metrics.width, metrics.height, metrics.advance_width
-                );
-            }
-
-            // Pack to 1bpp, row-major, bits MSB first in each byte
-            let mut packed: Vec<u8> = vec![0; ((w as usize + 7) / 8) * h as usize];
-            for y in 0..h as usize {
-                for x in 0..w as usize {
-                    let val = bitmap[y * w as usize + x];
-                    if val > 127 {
-                        let byte_idx = y * ((w as usize + 7) / 8) + (x / 8);
-                        let bit = 7 - (x % 8);
-                        packed[byte_idx] |= 1 << bit;
+            let stride = (w + 1) / 2;
+            let mut packed: Vec<u8> = vec![0; stride * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let a4 = ((bitmap[y * w + x] as u32 * 15 + 127) / 255) as u8;
+                    let idx = y * stride + x / 2;
+                    if x % 2 == 0 {
+                        packed[idx] |= a4 << 4;
+                    } else {
+                        packed[idx] |= a4;
                     }
                 }
             }
 
-            body.push_str(&format!("    Some(Glyph {{ width: {}, height: {}, advance: {}, ymin: {}, data: &[", w, h, adv, ymin));
+            body.push_str(&format!(
+                "    Some(Glyph {{ width: {}, height: {}, advance: {}, ymin: {}, data: &[",
+                w, h, adv, ymin
+            ));
             for (i, b) in packed.iter().enumerate() {
-                if i > 0 { body.push(','); }
-                body.push_str(&format!("{}", b));
+                if i > 0 {
+                    body.push(',');
+                }
+                body.push_str(&format!("{b}"));
             }
             body.push_str("] }),\n");
         } else {
@@ -399,9 +421,4 @@ fn generate_inter_font() {
         }
     }
     body.push_str("];\n");
-
-    let path = std::path::Path::new(&out_dir).join("inter_font.rs");
-    std::fs::write(&path, body).expect("write inter_font.rs");
-    println!("cargo:rerun-if-changed=assets/InterDisplay-Bold.ttf");
-    println!("cargo:rerun-if-changed=build.rs");
 }

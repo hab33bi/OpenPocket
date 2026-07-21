@@ -555,34 +555,30 @@ impl Clock {
         let mut x1 = 0i32;
         let mut y1 = 0i32;
 
-        let mut absorb = |text: &str, base_y: i32, scale: i32| {
+        let mut absorb = |text: &str, base_y: i32, glyphs: &[Option<Glyph>; 128]| {
             let mut total_w: i32 = 0;
             for ch in text.chars() {
-                if let Some(g) = get_glyph(ch) {
-                    total_w += ((g.advance as i32 + 1) / 2) * scale;
+                if let Some(g) = get_glyph(glyphs, ch) {
+                    total_w += g.advance as i32;
                 }
             }
             let start_x = CX - total_w / 2;
             let mut x = start_x;
             for ch in text.chars() {
-                if let Some(g) = get_glyph(ch) {
-                    let unit_h = (g.height as i32 + 1) / 2;
-                    let unit_ymin = g.ymin as i32 / 2;
-                    let draw_h = unit_h * scale;
-                    let draw_ymin = unit_ymin * scale;
-                    let glyph_y = base_y - (draw_h + draw_ymin);
-                    let draw_w = ((g.width as i32 + 1) / 2) * scale;
+                if let Some(g) = get_glyph(glyphs, ch) {
+                    let draw_h = g.height as i32;
+                    let glyph_y = base_y - (draw_h + g.ymin as i32);
                     x0 = x0.min(x - 2);
                     y0 = y0.min(glyph_y - 2);
-                    x1 = x1.max(x + draw_w + 2);
+                    x1 = x1.max(x + g.width as i32 + 2);
                     y1 = y1.max(glyph_y + draw_h + 2);
-                    x += ((g.advance as i32 + 1) / 2) * scale;
+                    x += g.advance as i32;
                 }
             }
         };
 
-        absorb("00:00", CY + 5 + y_shift, 3);
-        absorb(self.date_str(), CY + 70 + y_shift, 1);
+        absorb("00:00", CY + 5 + y_shift, &TIME_GLYPHS);
+        absorb(self.date_str(), CY + 70 + y_shift, &TEXT_GLYPHS);
 
         if x0 > x1 {
             return (0, 0, W - 1, H - 1);
@@ -618,10 +614,10 @@ impl Clock {
             core::str::from_utf8(&s).unwrap(),
             CY + 5 + y_shift,
             Q,
-            3,
+            &TIME_GLYPHS,
             clip_y,
         );
-        self.draw_text_centered_clipped(fb, self.date_str(), CY + 70 + y_shift, Q, 1, clip_y);
+        self.draw_text_centered_clipped(fb, self.date_str(), CY + 70 + y_shift, Q, &TEXT_GLYPHS, clip_y);
         let (x0, y0, x1, y1) = self.text_bbox_at(y_shift);
         (x0, y0, x1, y1.min(clip_y - 1))
     }
@@ -678,15 +674,22 @@ impl Clock {
         s[2] = b':';
         s[3] = b'0' + (m / 10);
         s[4] = b'0' + (m % 10);
-        self.draw_text_centered(fb, core::str::from_utf8(&s).unwrap(), CY + 5, fade_q14, 3);
+        self.draw_text_centered(fb, core::str::from_utf8(&s).unwrap(), CY + 5, fade_q14, &TIME_GLYPHS);
     }
 
     fn draw_date(&self, fb: &mut [u8], fade_q14: i32) {
-        self.draw_text_centered(fb, self.date_str(), CY + 70, fade_q14, 1);
+        self.draw_text_centered(fb, self.date_str(), CY + 70, fade_q14, &TEXT_GLYPHS);
     }
 
-    fn draw_text_centered(&self, fb: &mut [u8], text: &str, base_y: i32, fade_q14: i32, scale: i32) {
-        self.draw_text_centered_clipped(fb, text, base_y, fade_q14, scale, H);
+    fn draw_text_centered(
+        &self,
+        fb: &mut [u8],
+        text: &str,
+        base_y: i32,
+        fade_q14: i32,
+        glyphs: &[Option<Glyph>; 128],
+    ) {
+        self.draw_text_centered_clipped(fb, text, base_y, fade_q14, glyphs, H);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -696,76 +699,62 @@ impl Clock {
         text: &str,
         base_y: i32,
         fade_q14: i32,
-        scale: i32,
+        glyphs: &[Option<Glyph>; 128],
         clip_y: i32,
     ) {
         let mut total_w: i32 = 0;
         for ch in text.chars() {
-            if let Some(g) = get_glyph(ch) {
-                let unit_adv = (g.advance as i32 + 1) / 2;
-                total_w += unit_adv * scale;
+            if let Some(g) = get_glyph(glyphs, ch) {
+                total_w += g.advance as i32;
             }
         }
         let start_x = CX - total_w / 2;
 
         let mut x = start_x;
         for ch in text.chars() {
-            if let Some(g) = get_glyph(ch) {
-                let unit_h = (g.height as i32 + 1) / 2;
-                let unit_ymin = g.ymin as i32 / 2;
-                let draw_h = unit_h * scale;
-                let draw_ymin = unit_ymin * scale;
-                let glyph_y = base_y - (draw_h + draw_ymin);
-                self.draw_glyph(fb, x, glyph_y, g, fade_q14, scale, clip_y);
-                let unit_adv = (g.advance as i32 + 1) / 2;
-                x += unit_adv * scale;
+            if let Some(g) = get_glyph(glyphs, ch) {
+                let glyph_y = base_y - (g.height as i32 + g.ymin as i32);
+                self.draw_glyph(fb, x, glyph_y, g, fade_q14, clip_y);
+                x += g.advance as i32;
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_glyph(
-        &self,
-        fb: &mut [u8],
-        ox: i32,
-        oy: i32,
-        g: &Glyph,
-        fade_q14: i32,
-        scale: i32,
-        clip_y: i32,
-    ) {
+    /// Blend one 4-bit-alpha atlas glyph at its native size (16 levels of
+    /// fontdue's true edge coverage — no runtime scaling or reconstruction).
+    fn draw_glyph(&self, fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, fade_q14: i32, clip_y: i32) {
         let color_r = 240u8;
         let color_g = 240u8;
         let color_b = 245u8;
 
-        let src_w = g.width as i32;
-        let src_h = g.height as i32;
-        let out_w = ((src_w + 1) / 2) * scale;
-        let out_h = ((src_h + 1) / 2) * scale;
+        let w = g.width as i32;
+        let h = g.height as i32;
+        let stride = (g.width as usize + 1) / 2;
 
-        for oy_local in 0..out_h {
-            // Clip before sampling: offscreen/clipped glyph rows (common while
+        for gy in 0..h {
+            // Clip before decoding: offscreen/clipped glyph rows (common while
             // the sheet text slides past the panel edge) must cost nothing.
-            let y = oy + oy_local;
+            let y = oy + gy;
             if y < 0 || y >= H || y >= clip_y {
                 continue;
             }
-            for ox_local in 0..out_w {
-                let x = ox + ox_local;
+            let row = &g.data[gy as usize * stride..(gy as usize + 1) * stride];
+            for gx in 0..w {
+                let x = ox + gx;
                 if x < 0 || x >= W {
                     continue;
                 }
-                let count = sample_glyph_coverage(g, ox_local, oy_local, scale);
-                if count == 0 {
+                let byte = row[gx as usize / 2];
+                let a4 = if gx % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+                if a4 == 0 {
                     continue;
                 }
-                let alpha = (count * 255) / 4;
+                let alpha = (a4 as i64) * 17; // 0..255
 
                 let base = fade_q14 as i64;
-                let a64 = alpha as i64;
-                let r = ((color_r as i64 * base * a64) >> (14 + 8)) as u8;
-                let gg = ((color_g as i64 * base * a64) >> (14 + 8)) as u8;
-                let b = ((color_b as i64 * base * a64) >> (14 + 8)) as u8;
+                let r = ((color_r as i64 * base * alpha) >> (14 + 8)) as u8;
+                let gg = ((color_g as i64 * base * alpha) >> (14 + 8)) as u8;
+                let b = ((color_b as i64 * base * alpha) >> (14 + 8)) as u8;
 
                 let r5 = (r as u16 * 31 / 255) & 0x1F;
                 let g6 = (gg as u16 * 63 / 255) & 0x3F;
@@ -883,43 +872,7 @@ fn black_bezel_3x3(fb: &mut [u8], byte_off: u32, acc: &mut RectAcc) -> usize {
     write_bezel_3x3(fb, byte_off, 0, 0, acc)
 }
 
-#[inline]
-fn get_glyph_bit(g: &Glyph, x: i32, y: i32) -> bool {
-    if x < 0 || y < 0 || x >= g.width as i32 || y >= g.height as i32 {
-        return false;
-    }
-    let stride = (g.width as usize + 7) / 8;
-    let ux = x as usize;
-    let byte_idx = (y as usize) * stride + (ux / 8);
-    let bit = 7 - (ux % 8);
-    (g.data[byte_idx] & (1 << bit)) != 0
-}
-
-#[inline]
-fn sample_glyph_coverage(g: &Glyph, ox_local: i32, oy_local: i32, scale: i32) -> i32 {
-    let q = 256i64;
-    let base_x = (ox_local as i64 * 2 * q) / (scale as i64);
-    let base_y = (oy_local as i64 * 2 * q) / (scale as i64);
-
-    let mut count = 0i32;
-    let offs = [0i64, q / 2];
-    for &dy in &offs {
-        for &dx in &offs {
-            let sx = ((base_x + dx) / q) as i32;
-            let sy = ((base_y + dy) / q) as i32;
-            if get_glyph_bit(g, sx, sy) {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-fn get_glyph(ch: char) -> Option<&'static Glyph> {
+fn get_glyph<'a>(glyphs: &'a [Option<Glyph>; 128], ch: char) -> Option<&'a Glyph> {
     let idx = ch as usize;
-    if idx < 128 {
-        GLYPHS[idx].as_ref()
-    } else {
-        None
-    }
+    if idx < 128 { glyphs[idx].as_ref() } else { None }
 }
