@@ -66,16 +66,28 @@ const CAP_STEPS: i32 = FADE_STEPS;
 /// 10 frames = 250 ms at the 40 fps anim cadence — a swift, decisive merge.
 const HEAL_FRAMES: u32 = 10;
 
-/// Lightsaber flourish (PWR press while locked): ignition sweep → flare
-/// pulses → retraction, ~1.5 s at the anim cadence. Real, visible glow —
-/// peak intensities 60-100% over a wide band (the earlier always-on ring
-/// glow at ≤27% vanished into the AMOLED black floor; a transient effect can
-/// afford to burn bright).
-const FLOURISH_BAND_PX: i32 = 14; // radial half-width of the effect band
-const FL_SWEEP_F: u32 = 18;
-const FL_FLARE_F: u32 = 12;
+/// Lightsaber flourish v2 (PWR press while locked): blade ignition sweep →
+/// whole-ring inner-glow BLOOM → shimmering hold → retraction. The glow
+/// lives INSIDE the ring (only ~10 px exist outside before the panel edge):
+/// a three-layer quadratic falloff reaching 40 px toward the center, Bayer-
+/// dithered so the gradient reads as smooth blur instead of RGB565 banding,
+/// at intensities well above the AMOLED black-crush floor.
+const FL_IN_PX: i32 = 44; // inner band: 40 px design reach + falloff tail
+const FL_OUT_PX: i32 = 10; // outer band: to the physical panel edge
+const FL_SWEEP_F: u32 = 14;
+const FL_BLOOM_F: u32 = 9;
+const FL_SHIMMER_F: u32 = 18;
 const FL_RETRACT_F: u32 = 14;
-const FL_TOTAL_F: u32 = FL_SWEEP_F + FL_FLARE_F + FL_RETRACT_F;
+const FL_TOTAL_F: u32 = FL_SWEEP_F + FL_BLOOM_F + FL_SHIMMER_F + FL_RETRACT_F;
+
+/// Bayer 4×4 ordered-dither offsets (≈ ±half an RGB565 blue step) — breaks
+/// the 32-level blue quantization into invisible noise across the glow.
+const BAYER4: [[i32; 4]; 4] = [
+    [-7, 1, -5, 3],
+    [5, -3, 7, -1],
+    [-4, 4, -6, 2],
+    [8, 0, 6, -2],
+];
 
 /// Bezel animation phase, advanced by frame index against the build-time schedules.
 /// A sweep phase exits only when its schedule is consumed AND the ring reached the
@@ -265,14 +277,15 @@ impl Clock {
             self.ring_lut[i] = bezel_color_bytes(Q * i as i32 / 255);
         }
 
-        // Lightsaber flourish band: per-pixel radial distance + angle over a
-        // ±FLOURISH_BAND_PX annulus, as row-major runs (sequential writes).
-        let r_out = BEZEL_R + FLOURISH_BAND_PX;
-        let r_in = BEZEL_R - FLOURISH_BAND_PX;
+        // Lightsaber flourish band: per-pixel SIGNED radial distance (Q1
+        // half-px, biased +128; negative = inside the ring) + angle, over an
+        // asymmetric annulus [R−FL_IN_PX, R+FL_OUT_PX], as row-major runs.
+        let r_out = BEZEL_R + FL_OUT_PX;
+        let r_in = BEZEL_R - FL_IN_PX;
         let (r_out2, r_in2) = (r_out * r_out, r_in * r_in);
-        let mut fruns: Vec<(u32, u16)> = Vec::with_capacity(2_048);
-        let mut fd: Vec<u8> = Vec::with_capacity(44_000);
-        let mut fang: Vec<u8> = Vec::with_capacity(44_000);
+        let mut fruns: Vec<(u32, u16)> = Vec::with_capacity(4_096);
+        let mut fd: Vec<u8> = Vec::with_capacity(72_000);
+        let mut fang: Vec<u8> = Vec::with_capacity(72_000);
         for py in 0..H {
             let dy = py - CY;
             for px in 0..W {
@@ -282,7 +295,7 @@ impl Clock {
                     continue;
                 }
                 let r_q4 = isqrt((r2 as u32) * 256) as i32;
-                let d_q3 = (((r_q4 - BEZEL_R * 16).abs() / 2).min(127)) as u8;
+                let d_biased = ((r_q4 - BEZEL_R * 16) / 8 + 128).clamp(0, 255) as u8;
                 let off = ((py * W + px) * 2) as u32;
                 match fruns.last_mut() {
                     Some((st, len)) if *st + (*len as u32) * 2 == off && *len < u16::MAX => {
@@ -290,7 +303,7 @@ impl Clock {
                     }
                     _ => fruns.push((off, 1)),
                 }
-                fd.push(d_q3);
+                fd.push(d_biased);
                 // Rotate so the ignition starts at 12 o'clock.
                 fang.push(angle256(dx, dy).wrapping_sub(192));
             }
@@ -299,22 +312,22 @@ impl Clock {
         self.flourish_d = fd;
         self.flourish_ang = fang;
 
-        // Neon saber gradient: black → electric blue → neon azure → electric
-        // cyan → white-hot. Deliberately hotter/more saturated than the ring;
-        // the crossfade in step_flourish handles color continuity.
+        // Electric-azure saber gradient (user-chosen): black → deep indigo
+        // veil → azure glow → neon azure blade → white-hot core. The
+        // crossfade in step_flourish handles continuity with the ring hue.
         for i in 0..256usize {
             let v = i as i32;
-            let (r, g, b) = if v < 64 {
-                (0, v * 60 / 64, v * 255 / 64)
-            } else if v < 176 {
-                let t = v - 64;
-                (0, 60 + t * 110 / 112, 255)
-            } else if v < 232 {
-                let t = v - 176;
-                (t * 110 / 56, 170 + t * 70 / 56, 255)
+            let (r, g, b) = if v < 72 {
+                (v * 10 / 72, v * 40 / 72, v * 140 / 72)
+            } else if v < 160 {
+                let t = v - 72;
+                (10 - t * 10 / 88, 40 + t * 70 / 88, 140 + t * 90 / 88)
+            } else if v < 216 {
+                let t = v - 160;
+                (0, 110 + t * 60 / 56, 230 + t * 25 / 56)
             } else {
-                let t = v - 232;
-                (110 + t * 75 / 23, 240 + t * 15 / 23, 255)
+                let t = v - 216;
+                (t * 190 / 39, 170 + t * 85 / 39, 255)
             };
             self.saber_rgb[i] = (r as u8, g as u8, b as u8);
             let r5 = ((r as u16) * 31 / 255) & 0x1F;
@@ -886,42 +899,60 @@ impl Clock {
         }
     }
 
-    /// One flourish frame: ignition sweep → flare pulses → retraction.
-    /// Per pixel: val = max(resting ring alpha, angular-mask × radial glow),
-    /// through the saber gradient LUT — so unswept regions show the (blue-
-    /// energized) resting ring and the final retract frame IS the resting
-    /// ring, pixel-identical.
+    /// One flourish frame: blade ignition sweep → whole-ring glow BLOOM →
+    /// shimmering hold → retraction. Per pixel:
+    /// val = max(resting ring alpha, angular-mask × radial profile), dithered,
+    /// through the (crossfaded) saber LUT. The final retract frame uses the
+    /// resting ring LUT with zero glow and no dither — pixel-exact handback.
     fn step_flourish(&mut self, fb: &mut [u8], acc: &mut RectAcc) -> usize {
         let fr = self.flourish_frame;
 
-        // Per-frame radial glow profile (peak 0..=255, width in Q3 px past
-        // the stroke core at d≈34).
-        let (peak, width_q3): (i32, i32) = if fr < FL_SWEEP_F {
-            (200, 52) // ignition: bright 6.5 px corona
-        } else if fr < FL_SWEEP_F + FL_FLARE_F {
-            // Two breathing pulses.
-            const P: [i32; 12] = [210, 235, 255, 245, 220, 195, 205, 225, 210, 190, 175, 160];
-            const W: [i32; 12] = [52, 60, 70, 66, 58, 50, 54, 60, 54, 48, 44, 40];
-            let i = (fr - FL_SWEEP_F) as usize;
-            (P[i], W[i])
+        // Phase → (bloom 0..=256 = inner-glow strength, shimmer = saber-hum
+        // intensity wobble applied to the glow only).
+        let (bloom, shimmer): (i32, i32) = if fr < FL_SWEEP_F {
+            (0, 0) // blade only; the glow arrives as one beat at close
+        } else if fr < FL_SWEEP_F + FL_BLOOM_F {
+            // Whole-ring rise: ease-out surge to full.
+            let i = (fr - FL_SWEEP_F) as i32;
+            let n = FL_BLOOM_F as i32 - 1;
+            let rem = n - i;
+            (256 - (256 * rem * rem) / (n * n).max(1), 0)
+        } else if fr < FL_SWEEP_F + FL_BLOOM_F + FL_SHIMMER_F {
+            // Shimmer hold: full glow with a ±~7% deterministic hum.
+            const HUM: [i32; 18] = [
+                0, 8, -6, 14, -10, 4, -14, 10, -4, 12, -8, 16, -12, 2, -16, 6, -2, 0,
+            ];
+            (256, HUM[(fr - FL_SWEEP_F - FL_BLOOM_F) as usize])
         } else {
             // Quadratic collapse to exactly zero on the last frame.
-            let i = (fr - FL_SWEEP_F - FL_FLARE_F) as i32;
+            let i = (fr - FL_SWEEP_F - FL_BLOOM_F - FL_SHIMMER_F) as i32;
             let n = FL_RETRACT_F as i32 - 1;
-            let q = ((n - i) * (n - i) * 256) / (n * n).max(1);
-            ((160 * q) >> 8, (44 * q) >> 8)
+            let rem = n - i;
+            ((256 * rem * rem) / (n * n).max(1), 0)
         };
-        let mut radial = [0u8; 128];
-        for (d, r) in radial.iter_mut().enumerate() {
-            let d = d as i32;
-            *r = if d <= 34 {
-                255
-            } else if width_q3 > 0 && d - 34 < width_q3 {
-                let t = width_q3 - (d - 34);
-                ((peak * t * t) / (width_q3 * width_q3)).min(255) as u8
+
+        // Radial profile LUT indexed by biased Q1 distance (128 = centerline,
+        // < 128 = inside). Blade: white-hot centerline melting to hot edges.
+        // Outer: a thin bright rim to the panel edge. Inner: three layered
+        // quadratic falloffs (tight bright / soft mid / wide veil) — summed,
+        // capped below blade brightness, scaled by bloom and shimmer.
+        let mut prof = [0u8; 256];
+        for (idx, e) in prof.iter_mut().enumerate() {
+            let dh = idx as i32 - 128;
+            let v: i32 = if (-11..=11).contains(&dh) {
+                255 - (dh * dh) / 3
+            } else if dh > 11 {
+                let x = dh - 11;
+                if x <= 4 { 205 - x * 8 } else { (173 - (x - 4) * 24).max(0) }
             } else {
-                0
+                let x = -dh - 11;
+                let layer = |a: i32, reach: i32| -> i32 {
+                    if x >= reach { 0 } else { a * (reach - x) * (reach - x) / (reach * reach) }
+                };
+                let g = (layer(150, 20) + layer(95, 48) + layer(50, 80)).min(220);
+                (((g * bloom) >> 8) * (256 + shimmer)) >> 8
             };
+            *e = v.clamp(0, 255) as u8;
         }
 
         // Ignition front (0..=256 around the ring), quadratic ease-out:
@@ -963,6 +994,11 @@ impl Clock {
             &lut_local
         };
 
+        // Dither only while the saber look is active (g > 0) — the closing
+        // frame must write exact ring-LUT values, and dither noise must never
+        // persist on the resting canvas.
+        let do_dither = g > 0;
+
         let mut writes = 0usize;
         let mut pi = 0usize;
         for &(start, len) in &self.flourish_runs {
@@ -970,16 +1006,20 @@ impl Clock {
             let n = len as usize;
             let px_base = s / 2;
             for k in 0..n {
-                let d = self.flourish_d[pi + k] as usize;
-                let sab = radial[d & 127] as i32;
+                let sab = prof[self.flourish_d[pi + k] as usize] as i32;
                 let f = if front >= 512 {
                     256
                 } else {
                     ((front - self.flourish_ang[pi + k] as i32) * 13).clamp(0, 256)
                 };
                 let p = px_base + k;
-                let val = (self.ring_alpha[p] as i32).max((sab * f) >> 8) as usize;
-                let (hi, lo) = lut[val.min(255)];
+                let mut val = (self.ring_alpha[p] as i32).max((sab * f) >> 8);
+                if do_dither && val > 0 && val < 232 {
+                    let x = p % W as usize;
+                    let y = p / W as usize;
+                    val = (val + BAYER4[y & 3][x & 3]).clamp(0, 255);
+                }
+                let (hi, lo) = lut[val as usize];
                 let idx = p * 2;
                 if idx + 1 < fb.len() {
                     fb[idx] = hi;
@@ -989,8 +1029,8 @@ impl Clock {
             pi += n;
             writes += n;
         }
-        acc.add(CX - BEZEL_R - FLOURISH_BAND_PX - 1, CY - BEZEL_R - FLOURISH_BAND_PX - 1);
-        acc.add(CX + BEZEL_R + FLOURISH_BAND_PX + 1, CY + BEZEL_R + FLOURISH_BAND_PX + 1);
+        acc.add(CX - BEZEL_R - FL_OUT_PX - 1, CY - BEZEL_R - FL_OUT_PX - 1);
+        acc.add(CX + BEZEL_R + FL_OUT_PX + 1, CY + BEZEL_R + FL_OUT_PX + 1);
 
         self.flourish_frame += 1;
         if self.flourish_frame >= FL_TOTAL_F {
