@@ -337,14 +337,10 @@ impl<'a, 'd> App<'a, 'd> {
         }
 
         if target == LCD_HEIGHT {
-            // Fully locked: normalize the canvas (full ring + text at rest) and
-            // resume the clock. A minute change during the drag re-animates.
-            self.clock.repaint_full(&mut self.wfb);
-            // repaint_full leaves the canvas textless (the clock redraws its
-            // text next render via the invalidated cache) — flushing that
-            // as-is blanks the digits for one frame (visible blink at relock).
-            // Paint them now so the normalize flush is seamless.
-            self.clock.draw_sheet_text(self.wfb.buf_mut(), now, 0, H);
+            // Fully locked: normalize the canvas (full ring + text at rest,
+            // cache-registered) and resume the clock. A minute change during
+            // the drag re-animates on the next render.
+            self.clock.repaint_full(&mut self.wfb, now);
             self.flush_dirty();
             println!(
                 "scene: -> Locked (settle {} frames in {}ms)",

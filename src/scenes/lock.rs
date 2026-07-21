@@ -319,20 +319,26 @@ impl Clock {
     }
 
     /// Repaint the whole lock scene from scratch (returning from another scene
-    /// that overwrote the canvas). Ring lands complete + static; text redraws
-    /// on the next `render` call (cache invalidated). Marks the frame dirty.
-    pub fn repaint_full(&mut self, wfb: &mut WatchFb) {
+    /// that overwrote the canvas). Ring lands complete + static; text is
+    /// painted at rest AND registered in the retained-text cache — leaving the
+    /// cache invalid while text sits on the canvas makes the next changed
+    /// render draw new digits over these without erasing (visible overlap
+    /// when the minute rolls during a drag). Marks the frame dirty.
+    pub fn repaint_full(&mut self, wfb: &mut WatchFb, now: &WallTime) {
         self.phase = BezelPhase::Static;
         self.frame_in_phase = 0;
         self.drawn_centers = self.bezel_offsets_anim.len();
-        self.last_text = (255, 255, -1, 0, 0, 0);
-        self.last_text_bbox = (0, 0, -1, -1);
 
+        self.format_date(now);
         let fb = wfb.buf_mut();
         fb.fill(0);
         let (hi, lo) = bezel_color_bytes(Q);
         let mut acc = RectAcc::empty();
         self.blit_full_ring(fb, hi, lo, &mut acc);
+        self.draw_time_centered(fb, now.hour, now.minute, Q);
+        self.draw_date(fb, Q);
+        self.last_text = (now.hour, now.minute, Q, now.year, now.month, now.day);
+        self.last_text_bbox = self.text_bbox();
         wfb.mark_rect(0, 0, W - 1, H - 1);
     }
 

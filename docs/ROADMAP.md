@@ -97,6 +97,32 @@ was a 24 ms full flush because the ring pass repainted from row 0. Fixes:
 - Glyph renderer clips rows before coverage sampling (sliding offscreen
   text was paying full rasterization cost).
 
+## Drag smoothness backlog (ideas, not scheduled — M4 feel is accepted)
+
+Current state: composes ~1–10 ms (ring recolor via runs), partial flushes for
+most drag frames, touch read every ~10 ms while the finger is down. Ideas in
+rough order of expected payoff if we revisit:
+
+1. **Compose cap 16 ms → ~10 ms** (`COMPOSE_MIN_US`): composes are cheap now;
+   a 60→100 Hz render-on-move cap tightens finger tracking. One-line change,
+   measure first that fade-zone frames stay under the cap.
+2. **Target smoothing**: a small critically-damped filter on `target_b`
+   (e.g. `b += (target − b) · k` per compose with k ≈ 0.5–0.7) absorbs touch
+   sample jitter without adding perceptible lag — the "glued to the finger
+   but never trembling" premium feel.
+3. **Ring damage as per-run row spans**: the fade recolor currently marks the
+   annulus bounding rect (~60% of the screen → full flush on level-step
+   frames). Marking each run's row span instead keeps level-step frames
+   partial — fewer full-frame writes racing the panel scan.
+4. **More fade levels** (16 → 32): recolor is ~1 ms now; finer quantization =
+   visibly smoother scrub fade for the cost of more (cheap) level frames.
+5. **Velocity-carried settle**: seed the settle animation with the release
+   velocity (start fast, decay) instead of a fixed 3/8 exponential — the
+   sheet keeps the finger's momentum through the handoff.
+6. **Pipeline overlap** (parked in "Later"): compose on core 0 while core 1
+   flushes the previous frame — halves effective frame time if scenes ever
+   outgrow the budget.
+
 ## Polish backlog (near-term, after M4)
 
 - **Font anti-aliasing upgrade**: current text uses 1-bpp glyphs + 2×2 box sampling
