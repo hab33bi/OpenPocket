@@ -26,9 +26,12 @@ use crate::input::gestures::{GestureEvent, SwipeDir, SwipeTracker};
 use crate::scenes::{lock, unlocked};
 use crate::time::{WallClock, WallTime};
 
-/// Fixed 20 fps cadence — matches TARGET_FPS in build.rs so the frame-indexed
-/// ease schedules take exactly their designed wall-clock duration.
+/// Fixed 20 fps cadence while the clock is static (idle frames cost ~0).
 const FRAME_US: u64 = 50_000;
+/// Bezel-animation cadence — matches TARGET_FPS (40) in build.rs so the
+/// frame-indexed ease schedules take exactly their designed duration, at
+/// double the temporal resolution of the old 20 fps sweep.
+const CLOCK_ANIM_FRAME_US: u64 = 25_000;
 /// Settle-animation cadence (25 fps; frames are cheap during the transition).
 const ANIM_FRAME_US: u64 = 40_000;
 /// Minimum gap between drag composes (≈60 Hz render-on-touch-move cap).
@@ -160,7 +163,12 @@ impl<'a, 'd> App<'a, 'd> {
             // to the drag session (render-on-touch-move).
             let mut start_drag: Option<(SwipeDir, u16)> = None;
             let mut flick: Option<(SwipeDir, u16, i32)> = None;
-            let deadline = frame_start + Duration::from_micros(FRAME_US);
+            let frame_us = if scene == Scene::Locked && self.clock.is_animating() {
+                CLOCK_ANIM_FRAME_US
+            } else {
+                FRAME_US
+            };
+            let deadline = frame_start + Duration::from_micros(frame_us);
             loop {
                 let now_ms = anim_start.elapsed().as_millis() as u32;
                 let ev = self.poll_touch_once(&mut tp, now_ms);

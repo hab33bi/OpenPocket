@@ -62,13 +62,19 @@ A pocket watch. **Lock screen** = the existing clock (time, date, animated bezel
 
 ## Arc rendering v2 (2026-07-21, user-directed — supersedes "arc frozen")
 
-Per-pixel radial alpha map: solid core → ~1.75 px antialiased stroke edge →
-soft quadratic glow tail (to ±9.5 px, peak ~27%). All ring paths (sweep
-stamps, static blit, scrub-fade runs) share the map + a 256-entry intensity
-LUT, so appearance is path-independent. Taps widened to ±9 (glow taps stamp
-1×1). Ease deepened: startup (0.45,0,0.25,1), minute (0.4,0,0.2,1); seam
-heal 600 → 300 ms. Measured: worst sweep frame 51 ms (brief dip to ~21 fps
-at peak slope), idle frames 0 ms.
+Per-pixel radial alpha map: solid core → ~1.75 px antialiased stroke edge.
+All ring paths (sweep stamps, static blit, scrub-fade runs) share the map +
+a 256-entry intensity LUT, so appearance is path-independent. Ease deepened:
+startup (0.45,0,0.25,1), minute (0.4,0,0.2,1); seam heal 250 ms.
+
+- **Glow: tried and removed** — invisible against the AMOLED black floor at
+  tasteful intensity, and its wider taps cost ~73% more sweep work. Revisit
+  only with a fundamentally different technique (e.g. blur pass).
+- **Sweep runs at 40 fps** (build-time schedules at TARGET_FPS 40; the app
+  switches to a 25 ms cadence while `Clock::is_animating`, 20 fps static).
+  Fixed the visible stepping at the ease curve's speed peak. Comet-tip
+  window restamps at stride 2 (still ~13 steps/px, gap-free) to fit the
+  budget: worst sweep frame 24 ms, typical 8–14 ms, idle 0 ms.
 
 ## M4 status (2026-07-21): direction + polish fixes applied
 

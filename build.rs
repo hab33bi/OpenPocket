@@ -167,15 +167,16 @@ const MINUTE_BEZIER: (f64, f64, f64, f64) = (0.4, 0.0, 0.2, 1.0);
 /// frame, so per-frame deltas are bounded by construction (no runtime cap needed) and
 /// the ring always reaches the schedule's end state before the phase can exit.
 fn generate_bezel_schedules() {
-    // Must equal the lock-scene precompute size: BEZEL_STEPS (36000) × TAPS (19,
-    // stroke ± glow reach). scale_sched in lock.rs tolerates a mismatch, but
-    // identity keeps per-frame deltas exactly as constructed.
-    const TOTAL: u32 = 684_000;
-    // The main loop paces frames to exactly this rate (CLOCK_FRAME_US in main.rs),
-    // so schedules take precisely their designed wall-clock duration. More fps =
-    // more, smaller schedule steps over the same duration = smoother motion;
-    // every frame's work must fit 1000/fps ms (worst measured ~45 ms at 20 fps).
-    const TARGET_FPS: u64 = 20;
+    // Must equal the lock-scene precompute size: BEZEL_STEPS (36000) × TAPS (11).
+    // scale_sched in lock.rs tolerates a mismatch, but identity keeps per-frame
+    // deltas exactly as constructed.
+    const TOTAL: u32 = 396_000;
+    // The app paces bezel-animation frames at this rate (CLOCK_ANIM_FRAME_US in
+    // app.rs), dropping to 20 fps when static. 40 fps halves each frame's arc
+    // delta — the mid-sweep speed peak stays visually continuous instead of
+    // stepping. Every anim frame's work must fit 25 ms (stride-2 tip restamp
+    // keeps the worst frame inside that).
+    const TARGET_FPS: u64 = 40;
     const INITIAL_MS: u64 = 8_000;
     const UNDRAW_MS: u64 = 3_500;
     const REDRAW_MS: u64 = 3_500;
