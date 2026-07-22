@@ -26,7 +26,7 @@ use crate::display::qspi_bus::QspiBus;
 use crate::display::watch_fb::{RectAcc, WatchFb};
 use crate::drivers::{axp2101, cst9217};
 use crate::input::gestures::{GestureEvent, SwipeDir, SwipeTracker};
-use crate::scenes::{lock, wheel};
+use crate::scenes::{apps, lock, wheel};
 use crate::time::{WallClock, WallTime};
 
 /// Fixed 20 fps cadence while the clock is static (idle frames cost ~0).
@@ -81,8 +81,11 @@ const H: i32 = LCD_HEIGHT as i32;
 #[derive(Clone, Copy, PartialEq)]
 enum Scene {
     Locked,
-    /// The App Wheel — where unlock lands (W3; `Scene::App` joins in W3.2).
+    /// The App Wheel — where unlock lands (W3).
     Wheel,
+    /// An open app screen (the wheel row index IS the app index). Entered
+    /// through the open morph, left via PWR (close morph) or relock.
+    App(usize),
 }
 
 /// M5 idle ladder. Wake (on any touch) is instant from every state.
@@ -163,6 +166,8 @@ impl<'a, 'd> App<'a, 'd> {
         let mut brightness: u8 = 0xFF;
         let mut power = Power::Awake;
         let mut aod_minute: u8 = 255;
+        // Minute shown by the wheel/app status line at rest (rollover redraw).
+        let mut status_minute: u8 = 255;
         // Wheel scroll state (Q8 px) + battery cached at wheel entry.
         let mut wheel_s_q8: i32 = 0;
         let mut wheel_batt: Option<u8> = None;
@@ -179,6 +184,11 @@ impl<'a, 'd> App<'a, 'd> {
                 && unlocked_at.elapsed() >= Duration::from_secs(AUTO_RELOCK_SECS)
             {
                 println!("scene: auto-relock");
+                if matches!(scene, Scene::App(_)) {
+                    // The app painted content the rect cache doesn't track —
+                    // the relock morph reseeds from a clean wheel frame.
+                    self.wheel_fx.invalidate();
+                }
                 scene = self.settle_from(&mut sheet_b, LCD_HEIGHT, &now, wheel_batt, wheel_s_q8);
                 continue;
             }
@@ -232,6 +242,19 @@ impl<'a, 'd> App<'a, 'd> {
                     let focused = (((wheel_s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
                         .clamp(0, wheel::rows() as i32 - 1) as usize;
                     wheel::tick_ring(&mut self.wfb, elapsed, focused);
+                    if status_minute != now.minute {
+                        status_minute = now.minute;
+                        wheel::tick_status(&mut self.wfb, &now, wheel_batt);
+                    }
+                }
+            } else if let Scene::App(idx) = scene {
+                if power == Power::Awake {
+                    // The app's ONE breathing element (partial redraw).
+                    apps::tick(&mut self.wfb, idx, elapsed);
+                    if status_minute != now.minute {
+                        status_minute = now.minute;
+                        wheel::tick_status(&mut self.wfb, &now, wheel_batt);
+                    }
                 }
             }
             let render_ms = render_start.elapsed().as_millis() as u32;
@@ -310,8 +333,22 @@ impl<'a, 'd> App<'a, 'd> {
                             println!("pwr: short press -> flourish");
                         }
                         Scene::Wheel => {
+                            let focused = (((wheel_s_q8 >> 8) + wheel::PITCH_PX / 2)
+                                / wheel::PITCH_PX)
+                                .clamp(0, wheel::rows() as i32 - 1)
+                                as usize;
+                            println!("pwr: short press -> open app {focused}");
+                            scene = self.app_morph(
+                                focused, true, wheel_s_q8, &now, wheel_batt, anim_start, &mut tp,
+                            );
                             unlocked_at = Instant::now();
-                            println!("pwr: short press (app open lands in W3.2)");
+                        }
+                        Scene::App(idx) => {
+                            println!("pwr: short press -> close app {idx}");
+                            scene = self.app_morph(
+                                idx, false, wheel_s_q8, &now, wheel_batt, anim_start, &mut tp,
+                            );
+                            unlocked_at = Instant::now();
                         }
                     }
                 }
@@ -355,8 +392,10 @@ impl<'a, 'd> App<'a, 'd> {
                                 start_drag = Some((dir, dist, y));
                                 kind = "sheet";
                             }
-                            // Top-edge swipe-down in the wheel = relock.
-                            (SwipeDir::Down, Scene::Wheel) if (y as i32) < H * 12 / 100 => {
+                            // Top-edge swipe-down = relock (wheel AND apps).
+                            (SwipeDir::Down, Scene::Wheel | Scene::App(_))
+                                if (y as i32) < H * 12 / 100 =>
+                            {
                                 start_drag = Some((dir, dist, y));
                                 kind = "relock";
                             }
@@ -418,6 +457,12 @@ impl<'a, 'd> App<'a, 'd> {
                 core::hint::spin_loop();
             }
             self.maybe_reinit_touch(&mut tp);
+            // Any touch inside an app counts as interaction (auto-relock).
+            if matches!(scene, Scene::App(_))
+                && tp.last_activity.elapsed() < Duration::from_millis(100)
+            {
+                unlocked_at = Instant::now();
+            }
 
             if let Some((dir, dist, start_y)) = start_drag {
                 // A drag can arm while dimmed/AOD — the composer needs the
@@ -429,6 +474,11 @@ impl<'a, 'd> App<'a, 'd> {
                 if dir == SwipeDir::Up {
                     // Fresh unlock always lands on the wheel's first row.
                     wheel_s_q8 = 0;
+                }
+                if matches!(scene, Scene::App(_)) {
+                    // Relock from inside an app: the canvas holds content the
+                    // rect cache doesn't track — reseed for the morph.
+                    self.wheel_fx.invalidate();
                 }
                 scene = self.drag_session(
                     dir,
@@ -1340,6 +1390,79 @@ impl<'a, 'd> App<'a, 'd> {
     /// clear + union-bbox partial flush; motion LOD when `fast`).
     fn draw_wheel(&mut self, now: &WallTime, batt: Option<u8>, s_q8: i32, fast: bool) {
         wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast, None);
+    }
+
+    /// The wheel ↔ app open/close morph (W3 §2): the focused icon flies
+    /// between its row slot and the app's hero slot (56→96 px) while its
+    /// glow dissolves, the other rows fade away from center, and the app
+    /// content rises in with a hero crossfade over the tail. ~350 ms open,
+    /// ~240 ms close (returns are always faster), smoothstep-eased (the
+    /// integer stand-in for the (0.4,0,0.2,1) standard curve), 25 ms
+    /// cadence. PWR mid-morph REVERSES from the current progress — never
+    /// queues, never snaps.
+    #[allow(clippy::too_many_arguments)]
+    fn app_morph(
+        &mut self,
+        idx: usize,
+        opening: bool,
+        s_q8: i32,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) -> Scene {
+        const OPEN_STEP: i32 = 256 * 25 / 350;
+        const CLOSE_STEP: i32 = 256 * 25 / 240;
+        let (hero_x, hero_y) = apps::hero_pos(idx);
+        let fades = apps::icon_fades(idx);
+        let mut t: i32 = if opening { 0 } else { 256 };
+        let mut dirn: i32 = if opening { 1 } else { -1 };
+        if !opening {
+            // Coming from the app's rest frame: the canvas holds content
+            // the rect cache doesn't track — reseed on the first frame.
+            self.wheel_fx.invalidate();
+        }
+        loop {
+            let fs = Instant::now();
+            t += dirn * if dirn > 0 { OPEN_STEP } else { CLOSE_STEP };
+            let t_c = t.clamp(0, 256);
+            // Smoothstep in Q8: e = t²·(3 − 2t).
+            let e = (t_c * t_c * (768 - 2 * t_c)) >> 16;
+            // Flight leads; content rises in over the tail (crossfade).
+            let f = (e * 256 / 176).min(256);
+            let q = ((e - 160) * 256 / 96).clamp(0, 256);
+            let icon_q = if fades { q } else { 0 };
+            wheel::draw_open_morph(
+                &mut self.wfb,
+                now,
+                batt,
+                s_q8,
+                &mut self.wheel_fx,
+                idx,
+                f,
+                icon_q,
+                hero_x,
+                hero_y,
+            );
+            let elapsed = anim_start.elapsed().as_millis() as u32;
+            apps::draw_reveal(&mut self.wfb, &mut self.wheel_fx, now, idx, q, elapsed);
+            self.flush_dirty();
+            // PWR mid-morph: reverse from the current progress.
+            if axp2101::poll_power_key(&mut self.i2c) == axp2101::PowerKey::ShortPress {
+                dirn = -dirn;
+                println!("pwr: morph reverse");
+            }
+            // Keep the recognizer fed; gestures during the ≤350 ms morph
+            // are superseded by it.
+            let _ = self.poll_touch_once(tp, elapsed);
+            if t >= 256 && dirn > 0 {
+                return Scene::App(idx);
+            }
+            if t <= 0 && dirn < 0 {
+                return Scene::Wheel;
+            }
+            wheel::pace(fs);
+        }
     }
 
     /// A gesture takes over mid-flourish: write the flourish's zero-glow

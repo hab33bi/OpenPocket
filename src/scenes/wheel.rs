@@ -418,6 +418,144 @@ pub fn tick_ring(wfb: &mut WatchFb, elapsed_ms: u32, focused: usize) {
     wfb.mark_rect(icon_cx - s, y_c - s, icon_cx + s, y_c + s);
 }
 
+/// Redraw the status line in place (minute rollover at rest — the wheel's
+/// tick_ring and app rest frames don't otherwise touch it). Clears the
+/// band first (tick_ring doctrine: from black, every draw is identical).
+pub fn tick_status(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>) {
+    let fb = wfb.buf_mut();
+    for y in 26..66 {
+        let a = ((y * W + (CX - 110)) * 2) as usize;
+        let b = ((y * W + (CX + 110)) * 2) as usize;
+        fb[a..b].fill(0);
+    }
+    draw_status(fb, now, battery);
+    wfb.mark_rect(CX - 110, 26, CX + 110, 66);
+}
+
+/// Wheel-side frame of the open/close morph (W3 §2), driven by two scrub
+/// values: `f_q8` = the focused icon's flight (56→96 px, row slot → the
+/// app's hero slot) while its glow dissolves, its label fades fast, and
+/// every other row fades + slides 12 px away from center; `icon_q8` = the
+/// hero crossfade (the flying icon fades OUT as the app's own hero element
+/// fades in — 0 for apps whose hero IS the icon). The app's content is
+/// drawn by apps::draw_reveal AFTER this, sharing the same rect cache.
+/// Status stays topmost and never blinks.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_open_morph(
+    wfb: &mut WatchFb,
+    now: &WallTime,
+    battery: Option<u8>,
+    s_q8: i32,
+    fx: &mut WheelFx,
+    focused: usize,
+    f_q8: i32,
+    icon_q8: i32,
+    hero_x: i32,
+    hero_y: i32,
+) {
+    fx.intro = None;
+    let s_px = s_q8 >> 8;
+    let mut d = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+
+    let seed = !fx.seeded;
+    if seed {
+        fx.seeded = true;
+        wfb.buf_mut().fill(0);
+    } else {
+        let fb = wfb.buf_mut();
+        for k in 0..fx.n {
+            let (x0, y0, x1, y1) = fx.rects[k];
+            let (x0, y0) = ((x0 as i32).max(0), (y0 as i32).max(0));
+            let (x1, y1) = ((x1 as i32).min(W - 1), (y1 as i32).min(H - 1));
+            if x1 < x0 || y1 < y0 {
+                continue;
+            }
+            for y in y0..=y1 {
+                let a = ((y * W + x0) * 2) as usize;
+                let b = ((y * W + x1) * 2 + 2) as usize;
+                fb[a..b].fill(0);
+            }
+            grow(&mut d, x0, y0, x1, y1);
+        }
+    }
+    fx.n = 0;
+
+    let fb = wfb.buf_mut();
+
+    // Non-focused rows: fade out while sliding away from center.
+    for (i, app) in WHEEL_APPS.iter().enumerate() {
+        if i == focused {
+            continue;
+        }
+        let y_c = CY + i as i32 * PITCH - s_px;
+        if y_c < -PITCH || y_c > H + PITCH {
+            continue;
+        }
+        let (alpha, _) = row_alpha(y_c);
+        if alpha == 0 {
+            continue;
+        }
+        let away = if y_c >= CY { 12 } else { -12 };
+        let y_d = y_c + ((away * f_q8) >> 8);
+        let a = (alpha * (256 - f_q8)) >> 8;
+        if a < 8 {
+            continue;
+        }
+        let cx_i = icon_center_x(y_d, ICON_S_PX);
+        blit_icon(fb, app.icon_s, ICON_S_PX, cx_i, y_d, a);
+        let s2 = ICON_S_PX / 2 + 1;
+        fx.push(cx_i - s2, y_d - s2, cx_i + s2, y_d + s2);
+        let gs = &lock::TEXT_GLYPHS;
+        let tw = text_width(app.name, gs);
+        let x = (CX - tw / 2).max(cx_i + ICON_S_PX / 2 + 10);
+        draw_text_at(fb, app.name, x, y_d + 11, a, gs);
+        fx.push(x - 1, y_d - 36, x + tw + 1, y_d + 36);
+    }
+
+    // Focused row: glow dissolves early, label fades fast, icon flies.
+    let app = &WHEEL_APPS[focused];
+    let y_c = CY + focused as i32 * PITCH - s_px;
+    let icon_from = icon_center_x(y_c, ICON_L_PX);
+    let ga = (256 - f_q8 * 5 / 2).clamp(0, 256);
+    if ga > 8 {
+        let sl = saber_lut(0);
+        blit_glow(fb, &sl, icon_from, y_c, ga);
+        let s2 = GLOW_RING_PX / 2;
+        fx.push(icon_from - s2, y_c - s2, icon_from + s2, y_c + s2);
+    }
+    let la = (256 - f_q8 * 2).clamp(0, 256);
+    if la > 8 {
+        let gl = &lock::LABELF_GLYPHS;
+        let tw = text_width(app.name, gl);
+        let x = (CX - tw / 2).max(icon_from + ICON_L_PX / 2 + 10);
+        draw_text_at(fb, app.name, x, y_c + 11, la, gl);
+        fx.push(x - 1, y_c - 36, x + tw + 1, y_c + 36);
+    }
+    let ia = (256 - icon_q8).clamp(0, 256);
+    if ia > 8 {
+        let px_eff = ICON_L_PX + (((ICON_H_PX - ICON_L_PX) * f_q8) >> 8);
+        let ix = icon_from + (((hero_x - icon_from) * f_q8) >> 8);
+        let iy = y_c + (((hero_y - y_c) * f_q8) >> 8);
+        blit_icon_scaled(fb, app.icon_h, ICON_H_PX, px_eff, ix, iy, ia, false);
+        let s2 = px_eff / 2 + 1;
+        fx.push(ix - s2, iy - s2, ix + s2, iy + s2);
+    }
+
+    // Status: topmost, every frame — the one fixed point.
+    draw_status(fb, now, battery);
+    fx.push(CX - 110, 26, CX + 110, 66);
+
+    for k in 0..fx.n {
+        let (x0, y0, x1, y1) = fx.rects[k];
+        grow(&mut d, x0 as i32, y0 as i32, x1 as i32, y1 as i32);
+    }
+    if seed {
+        wfb.mark_rect(0, 0, W - 1, H - 1);
+    } else if d.0 <= d.2 && d.1 <= d.3 {
+        wfb.mark_rect(d.0, d.1, d.2, d.3);
+    }
+}
+
 /// Focus proximity + row alpha with a fade tail past 2 rows from center.
 fn row_alpha(y_c: i32) -> (i32, i32) {
     let ady = (y_c - CY).abs();
@@ -474,16 +612,35 @@ fn saber_lut(phase: i32) -> [(u8, u8); 256] {
     lut
 }
 
+/// The saber gradient frozen at its azure end — the shared accent LUT for
+/// app-screen glows (Photos disc, W3+).
+pub fn azure_lut() -> [(u8, u8); 256] {
+    saber_lut(0)
+}
+
 /// Blit the pre-rendered glow-ring intensity sprite through the saber LUT.
 fn blit_glow(fb: &mut [u8], lut: &[(u8, u8); 256], cx: i32, cy: i32, alpha: i32) {
-    let px = GLOW_RING_PX;
+    blit_lut_sprite(fb, GLOW_RING, GLOW_RING_PX, lut, cx, cy, alpha);
+}
+
+/// Blit any intensity sprite through a color LUT (per-channel MAX blend —
+/// overlapping glows merge instead of punching square bounds).
+pub fn blit_lut_sprite(
+    fb: &mut [u8],
+    sprite: &[u8],
+    px: i32,
+    lut: &[(u8, u8); 256],
+    cx: i32,
+    cy: i32,
+    alpha: i32,
+) {
     for iy in 0..px {
         let y = cy - px / 2 + iy;
         if y < 0 || y >= H {
             continue;
         }
         for ix in 0..px {
-            let a = GLOW_RING[(iy * px + ix) as usize] as i32;
+            let a = sprite[(iy * px + ix) as usize] as i32;
             if a < 6 {
                 continue;
             }
@@ -510,7 +667,7 @@ fn blit_glow(fb: &mut [u8], lut: &[(u8, u8); 256], cx: i32, cy: i32, alpha: i32)
 }
 
 /// Blit an icon alpha sprite, ice-blue tinted, scaled by row alpha (0..=256).
-fn blit_icon(fb: &mut [u8], sprite: &[u8], px: i32, cx: i32, cy: i32, alpha: i32) {
+pub fn blit_icon(fb: &mut [u8], sprite: &[u8], px: i32, cx: i32, cy: i32, alpha: i32) {
     for iy in 0..px {
         let y = cy - px / 2 + iy;
         if y < 0 || y >= H {
@@ -534,7 +691,7 @@ fn blit_icon(fb: &mut [u8], sprite: &[u8], px: i32, cx: i32, cy: i32, alpha: i32
 /// Scaled icon blit (downscale from the large sprite to any intermediate
 /// size) — used only mid-transition. `fast` swaps bilinear for
 /// nearest-neighbor sampling (~5x fewer ops/px; invisible at flick speed).
-fn blit_icon_scaled(
+pub fn blit_icon_scaled(
     fb: &mut [u8],
     sprite: &[u8],
     src_px: i32,
