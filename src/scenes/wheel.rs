@@ -88,6 +88,12 @@ impl WheelFx {
     pub fn intro_active(&self) -> bool {
         self.intro.is_some()
     }
+    /// Consume the reseed flag: true exactly once after invalidate() /
+    /// construction — for external full-canvas composers (gallery) that
+    /// manage their own damage.
+    pub fn take_seed(&mut self) -> bool {
+        !core::mem::replace(&mut self.seeded, true)
+    }
     pub fn push(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         if self.n < FX_RECTS {
             self.rects[self.n] = (x0 as i16, y0 as i16, x1 as i16, y1 as i16);
@@ -149,8 +155,10 @@ fn status_str(now: &WallTime, battery: Option<u8>, s: &mut [u8; 12]) -> usize {
     n
 }
 
-/// Status line, top-center: HH:MM, plus battery when present.
-fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
+/// Status line, top-center: HH:MM, plus battery when present. Source-over
+/// draw — callers over an image must re-blit the band first (repeated
+/// self-compositing brightens AA edges).
+pub fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
     let mut s = [0u8; 12];
     let n = status_str(now, battery, &mut s);
     let text = core::str::from_utf8(&s[..n]).unwrap_or("");

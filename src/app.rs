@@ -171,6 +171,10 @@ impl<'a, 'd> App<'a, 'd> {
         // Wheel scroll state (Q8 px) + battery cached at wheel entry.
         let mut wheel_s_q8: i32 = 0;
         let mut wheel_batt: Option<u8> = None;
+        // Gallery strip state: resting page + when it last settled (the
+        // finale caption fades in 300 ms after settle).
+        let mut gal_page: usize = 0;
+        let mut gal_settle: Option<Instant> = None;
 
         loop {
             let frame_start = Instant::now();
@@ -220,6 +224,26 @@ impl<'a, 'd> App<'a, 'd> {
                 unlocked_at = Instant::now();
                 continue;
             }
+            // Gallery strip: same direct-manipulation doctrine, X axis.
+            if scene == Scene::App(apps::GALLERY)
+                && power == Power::Awake
+                && self.swipe.finger_down()
+                && self
+                    .swipe
+                    .press_origin_y()
+                    .is_some_and(|y| (y as i32) >= H * 12 / 100)
+            {
+                self.gallery_interact(
+                    &mut gal_page,
+                    &mut gal_settle,
+                    &now,
+                    wheel_batt,
+                    anim_start,
+                    &mut tp,
+                );
+                unlocked_at = Instant::now();
+                continue;
+            }
 
             let render_start = Instant::now();
             if scene == Scene::Locked && power != Power::Aod && power != Power::Sleep {
@@ -249,11 +273,25 @@ impl<'a, 'd> App<'a, 'd> {
                 }
             } else if let Scene::App(idx) = scene {
                 if power == Power::Awake {
-                    // The app's ONE breathing element (partial redraw).
-                    apps::tick(&mut self.wfb, idx, elapsed);
-                    if status_minute != now.minute {
-                        status_minute = now.minute;
-                        wheel::tick_status(&mut self.wfb, &now, wheel_batt);
+                    if idx == apps::GALLERY {
+                        // Full-bleed art keeps its own status/caption upkeep
+                        // (bands re-blit from the page, never cleared black).
+                        let settle_ms = gal_settle.map(|t| t.elapsed().as_millis() as u32);
+                        apps::gallery_tick(
+                            &mut self.wfb,
+                            &now,
+                            wheel_batt,
+                            gal_page,
+                            settle_ms,
+                            &mut status_minute,
+                        );
+                    } else {
+                        // The app's ONE breathing element (partial redraw).
+                        apps::tick(&mut self.wfb, idx, elapsed);
+                        if status_minute != now.minute {
+                            status_minute = now.minute;
+                            wheel::tick_status(&mut self.wfb, &now, wheel_batt);
+                        }
                     }
                 }
             }
@@ -338,15 +376,21 @@ impl<'a, 'd> App<'a, 'd> {
                                 .clamp(0, wheel::rows() as i32 - 1)
                                 as usize;
                             println!("pwr: short press -> open app {focused}");
+                            if focused == apps::GALLERY {
+                                gal_page = 0;
+                                gal_settle = Some(Instant::now());
+                            }
                             scene = self.app_morph(
-                                focused, true, wheel_s_q8, &now, wheel_batt, anim_start, &mut tp,
+                                focused, true, wheel_s_q8, gal_page, &now, wheel_batt, anim_start,
+                                &mut tp,
                             );
                             unlocked_at = Instant::now();
                         }
                         Scene::App(idx) => {
                             println!("pwr: short press -> close app {idx}");
                             scene = self.app_morph(
-                                idx, false, wheel_s_q8, &now, wheel_batt, anim_start, &mut tp,
+                                idx, false, wheel_s_q8, gal_page, &now, wheel_batt, anim_start,
+                                &mut tp,
                             );
                             unlocked_at = Instant::now();
                         }
@@ -1402,11 +1446,13 @@ impl<'a, 'd> App<'a, 'd> {
     /// the logo shows, the icon flies home). Smoothstep-eased phases,
     /// 25 ms cadence. PWR mid-morph REVERSES from the current progress —
     /// never queues, never snaps.
+    #[allow(clippy::too_many_arguments)]
     fn app_morph(
         &mut self,
         idx: usize,
         opening: bool,
         s_q8: i32,
+        page: usize,
         now: &WallTime,
         batt: Option<u8>,
         anim_start: Instant,
@@ -1430,6 +1476,10 @@ impl<'a, 'd> App<'a, 'd> {
             let x = x.clamp(0, 256);
             (x * x * (768 - 2 * x)) >> 16
         };
+        // Full-bleed apps (Gallery) swap renderers at the content boundary
+        // — the art composes its own frames; crossing either way reseeds.
+        let full_bleed = idx == apps::GALLERY;
+        let mut was_full = false;
         loop {
             let fs = Instant::now();
             t += dirn * if dirn > 0 { STEP_OPEN } else { STEP_CLOSE };
@@ -1444,22 +1494,33 @@ impl<'a, 'd> App<'a, 'd> {
                 let q = smooth((tc - T_FLIGHT - T_HOLD) * 256 / T_CONTENT);
                 (256, 256 - q, 256 - q, q)
             };
-            wheel::draw_open_morph(
-                &mut self.wfb,
-                now,
-                batt,
-                s_q8,
-                &mut self.wheel_fx,
-                idx,
-                f,
-                icon_a,
-            );
-            if title_a > 0 {
-                apps::draw_splash_title(&mut self.wfb, &mut self.wheel_fx, idx, title_a);
-            }
             let elapsed = anim_start.elapsed().as_millis() as u32;
-            if q > 0 {
-                apps::draw_reveal(&mut self.wfb, &mut self.wheel_fx, now, idx, q, elapsed);
+            if full_bleed && q > 0 {
+                if !was_full {
+                    was_full = true;
+                    self.wheel_fx.invalidate();
+                }
+                apps::draw_gallery_load(&mut self.wfb, &mut self.wheel_fx, now, batt, page, q);
+            } else {
+                if core::mem::replace(&mut was_full, false) {
+                    self.wheel_fx.invalidate();
+                }
+                wheel::draw_open_morph(
+                    &mut self.wfb,
+                    now,
+                    batt,
+                    s_q8,
+                    &mut self.wheel_fx,
+                    idx,
+                    f,
+                    icon_a,
+                );
+                if title_a > 0 {
+                    apps::draw_splash_title(&mut self.wfb, &mut self.wheel_fx, idx, title_a);
+                }
+                if q > 0 {
+                    apps::draw_reveal(&mut self.wfb, &mut self.wheel_fx, now, idx, q, elapsed);
+                }
             }
             self.flush_dirty();
             // PWR mid-morph: reverse from the current progress.
@@ -1477,6 +1538,168 @@ impl<'a, 'd> App<'a, 'd> {
                 return Scene::Wheel;
             }
             wheel::pace(fs);
+        }
+    }
+
+    /// Gallery page strip (W3 §4.2): horizontal direct manipulation in the
+    /// wheel's vocabulary — anchored 1:1 at the first raw report, jitter
+    /// gate with remainder subtraction, 3/4 pursuit on report bursts,
+    /// progressive rubber past the ends, velocity verdict at lift (a
+    /// definite flick turns exactly ONE page — per-page detent doctrine),
+    /// damped settle. Interruptible: a finger mid-settle re-grabs.
+    fn gallery_interact(
+        &mut self,
+        page: &mut usize,
+        settled: &mut Option<Instant>,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) {
+        const PG_W: i32 = LCD_WIDTH as i32;
+        const GATE_PX: i32 = 6;
+        const STALE_MS: u32 = 50;
+        const DT_FLOOR_MS: i32 = 5;
+        /// Release speed (Q8 px/ms) that turns a page.
+        const PAGE_FLING_Q8: i32 = 64;
+        let n = apps::GALLERY_PAGES as i32;
+        let s_max = (n - 1) * PG_W;
+        let rubber = |t: i32| -> i32 {
+            let give = |x: i32| (x * 141 * 128) / (256 * 128 + 141 * x);
+            if t < 0 {
+                -give(-t)
+            } else if t > s_max {
+                s_max + give(t - s_max)
+            } else {
+                t
+            }
+        };
+        let mut s: i32 = (*page as i32).clamp(0, n - 1) * PG_W;
+        *settled = None;
+        'grab: loop {
+            // Anchor at the finger's current X (wait one report if raced).
+            let mut anchor_x: Option<i32> = match tp.last_raw {
+                Some(t) if t.pressed => Some(t.x as i32),
+                _ => None,
+            };
+            while anchor_x.is_none() && self.swipe.finger_down() {
+                let now_ms = anim_start.elapsed().as_millis() as u32;
+                let _ = self.poll_touch_once(tp, now_ms);
+                if let Some(t) = tp.last_raw {
+                    if t.pressed {
+                        anchor_x = Some(t.x as i32);
+                    }
+                }
+                core::hint::spin_loop();
+            }
+            let mut v: i32 = 0;
+            let mut gate = false;
+            if let Some(mut ax) = anchor_x {
+                let anchor_s = s;
+                let origin_x = ax;
+                let mut last_x = ax;
+                let mut target = anchor_s;
+                let t0 = Instant::now();
+                let start_ms = anim_start.elapsed().as_millis() as u32;
+                let mut ring = [(ax, start_ms); 3];
+                let mut seq = tp.raw_seq;
+                loop {
+                    let now_ms = anim_start.elapsed().as_millis() as u32;
+                    let _ = self.poll_touch_once(tp, now_ms);
+                    if seq != tp.raw_seq {
+                        seq = tp.raw_seq;
+                        if let Some(t) = tp.last_raw {
+                            let x = t.x as i32;
+                            if x != last_x {
+                                ring[0] = ring[1];
+                                ring[1] = ring[2];
+                                ring[2] = (x, now_ms);
+                                last_x = x;
+                            }
+                            if !gate {
+                                let d = ax - x;
+                                if d.abs() > GATE_PX {
+                                    gate = true;
+                                    ax -= GATE_PX * d.signum();
+                                }
+                            }
+                            if gate && t.pressed {
+                                // Strip space: finger left = forward.
+                                target = anchor_s + (ax - x);
+                            }
+                        }
+                    }
+                    if !self.swipe.finger_down() {
+                        break;
+                    }
+                    let diff = rubber(target) - s;
+                    if diff != 0 {
+                        s += if diff.abs() <= 2 { diff } else { diff * 3 / 4 };
+                        apps::draw_gallery_frame(&mut self.wfb, s, now, batt);
+                        self.flush_dirty();
+                    }
+                    self.maybe_reinit_touch(tp);
+                    core::hint::spin_loop();
+                }
+                // Release velocity (Q8 px/ms, + = forward): hotter-of the
+                // last segments + whole-press ballistic fallback.
+                let now_ms = anim_start.elapsed().as_millis() as u32;
+                let held = t0.elapsed().as_millis() as u32;
+                if gate {
+                    if now_ms.wrapping_sub(ring[2].1) <= STALE_MS {
+                        let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(DT_FLOOR_MS as u32) as i32;
+                        let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(DT_FLOOR_MS as u32) as i32;
+                        let v_b = ((ring[1].0 - ring[2].0) << 8) / dt_b;
+                        let v_a = ((ring[0].0 - ring[1].0) << 8) / dt_a;
+                        let v_w = (2 * v_b + v_a) / 3;
+                        v = if dt_b > 60 {
+                            v_b
+                        } else if (v_b >= 0) == (v_w >= 0) && v_b.abs() > v_w.abs() {
+                            v_b
+                        } else {
+                            v_w
+                        };
+                    }
+                    if held <= 180 {
+                        let vp =
+                            ((origin_x - last_x) << 8) / held.max(DT_FLOOR_MS as u32) as i32 * 3 / 2;
+                        if v == 0 || ((vp >= 0) == (v >= 0) && vp.abs() > v.abs()) {
+                            v = vp;
+                        }
+                    }
+                }
+            }
+            // Verdict: one page per definite flick, else nearest detent.
+            let tgt = if gate && v.abs() >= PAGE_FLING_Q8 {
+                if v > 0 {
+                    s.div_euclid(PG_W) + 1
+                } else {
+                    (s + PG_W - 1).div_euclid(PG_W) - 1
+                }
+            } else {
+                (s + PG_W / 2).div_euclid(PG_W)
+            }
+            .clamp(0, n - 1);
+            if v != 0 {
+                println!("gallery: flick v={v} -> page {tgt}");
+            }
+            let target = tgt * PG_W;
+            while s != target {
+                let fs = Instant::now();
+                let now_ms = anim_start.elapsed().as_millis() as u32;
+                let _ = self.poll_touch_once(tp, now_ms);
+                if self.swipe.finger_down() {
+                    continue 'grab;
+                }
+                let diff = target - s;
+                s += if diff.abs() <= 3 { diff } else { diff * 5 / 16 };
+                apps::draw_gallery_frame(&mut self.wfb, s, now, batt);
+                self.flush_dirty();
+                wheel::pace(fs);
+            }
+            *page = tgt as usize;
+            *settled = Some(Instant::now());
+            return;
         }
     }
 
