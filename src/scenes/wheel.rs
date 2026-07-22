@@ -155,25 +155,36 @@ pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8:
         if alpha == 0 {
             continue;
         }
-        let (sprite, px) = if t > 128 {
-            (app.icon_l, ICON_L_PX)
-        } else {
-            (app.icon_s, ICON_S_PX)
-        };
-        let icon_cx = icon_center_x(y_c, px);
+        // Continuous size interpolation: crossfade the two pre-rendered
+        // sizes (icons AND labels) through the focus band, anchored at the
+        // blended center — reads as one smoothly scaling element.
+        let wl = ((t - 64) * 2).clamp(0, 256);
+        let cx_s = icon_center_x(y_c, ICON_S_PX);
+        let cx_l = icon_center_x(y_c, ICON_L_PX);
+        let cx = cx_s + (((cx_l - cx_s) * wl) >> 8);
         if t > 128 {
-            blit_glow(fb, &saber, icon_cx, y_c, (t - 128) * 2);
+            blit_glow(fb, &saber, cx, y_c, (t - 128) * 2);
         }
-        blit_icon(fb, sprite, px, icon_cx, y_c, alpha);
-        let glyphs: &[Option<Glyph>; 128] = if t > 128 {
-            &lock::LABELF_GLYPHS
-        } else {
-            &lock::TEXT_GLYPHS
-        };
-        let tw = text_width(app.name, glyphs);
-        let min_left = icon_cx + px / 2 + 10;
-        let x = (CX - tw / 2).max(min_left);
-        draw_text_at(fb, app.name, x, y_c + 11, alpha, glyphs);
+        if wl < 256 {
+            blit_icon(fb, app.icon_s, ICON_S_PX, cx, y_c, (alpha * (256 - wl)) >> 8);
+        }
+        if wl > 0 {
+            blit_icon(fb, app.icon_l, ICON_L_PX, cx, y_c, (alpha * wl) >> 8);
+        }
+        let px_eff = ICON_S_PX + (((ICON_L_PX - ICON_S_PX) * wl) >> 8);
+        let min_left = cx + px_eff / 2 + 10;
+        if wl < 256 {
+            let gs = &lock::TEXT_GLYPHS;
+            let tw = text_width(app.name, gs);
+            let x = (CX - tw / 2).max(min_left);
+            draw_text_at(fb, app.name, x, y_c + 11, (alpha * (256 - wl)) >> 8, gs);
+        }
+        if wl > 0 {
+            let gl = &lock::LABELF_GLYPHS;
+            let tw = text_width(app.name, gl);
+            let x = (CX - tw / 2).max(min_left);
+            draw_text_at(fb, app.name, x, y_c + 11, (alpha * wl) >> 8, gl);
+        }
     }
 
     draw_status(fb, now, battery);
@@ -361,20 +372,29 @@ fn draw_glyph(fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, alpha: i32) {
     }
 }
 
+/// Tinted MAX-blend write: per-channel max against what's already there.
+/// This is what makes the two-size crossfade read as one smoothly scaling
+/// element (overwrite-blending would punch the dimmer sprite into the
+/// brighter one), and it lets icons ride over the glow without dark halos.
 #[inline]
 fn write_tinted(fb: &mut [u8], x: i32, y: i32, v: i32) {
+    let idx = ((y * W + x) * 2) as usize;
+    if idx + 1 >= fb.len() {
+        return;
+    }
     let r = (TINT.0 * v / 255).clamp(0, 255);
     let g = (TINT.1 * v / 255).clamp(0, 255);
     let b = (TINT.2 * v / 255).clamp(0, 255);
-    let r5 = ((r as u16) * 31 / 255) & 0x1F;
-    let g6 = ((g as u16) * 63 / 255) & 0x3F;
-    let b5 = ((b as u16) * 31 / 255) & 0x1F;
+    let nr = ((r as u16) * 31 / 255) & 0x1F;
+    let ng = ((g as u16) * 63 / 255) & 0x3F;
+    let nb = ((b as u16) * 31 / 255) & 0x1F;
+    let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
+    let r5 = (old >> 11).max(nr);
+    let g6 = ((old >> 5) & 0x3F).max(ng);
+    let b5 = (old & 0x1F).max(nb);
     let px = (r5 << 11) | (g6 << 5) | b5;
-    let idx = ((y * W + x) * 2) as usize;
-    if idx + 1 < fb.len() {
-        fb[idx] = (px >> 8) as u8;
-        fb[idx + 1] = px as u8;
-    }
+    fb[idx] = (px >> 8) as u8;
+    fb[idx + 1] = px as u8;
 }
 
 /// Pace helper for the intro (blocking, 25 ms frames like the settle).

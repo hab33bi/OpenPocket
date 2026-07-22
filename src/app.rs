@@ -865,7 +865,8 @@ impl<'a, 'd> App<'a, 'd> {
             let t_eff = wheel_rubber(target, wheel_s_max());
             let diff = t_eff - *s_q8;
             if diff != 0 {
-                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 3 / 4 };
+                // Near-1:1 tracking (7/8): light, immediate.
+                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 7 / 8 };
                 wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
                 self.flush_dirty();
             }
@@ -883,13 +884,15 @@ impl<'a, 'd> App<'a, 'd> {
         while v_q8.abs() > 64 {
             let fs = Instant::now();
             *s_q8 += v_q8 * dt_ms;
-            if *s_q8 <= 0 {
-                *s_q8 = 0;
-                break;
-            }
-            if *s_q8 >= s_max {
-                *s_q8 = s_max;
-                break;
+            // Elastic boundary: a hard flick BOUNCES off the ends (halved
+            // penetration, ~30% restitution) instead of dead-stopping —
+            // then coasts back and settles like everything else.
+            if *s_q8 < 0 {
+                *s_q8 = -*s_q8 / 2;
+                v_q8 = -v_q8 * 5 / 16;
+            } else if *s_q8 > s_max {
+                *s_q8 = s_max - (*s_q8 - s_max) / 2;
+                v_q8 = -v_q8 * 5 / 16;
             }
             // ~0.97 per 25 ms — a long, luxurious coast (decay scaled to
             // the actual frame time).
