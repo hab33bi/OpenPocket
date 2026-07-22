@@ -81,8 +81,13 @@ const FL_BLOOM_F: u32 = 10;
 const FL_SHIMMER_F: u32 = 64;
 const FL_RETRACT_F: u32 = 14;
 const FL_TOTAL_F: u32 = FL_BLOOM_F + FL_SHIMMER_F + FL_RETRACT_F;
-/// Ember spray population (transition sparks).
-const EMBER_N: usize = 24;
+/// Ember spray population (transition sparks + hold trickle).
+const EMBER_N: usize = 48;
+/// Flourish annulus radius² bounds — embers are clamped to this band so the
+/// per-frame band rewrite always erases them (no speck ever left on the
+/// clock face inside the ring).
+const FL_R_IN2: i32 = (BEZEL_R - FL_IN_PX) * (BEZEL_R - FL_IN_PX);
+const FL_R_OUT2: i32 = (BEZEL_R + FL_OUT_PX) * (BEZEL_R + FL_OUT_PX);
 
 /// Bayer 4×4 ordered-dither offsets (≈ ±half an RGB565 blue step) — breaks
 /// the 32-level blue quantization into invisible noise across the glow.
@@ -1040,12 +1045,18 @@ impl Clock {
                 let mut val = (self.ring_alpha[p] as i32).max(sab);
                 if aurora && val > 0 {
                     let ang = self.flourish_a[pi + k] as usize;
+                    // Broad sweeping bands: both octaves sampled at the base
+                    // ring frequency (NOISE_B was 2×), counter-scrolled — the
+                    // flow reads as large aurora curtains, not fine ripples.
                     let sh = (NOISE_A[(ang + t1) & 255] as i32
-                        + NOISE_B[(ang * 2 + 512 - t2) & 255] as i32)
+                        + NOISE_B[(ang + 512 - t2) & 255] as i32)
                         / 2
                         - 128;
                     let w = (val * (255 - val)) >> 6;
-                    val = (val + ((((sh * w) >> 9) * bloom) >> 8)).clamp(0, 255);
+                    // ~1.5× displacement (bigger, more visible flow); the
+                    // val·(255−val) weight still pins the endpoints exact so
+                    // the retract handback is untouched.
+                    val = (val + ((((sh * w * 3) >> 10) * bloom) >> 8)).clamp(0, 255);
                 }
                 if do_dither && val > 0 && val < 232 {
                     let x = p % W as usize;
@@ -1063,12 +1074,18 @@ impl Clock {
             writes += n;
         }
 
-        // Ember spray (transitions only): sparks scatter along the band at
-        // ignition and retract, riding over the glow with MAX writes. They
-        // live entirely inside the annulus, so the next frame's full band
-        // rewrite erases them for free.
-        if fr == 0 || fr == FL_BLOOM_F + FL_SHIMMER_F {
-            self.spawn_embers();
+        // Ember spray: a dense burst STAGGERED across the ignition frames
+        // and again at retract, plus a faint continuous trickle through the
+        // hold so the ring is never entirely still. Sparks fill only dead
+        // pool slots (waves layer instead of resetting). All clamped to the
+        // annulus, so the band rewrite erases them for free.
+        let shimmer_end = FL_BLOOM_F + FL_SHIMMER_F;
+        if fr < 4 {
+            self.spawn_embers(16); // ignition burst over 4 frames → full pool
+        } else if fr == shimmer_end || fr == shimmer_end + 1 {
+            self.spawn_embers(18); // retract burst
+        } else if fr < shimmer_end && fr % 5 == 0 {
+            self.spawn_embers(4); // hold trickle
         }
         if g > 0 {
             self.step_embers(fb, &lut);
@@ -1094,58 +1111,57 @@ impl Clock {
         x
     }
 
-    /// Scatter the spray: embers born on the ring's centerline with mostly
-    /// tangential velocity + a small inward drift — bounded so every spark
-    /// lives and dies inside the flourish annulus.
-    fn spawn_embers(&mut self) {
-        for e in 0..EMBER_N {
+    /// Scatter `count` fresh embers into currently-dead pool slots (waves
+    /// layer instead of resetting). Born near the ring centerline with
+    /// mostly tangential velocity + a small inward drift, varied speed and
+    /// life; the annulus clamp in ember_blob keeps every spark contained.
+    fn spawn_embers(&mut self, count: usize) {
+        let mut made = 0;
+        for i in 0..EMBER_N {
+            if made >= count {
+                break;
+            }
+            if self.embers[i][4] > 0 {
+                continue;
+            }
             let a = (self.rnd() & 255) as i32;
             let (dx, dy) = diamond_dir(a);
-            let r0 = (BEZEL_R - 14) + (self.rnd() % 10) as i32;
+            let r0 = (BEZEL_R - 18) + (self.rnd() % 16) as i32;
             let t_sign: i32 = if self.rnd() & 1 == 0 { 1 } else { -1 };
-            let sp = 50 + (self.rnd() % 90) as i32;
-            let inw = 14 + (self.rnd() % 26) as i32;
-            self.embers[e] = [
+            let sp = 40 + (self.rnd() % 130) as i32;
+            let inw = 8 + (self.rnd() % 40) as i32;
+            self.embers[i] = [
                 (CX << 8) + r0 * dx,
                 (CY << 8) + r0 * dy,
                 (-dy * t_sign * sp - dx * inw) >> 8,
                 (dx * t_sign * sp - dy * inw) >> 8,
-                (9 + (self.rnd() % 7)) as i32,
+                (12 + (self.rnd() % 12)) as i32,
             ];
+            made += 1;
         }
     }
 
-    /// Advance + draw embers: 2×2 white-hot dots, per-channel MAX over the
-    /// glow (idempotent layering; erased by the band rewrite next frame).
+    /// Advance + draw embers: a soft white-hot blob (size grows with life)
+    /// plus a dim single-pixel comet trail at the previous position, both
+    /// MAX-blended over the glow and clamped to the annulus.
     fn step_embers(&mut self, fb: &mut [u8], lut: &[(u8, u8); 256]) {
-        for e in self.embers.iter_mut() {
+        for i in 0..EMBER_N {
+            let e = &mut self.embers[i];
             if e[4] <= 0 {
                 continue;
             }
             e[4] -= 1;
+            let (px0, py0) = (e[0] >> 8, e[1] >> 8);
             e[0] += e[2];
             e[1] += e[3];
-            e[2] = e[2] * 243 / 256;
-            e[3] = e[3] * 243 / 256;
-            let v = (170 + e[4] * 12).min(255) as usize;
-            let (hi, lo) = lut[v];
-            let new = ((hi as u16) << 8) | lo as u16;
+            e[2] = e[2] * 240 / 256;
+            e[3] = e[3] * 240 / 256;
+            let life = e[4];
             let (x0, y0) = (e[0] >> 8, e[1] >> 8);
-            for (px, py) in [(x0, y0), (x0 + 1, y0), (x0, y0 + 1), (x0 + 1, y0 + 1)] {
-                if px < 0 || px >= W || py < 0 || py >= H {
-                    continue;
-                }
-                let idx = ((py * W + px) * 2) as usize;
-                if idx + 1 >= fb.len() {
-                    continue;
-                }
-                let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
-                let m = ((new >> 11).max(old >> 11) << 11)
-                    | (((new >> 5) & 0x3F).max((old >> 5) & 0x3F) << 5)
-                    | (new & 0x1F).max(old & 0x1F);
-                fb[idx] = (m >> 8) as u8;
-                fb[idx + 1] = m as u8;
-            }
+            let v = (150 + life * 9).min(255) as usize;
+            let r = if life > 14 { 2 } else if life > 5 { 1 } else { 0 };
+            ember_blob(fb, lut, x0, y0, r, v);
+            ember_blob(fb, lut, px0, py0, 0, v * 2 / 5);
         }
     }
 
@@ -1368,6 +1384,47 @@ fn diamond_angle(dx: i32, dy: i32) -> u8 {
         (false, false) => 192 + ((ay << 6) / d),
     };
     a as u8
+}
+
+/// Soft ember blob (radius r, quadratic falloff; r=0 = single pixel),
+/// MAX-blended through the live LUT and clamped to the flourish annulus so
+/// the next frame's band rewrite always erases it — never a stuck speck
+/// over the clock inside the ring.
+fn ember_blob(fb: &mut [u8], lut: &[(u8, u8); 256], cx: i32, cy: i32, r: i32, vpeak: usize) {
+    let denom = (r * r + r).max(1);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = dx * dx + dy * dy;
+            if d2 > r * r + r {
+                continue;
+            }
+            let (x, y) = (cx + dx, cy + dy);
+            if x < 0 || x >= W || y < 0 || y >= H {
+                continue;
+            }
+            let rr2 = (x - CX) * (x - CX) + (y - CY) * (y - CY);
+            if rr2 < FL_R_IN2 || rr2 > FL_R_OUT2 {
+                continue;
+            }
+            let v = if r == 0 {
+                vpeak
+            } else {
+                vpeak * (denom - d2).max(0) as usize / denom as usize
+            };
+            let idx = ((y * W + x) * 2) as usize;
+            if idx + 1 >= fb.len() {
+                continue;
+            }
+            let (hi, lo) = lut[v.min(255)];
+            let new = ((hi as u16) << 8) | lo as u16;
+            let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
+            let m = ((new >> 11).max(old >> 11) << 11)
+                | (((new >> 5) & 0x3F).max((old >> 5) & 0x3F) << 5)
+                | (new & 0x1F).max(old & 0x1F);
+            fb[idx] = (m >> 8) as u8;
+            fb[idx + 1] = m as u8;
+        }
+    }
 }
 
 /// Unit direction (Q8) for a diamond pseudo-angle.
