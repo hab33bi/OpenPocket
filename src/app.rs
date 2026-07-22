@@ -398,7 +398,7 @@ impl<'a, 'd> App<'a, 'd> {
             if let Some(v) = wheel_flick {
                 self.wheel_interact(
                     None,
-                    v * 3 / 2,
+                    v,
                     &mut wheel_s_q8,
                     &now,
                     wheel_batt,
@@ -851,30 +851,47 @@ impl<'a, 'd> App<'a, 'd> {
     }
 
     /// Wheel interaction umbrella: track → coast → (regrab?) → track …
-    /// A touch during any phase catches the wheel instantly.
+    /// A touch during any phase catches the wheel instantly. Momentum is
+    /// ADDITIVE across quick successive flicks: a regrab-flick in the
+    /// glide's direction stacks onto the surviving momentum; an opposite
+    /// flick (or a long deliberate drag) starts fresh — the finger already
+    /// braked the wheel by tracking it 1:1.
     fn wheel_interact(
         &mut self,
         mut grab: Option<(SwipeDir, u16)>,
-        mut vel: i32,
+        vel_raw: i32,
         s_q8: &mut i32,
         now: &WallTime,
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
     ) {
+        let mut vel = wheel_power(vel_raw);
+        let mut carry: i32 = 0;
         loop {
             if let Some((d, ds)) = grab.take() {
-                vel = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp);
+                let (rel, held_ms) = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp);
+                let flick = wheel_power(rel);
+                vel = if held_ms <= CHAIN_HOLD_MS && flick != 0 && flick.signum() == carry.signum()
+                {
+                    (carry + flick).clamp(-V_MAX_Q8, V_MAX_Q8)
+                } else {
+                    flick
+                };
             }
-            grab = self.wheel_coast(s_q8, vel, now, batt, anim_start, tp);
-            if grab.is_none() {
-                break;
+            match self.wheel_coast(s_q8, vel, now, batt, anim_start, tp) {
+                None => break,
+                Some((dir, dist, c)) => {
+                    grab = Some((dir, dist));
+                    carry = c;
+                }
             }
         }
     }
 
     /// Finger-tracked scroll: true 1:1 (rubber band past the ends). Returns
-    /// the release velocity (sign in scroll space).
+    /// the release velocity (sign in scroll space) and how long the finger
+    /// held the wheel — a short hold keeps a prior glide's momentum alive.
     fn wheel_track(
         &mut self,
         dir: SwipeDir,
@@ -884,11 +901,12 @@ impl<'a, 'd> App<'a, 'd> {
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
-    ) -> i32 {
+    ) -> (i32, u32) {
         let sign: i32 = match dir {
             SwipeDir::Up => 1,
             SwipeDir::Down => -1,
         };
+        let t0 = Instant::now();
         let s_start = *s_q8;
         let mut target = s_start + sign * ((start_dist as i32) << 8);
         loop {
@@ -897,7 +915,9 @@ impl<'a, 'd> App<'a, 'd> {
                 GestureEvent::DragMove { dist, .. } => {
                     target = s_start + sign * ((dist as i32) << 8);
                 }
-                GestureEvent::DragEnd { vel_q8, .. } => return sign * vel_q8,
+                GestureEvent::DragEnd { vel_q8, .. } => {
+                    return (sign * vel_q8, t0.elapsed().as_millis() as u32);
+                }
                 _ => {}
             }
             let t_eff = wheel_rubber(target, wheel_s_max());
@@ -919,8 +939,10 @@ impl<'a, 'd> App<'a, 'd> {
     /// row, and decelerate STRAIGHT to that row as one continuous motion —
     /// no free coast, no boundary bounce (an overshooting fling dampens onto
     /// the first/last row, never reverses), no disjoint snap. Fully
-    /// interruptible: a new drag returns Some(grab); a plain touch catches
-    /// the wheel and the lift settles it.
+    /// interruptible: a new drag returns Some((grab, carry)) with the
+    /// momentum that survives into the regrab; a whole-flick that fits in
+    /// one poll gap (salvaged DragEnd) injects ADDITIVELY right here —
+    /// same direction stacks, opposite brakes/reverses.
     fn wheel_coast(
         &mut self,
         s_q8: &mut i32,
@@ -929,7 +951,7 @@ impl<'a, 'd> App<'a, 'd> {
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
-    ) -> Option<(SwipeDir, u16)> {
+    ) -> Option<(SwipeDir, u16, i32)> {
         // iOS-FAST deceleration (the picker rate): f = 199/256 per 25 ms
         // (≈0.99/ms). Projection horizon K = dt/(1−f) = 25·256/57 ≈ 112 ms —
         // a medium flick lands 2–4 rows away, considered, picker-like.
@@ -943,28 +965,72 @@ impl<'a, 'd> App<'a, 'd> {
         let nearest = |s: i32| -> i32 {
             ((s + pitch_q8 / 2) / pitch_q8).clamp(0, wheel::rows() as i32 - 1) * pitch_q8
         };
-        let mut target = if v0_q8.abs() < FLING_FLOOR_Q8 {
-            nearest(*s_q8)
-        } else {
-            let proj = (*s_q8 as i64 + v0_q8 as i64 * K_MS as i64).clamp(0, s_max as i64) as i32;
-            nearest(proj)
+        let project = |s: i32, v: i32| -> i32 {
+            if v.abs() < FLING_FLOOR_Q8 {
+                nearest(s)
+            } else {
+                nearest((s as i64 + v as i64 * K_MS as i64).clamp(0, s_max as i64) as i32)
+            }
         };
+        let mut target = project(*s_q8, v0_q8);
+        if v0_q8 != 0 {
+            println!("wheel: glide v={v0_q8} -> row {}", target / pitch_q8);
+        }
         // Velocity that lands exactly on the target under the decay — for an
         // unclamped projection this ≈ v0 (continuity); for a clamped one it
         // becomes a smooth damped approach to the edge row.
         let mut v_q8 = (target - *s_q8) / K_MS;
         let mut dt_ms: i32 = 25;
+        // Momentum frozen by a catch — survives a quick touch, dies of age.
+        let mut carry: i32 = 0;
+        let mut carry_at: u32 = 0;
 
         loop {
             let fs = Instant::now();
             let now_ms = anim_start.elapsed().as_millis() as u32;
-            if let GestureEvent::DragStart { dir, dist, .. } = self.poll_touch_once(tp, now_ms) {
-                return Some((dir, dist));
+            let live = |v: i32| -> i32 {
+                if v != 0 {
+                    v
+                } else if now_ms.wrapping_sub(carry_at) <= CHAIN_HOLD_MS {
+                    carry
+                } else {
+                    0
+                }
+            };
+            match self.poll_touch_once(tp, now_ms) {
+                GestureEvent::DragStart { dir, dist, .. } => {
+                    return Some((dir, dist, live(v_q8)));
+                }
+                // Whole flick inside one poll gap while gliding: inject it
+                // additively without ever leaving the glide.
+                GestureEvent::DragEnd { dir, vel_q8: rel, .. } => {
+                    let sign: i32 = match dir {
+                        SwipeDir::Up => 1,
+                        SwipeDir::Down => -1,
+                    };
+                    let flick = wheel_power(sign * rel);
+                    let cur = live(v_q8);
+                    v_q8 = if flick != 0 && flick.signum() == cur.signum() {
+                        (cur + flick).clamp(-V_MAX_Q8, V_MAX_Q8)
+                    } else {
+                        flick
+                    };
+                    carry = 0;
+                    target = project(*s_q8, v_q8);
+                    println!("wheel: chain v={v_q8} -> row {}", target / pitch_q8);
+                    v_q8 = (target - *s_q8) / K_MS;
+                }
+                _ => {}
             }
             if self.swipe.finger_down() {
-                // Caught: freeze under the finger; land on the nearest row
-                // after the lift.
-                v_q8 = 0;
+                // Caught: freeze under the finger; the momentum survives a
+                // short touch (quick re-flick) and a slow lift lands on the
+                // nearest row.
+                if v_q8 != 0 {
+                    carry = v_q8;
+                    carry_at = now_ms;
+                    v_q8 = 0;
+                }
                 target = nearest(*s_q8);
                 core::hint::spin_loop();
                 continue;
@@ -1064,6 +1130,22 @@ impl<'a, 'd> App<'a, 'd> {
 /// Wheel scroll range (Q8): rows 0..N-1, row N-1 rests at (N-1)·PITCH.
 fn wheel_s_max() -> i32 {
     ((wheel::rows() as i32 - 1) * wheel::PITCH_PX) << 8
+}
+
+/// Flick power reference (Q8 px/ms): at |v|=V_REF the curve doubles the
+/// velocity; well below it the response is near-linear.
+const V_REF_Q8: i32 = 700;
+/// Momentum ceiling — additive chaining can't run away past this.
+const V_MAX_Q8: i32 = 4000;
+/// A touch shorter than this keeps a prior glide's momentum alive; longer
+/// means a deliberate grab and the old momentum dies.
+const CHAIN_HOLD_MS: u32 = 300;
+
+/// Continuous flick power curve: v_eff = v·(1 + |v|/V_REF). Reach grows
+/// superlinearly with flick speed — gentle ≈1–2 rows, a normal flick ≈3–5,
+/// a hard flick rails to the first/last row (projection clamps to the list).
+fn wheel_power(v: i32) -> i32 {
+    (v + v.saturating_mul(v.abs()) / V_REF_Q8).clamp(-V_MAX_Q8, V_MAX_Q8)
 }
 
 /// Progressive rubber band past the wheel's ends (Apple's curve, integer

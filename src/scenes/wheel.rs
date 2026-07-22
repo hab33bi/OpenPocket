@@ -146,6 +146,27 @@ pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8:
     let saber = saber_lut(0);
     let s_px = s_q8 >> 8;
 
+    // Pass 1 — glow halos only. Glow is the BOTTOM layer everywhere: during
+    // a fast scroll the 96 px halo overlaps neighbor rows' icons (and two
+    // adjacent rows can both glow mid-transition), so every halo must be on
+    // canvas before any icon — the stacking is then correct by construction.
+    for i in 0..WHEEL_APPS.len() {
+        let y_c = CY + i as i32 * PITCH - s_px;
+        if y_c < -PITCH || y_c > H + PITCH {
+            continue;
+        }
+        let (alpha, t) = row_alpha(y_c);
+        if alpha == 0 || t <= 128 {
+            continue;
+        }
+        let wl = ((t - 160) * 4).clamp(0, 256);
+        let cx_s = icon_center_x(y_c, ICON_S_PX);
+        let cx_l = icon_center_x(y_c, ICON_L_PX);
+        let cx = cx_s + (((cx_l - cx_s) * wl) >> 8);
+        blit_glow(fb, &saber, cx, y_c, (t - 128) * 2);
+    }
+
+    // Pass 2 — icons + labels, composited OVER whatever glow lies beneath.
     for (i, app) in WHEEL_APPS.iter().enumerate() {
         let y_c = CY + i as i32 * PITCH - s_px;
         if y_c < -PITCH || y_c > H + PITCH {
@@ -155,19 +176,14 @@ pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8:
         if alpha == 0 {
             continue;
         }
-        // Continuous size interpolation: crossfade the two pre-rendered
-        // sizes (icons AND labels) through a NARROW focus band (t 160..224)
-        // that resting rows never occupy — the focused row (t=256) is purely
-        // large, resting neighbors (t=128) purely small; the crossfade only
-        // exists mid-scroll. (A wide band left neighbors permanently
-        // double-rendered.)
+        // Continuous size interpolation through a NARROW focus band
+        // (t 160..224) that resting rows never occupy — the focused row
+        // (t=256) is purely large, resting neighbors (t=128) purely small;
+        // the transition only exists mid-scroll.
         let wl = ((t - 160) * 4).clamp(0, 256);
         let cx_s = icon_center_x(y_c, ICON_S_PX);
         let cx_l = icon_center_x(y_c, ICON_L_PX);
         let cx = cx_s + (((cx_l - cx_s) * wl) >> 8);
-        if t > 128 {
-            blit_glow(fb, &saber, cx, y_c, (t - 128) * 2);
-        }
         // TRUE size interpolation: mid-transition, render the large sprite
         // bilinearly scaled to the exact intermediate size. At rest (wl 0 or
         // 256) the pixel-perfect pre-rendered sizes are used, so the crisp
@@ -220,9 +236,17 @@ pub fn tick_ring(wfb: &mut WatchFb, elapsed_ms: u32, focused: usize) {
     let icon_cx = icon_center_x(y_c, px);
 
     let fb = wfb.buf_mut();
+    let s = GLOW_RING_PX / 2;
+    // Clear the tick rect first: the icon composites source-over, and
+    // re-compositing over its own previous output would brighten AA edges
+    // frame over frame. From black, every tick is bit-identical.
+    for y in (y_c - s).max(0)..(y_c + s).min(H) {
+        let a = ((y * W + (icon_cx - s).max(0)) * 2) as usize;
+        let b = ((y * W + (icon_cx + s).min(W)) * 2) as usize;
+        fb[a..b].fill(0);
+    }
     blit_glow(fb, &saber, icon_cx, y_c, 256);
     blit_icon(fb, app.icon_l, px, icon_cx, y_c, 256);
-    let s = GLOW_RING_PX / 2;
     wfb.mark_rect(icon_cx - s, y_c - s, icon_cx + s, y_c + s);
 }
 
@@ -302,8 +326,16 @@ fn blit_glow(fb: &mut [u8], lut: &[(u8, u8); 256], cx: i32, cy: i32, alpha: i32)
             let (hi, lo) = lut[((a * alpha) >> 8).clamp(0, 255) as usize];
             let idx = ((y * W + x) * 2) as usize;
             if idx + 1 < fb.len() {
-                fb[idx] = hi;
-                fb[idx + 1] = lo;
+                // MAX-blend: overlapping halos (two adjacent glowing rows
+                // mid-scroll) merge seamlessly instead of the later one
+                // punching its square bounds into the earlier.
+                let new = ((hi as u16) << 8) | lo as u16;
+                let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
+                let px = ((new >> 11).max(old >> 11) << 11)
+                    | (((new >> 5) & 0x3F).max((old >> 5) & 0x3F) << 5)
+                    | (new & 0x1F).max(old & 0x1F);
+                fb[idx] = (px >> 8) as u8;
+                fb[idx + 1] = px as u8;
             }
         }
     }
@@ -491,26 +523,31 @@ fn draw_glyph(fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, alpha: i32) {
     }
 }
 
-/// Tinted MAX-blend write: per-channel max against what's already there.
-/// This is what makes the two-size crossfade read as one smoothly scaling
-/// element (overwrite-blending would punch the dimmer sprite into the
-/// brighter one), and it lets icons ride over the glow without dark halos.
+/// Tinted SOURCE-OVER write: v is coverage×row-alpha; out = tint·v +
+/// dst·(1−v). On the black canvas this renders identically to before, but
+/// over the glow the icon/text now genuinely COVERS it — a dim or scaled
+/// icon no longer loses per-channel to bright ring pixels (the old
+/// MAX-blend's split-second "icon sinks into the ring" on hard flicks).
 #[inline]
 fn write_tinted(fb: &mut [u8], x: i32, y: i32, v: i32) {
     let idx = ((y * W + x) * 2) as usize;
     if idx + 1 >= fb.len() {
         return;
     }
-    let r = (TINT.0 * v / 255).clamp(0, 255);
-    let g = (TINT.1 * v / 255).clamp(0, 255);
-    let b = (TINT.2 * v / 255).clamp(0, 255);
-    let nr = ((r as u16) * 31 / 255) & 0x1F;
-    let ng = ((g as u16) * 63 / 255) & 0x3F;
-    let nb = ((b as u16) * 31 / 255) & 0x1F;
+    let v = v.clamp(0, 255);
+    // Tint pre-quantized to 565 channel depth.
+    const TR5: i32 = TINT.0 * 31 / 255;
+    const TG6: i32 = TINT.1 * 63 / 255;
+    const TB5: i32 = TINT.2 * 31 / 255;
     let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
-    let r5 = (old >> 11).max(nr);
-    let g6 = ((old >> 5) & 0x3F).max(ng);
-    let b5 = (old & 0x1F).max(nb);
+    let (or5, og6, ob5) = (
+        (old >> 11) as i32,
+        ((old >> 5) & 0x3F) as i32,
+        (old & 0x1F) as i32,
+    );
+    let r5 = (or5 + (TR5 - or5) * v / 255) as u16 & 0x1F;
+    let g6 = (og6 + (TG6 - og6) * v / 255) as u16 & 0x3F;
+    let b5 = (ob5 + (TB5 - ob5) * v / 255) as u16 & 0x1F;
     let px = (r5 << 11) | (g6 << 5) | b5;
     fb[idx] = (px >> 8) as u8;
     fb[idx + 1] = px as u8;
