@@ -12,7 +12,7 @@
 use alloc::vec;
 
 use esp_hal::clock::CpuClock;
-use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
+use esp_hal::dma::DmaTxBuf;
 use esp_hal::dma_buffers;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout};
@@ -117,9 +117,12 @@ fn main() -> ! {
         .with_frequency(Rate::from_mhz(80))
         .with_mode(SpiMode::_0);
 
-    let (rx_buf, rx_desc, tx_buf, tx_desc) = dma_buffers!(DMA_CHUNK_BYTES);
-    let dma_rx = DmaRxBuf::new(rx_desc, rx_buf).unwrap();
-    let dma_tx = DmaTxBuf::new(tx_desc, tx_buf).unwrap();
+    // Two SRAM staging buffers for the ping-pong flush pipeline
+    // (docs/PIPELINE-PLAN.md): copy chunk N+1 while chunk N is on the wire.
+    let (_rx_a, _rxd_a, tx_buf_a, tx_desc_a) = dma_buffers!(0, DMA_CHUNK_BYTES);
+    let (_rx_b, _rxd_b, tx_buf_b, tx_desc_b) = dma_buffers!(0, DMA_CHUNK_BYTES);
+    let dma_tx_a = DmaTxBuf::new(tx_desc_a, tx_buf_a).unwrap();
+    let dma_tx_b = DmaTxBuf::new(tx_desc_b, tx_buf_b).unwrap();
 
     let spi = Spi::new(peripherals.SPI2, spi_config)
         .unwrap()
@@ -128,11 +131,10 @@ fn main() -> ! {
         .with_sio1(peripherals.GPIO5)
         .with_sio2(peripherals.GPIO6)
         .with_sio3(peripherals.GPIO7)
-        .with_dma(peripherals.DMA_CH0)
-        .with_buffers(dma_rx, dma_tx);
+        .with_dma(peripherals.DMA_CH0);
 
-    let mut bus = QspiBus::new(spi, lcd_cs);
-    println!("QSPI DMA {} KiB chunks @ 80 MHz", DMA_CHUNK_BYTES / 1024);
+    let mut bus = QspiBus::new(spi, lcd_cs, dma_tx_a, dma_tx_b);
+    println!("QSPI ping-pong DMA {} KiB staging x2 @ 80 MHz", DMA_CHUNK_BYTES / 1024);
 
     lcd_reset.set_high();
     delay_ms(10);

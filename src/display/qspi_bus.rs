@@ -1,12 +1,17 @@
-//! CO5300 QSPI transport — DMA pixel streaming from PSRAM framebuffer.
+//! CO5300 QSPI transport — ping-pong DMA pixel streaming (docs/PIPELINE-PLAN.md).
 //!
-//! ESP32-S3 GDMA can read external octal PSRAM (`dma_can_access_psram`). The
-//! `SpiDmaBus` HAL wrapper still copies each chunk into an internal DMA-capable
-//! buffer before TX; we minimise CPU work by storing the framebuffer as
-//! display-ready RGB565 big-endian bytes (no per-pixel swap).
+//! The old `SpiDmaBus` path copied every 8 KiB chunk PSRAM→SRAM and then
+//! blocked on its DMA — 54 serialized copy+wait rounds ≈ 24 ms per full
+//! frame, of which only ~10.9 ms is wire time (research: docs/research/
+//! PIPELINE-RESEARCH.md). This bus owns the lower-level `SpiDma` plus TWO
+//! SRAM staging buffers: while chunk N is on the wire, the CPU copies chunk
+//! N+1 into the other buffer, hiding the copy overhead behind the wire.
+//! Full-frame flush ≈ 12–14 ms, single core, retained canvas unchanged.
+//! Small command writes stay blocking (same driver path as before).
 
+use esp_hal::dma::DmaTxBuf;
 use esp_hal::gpio::Output;
-use esp_hal::spi::master::{Address, Command, DataMode, SpiDmaBus};
+use esp_hal::spi::master::{Address, Command, DataMode, SpiDma, SpiDmaTransfer};
 use esp_hal::Blocking;
 
 use crate::display::dmi::Span;
@@ -15,64 +20,91 @@ const QSPI_CMD_WRITE_REG: u16 = 0x02;
 const QSPI_CMD_WRITE_PIXELS: u16 = 0x32;
 const QSPI_ADDR_PIXEL_RAM: u32 = 0x003C00;
 
-/// 8 KiB chunks — fewer CS/DMA rounds than 4 KiB (Waveshare reference uses 8 KiB).
-pub const DMA_CHUNK_BYTES: usize = 8192;
+/// Staging chunk size — two of these live in internal SRAM. 16 KiB halves
+/// the round count vs the old 8 KiB while staying well under the 32,736 B
+/// single-DMA-transfer cap.
+pub const DMA_CHUNK_BYTES: usize = 16384;
+
+type Transfer<'d> = SpiDmaTransfer<'d, Blocking, DmaTxBuf>;
 
 pub struct QspiBus<'d> {
-    spi: SpiDmaBus<'d, Blocking>,
+    spi: Option<SpiDma<'d, Blocking>>,
+    bufs: [Option<DmaTxBuf>; 2],
     cs: Output<'d>,
 }
 
 impl<'d> QspiBus<'d> {
-    pub fn new(spi: SpiDmaBus<'d, Blocking>, cs: Output<'d>) -> Self {
-        Self { spi, cs }
+    pub fn new(
+        spi: SpiDma<'d, Blocking>,
+        cs: Output<'d>,
+        buf_a: DmaTxBuf,
+        buf_b: DmaTxBuf,
+    ) -> Self {
+        Self {
+            spi: Some(spi),
+            bufs: [Some(buf_a), Some(buf_b)],
+            cs,
+        }
     }
 
-    #[inline]
-    fn cs_low(&mut self) {
+    fn pixel_cmd(first: bool) -> (Command, Address) {
+        if first {
+            (
+                Command::_8Bit(QSPI_CMD_WRITE_PIXELS, DataMode::Single),
+                Address::_24Bit(QSPI_ADDR_PIXEL_RAM, DataMode::Single),
+            )
+        } else {
+            (Command::None, Address::None)
+        }
+    }
+
+    /// Kick a one-shot DMA write. A start error is a programming error
+    /// (length over the DMA cap) — panic loudly rather than limp.
+    fn start(
+        spi: SpiDma<'d, Blocking>,
+        buf: DmaTxBuf,
+        len: usize,
+        data_mode: DataMode,
+        cmd: Command,
+        addr: Address,
+    ) -> Transfer<'d> {
+        match spi.half_duplex_write(data_mode, cmd, addr, 0, len, buf) {
+            Ok(t) => t,
+            Err((e, _spi, _buf)) => panic!("qspi dma start: {:?}", e),
+        }
+    }
+
+    /// Blocking register write (init sequences, windows, brightness): the
+    /// exact same driver path the old SpiDmaBus wrapper used.
+    fn write_reg_blocking(&mut self, reg: u8, data: &[u8]) {
+        let spi = self.spi.take().unwrap();
+        let mut buf = self.bufs[0].take().unwrap();
+        buf.as_mut_slice()[..data.len()].copy_from_slice(data);
         self.cs.set_low();
-    }
-
-    #[inline]
-    fn cs_high(&mut self) {
+        let t = Self::start(
+            spi,
+            buf,
+            data.len(),
+            DataMode::Single,
+            Command::_8Bit(QSPI_CMD_WRITE_REG, DataMode::Single),
+            Address::_24Bit((reg as u32) << 8, DataMode::Single),
+        );
+        let (spi, buf) = t.wait();
         self.cs.set_high();
+        self.spi = Some(spi);
+        self.bufs[0] = Some(buf);
     }
 
     pub fn write_command(&mut self, reg: u8) {
-        self.cs_low();
-        let _ = self.spi.half_duplex_write(
-            DataMode::Single,
-            Command::_8Bit(QSPI_CMD_WRITE_REG, DataMode::Single),
-            Address::_24Bit((reg as u32) << 8, DataMode::Single),
-            0,
-            &[],
-        );
-        self.cs_high();
+        self.write_reg_blocking(reg, &[]);
     }
 
     pub fn write_c8d8(&mut self, reg: u8, data: u8) {
-        self.cs_low();
-        let _ = self.spi.half_duplex_write(
-            DataMode::Single,
-            Command::_8Bit(QSPI_CMD_WRITE_REG, DataMode::Single),
-            Address::_24Bit((reg as u32) << 8, DataMode::Single),
-            0,
-            &[data],
-        );
-        self.cs_high();
+        self.write_reg_blocking(reg, &[data]);
     }
 
     pub fn write_c8d16d16(&mut self, reg: u8, d1: u16, d2: u16) {
-        let data = [(d1 >> 8) as u8, d1 as u8, (d2 >> 8) as u8, d2 as u8];
-        self.cs_low();
-        let _ = self.spi.half_duplex_write(
-            DataMode::Single,
-            Command::_8Bit(QSPI_CMD_WRITE_REG, DataMode::Single),
-            Address::_24Bit((reg as u32) << 8, DataMode::Single),
-            0,
-            &data,
-        );
-        self.cs_high();
+        self.write_reg_blocking(reg, &[(d1 >> 8) as u8, d1 as u8, (d2 >> 8) as u8, d2 as u8]);
     }
 
     /// Set the CO5300 drawing window (inclusive panel coords; caller applies
@@ -82,10 +114,9 @@ impl<'d> QspiBus<'d> {
         self.write_c8d16d16(0x2B, y0, y1);
     }
 
-    /// Partial flush of dirty row spans (P3, docs/09): window the panel per
-    /// dirty region and DMA only those bytes. Runs of consecutive rows with
-    /// identical x-extent (what rect damage decomposes into) share one window,
-    /// so command overhead is paid per rect, not per row.
+    /// Partial flush of dirty row spans: window the panel per dirty region
+    /// and DMA only those bytes. Runs of consecutive rows with identical
+    /// x-extent share one window, so command overhead is paid per rect.
     pub fn flush_spans(&mut self, fb: &[u8], spans: &[Span], fb_width: u16, col_offset: u16) {
         let mut i = 0usize;
         while i < spans.len() {
@@ -104,13 +135,14 @@ impl<'d> QspiBus<'d> {
         }
     }
 
-    /// Window one rect and stream its rows (each ≤ 932 B, under the DMA chunk).
-    /// First row carries the pixel-write command; the rest continue with CS held.
+    /// Window one rect and stream its rows, batching as many rows as fit
+    /// into each staging buffer and ping-ponging the two buffers (copy the
+    /// next batch while the previous is on the wire). Row boundaries mean
+    /// nothing to the panel — the window fills from a continuous burst.
     ///
-    /// CO5300 windows must be 2-px aligned (start even, end odd — panel RAM is
-    /// written in 2-pixel units; unaligned windows displace pixels). Expand the
-    /// rect outward to alignment — extra flushed pixels carry correct fb data.
-    /// The panel col offset (6) is even, so fb-space alignment holds on-panel.
+    /// CO5300 windows must be 2-px aligned (start even, end odd — panel RAM
+    /// is written in 2-pixel units; unaligned windows displace pixels).
+    /// Expand outward; extra flushed pixels carry correct fb data.
     fn flush_rect(
         &mut self,
         fb: &[u8],
@@ -130,67 +162,86 @@ impl<'d> QspiBus<'d> {
         self.write_command(0x2C);
 
         let row_len = (x1 - x0 + 1) as usize * 2;
-        self.cs_low();
-        let mut first = true;
-        for y in y0..=y1 {
-            let start = (y as usize * fb_width as usize + x0 as usize) * 2;
-            let Some(row) = fb.get(start..start + row_len) else {
-                break;
-            };
-            let _ = if first {
-                first = false;
-                self.spi.half_duplex_write(
-                    DataMode::Quad,
-                    Command::_8Bit(QSPI_CMD_WRITE_PIXELS, DataMode::Single),
-                    Address::_24Bit(QSPI_ADDR_PIXEL_RAM, DataMode::Single),
-                    0,
-                    row,
-                )
-            } else {
-                self.spi
-                    .half_duplex_write(DataMode::Quad, Command::None, Address::None, 0, row)
-            };
+        let mut y = y0 as usize;
+        let y_end = y1 as usize;
+
+        let spi = self.spi.take().unwrap();
+        let mut a = self.bufs[0].take().unwrap();
+        let b = self.bufs[1].take().unwrap();
+        let cap = a.capacity().min(DMA_CHUNK_BYTES);
+
+        let fill = |buf: &mut DmaTxBuf, y: &mut usize| -> usize {
+            let mut n = 0usize;
+            while *y <= y_end && n + row_len <= cap {
+                let start = (*y * fb_width as usize + x0 as usize) * 2;
+                if let Some(row) = fb.get(start..start + row_len) {
+                    buf.as_mut_slice()[n..n + row_len].copy_from_slice(row);
+                    n += row_len;
+                }
+                *y += 1;
+            }
+            n
+        };
+
+        self.cs.set_low();
+        let n0 = fill(&mut a, &mut y);
+        if n0 == 0 {
+            self.cs.set_high();
+            self.spi = Some(spi);
+            self.bufs = [Some(a), Some(b)];
+            return;
         }
-        self.cs_high();
+        let (cmd, addr) = Self::pixel_cmd(true);
+        let mut t = Self::start(spi, a, n0, DataMode::Quad, cmd, addr);
+        let mut spare = b;
+        loop {
+            let n = fill(&mut spare, &mut y);
+            if n == 0 {
+                break;
+            }
+            let (s, used) = t.wait();
+            let (cmd, addr) = Self::pixel_cmd(false);
+            t = Self::start(s, spare, n, DataMode::Quad, cmd, addr);
+            spare = used;
+        }
+        let (s, used) = t.wait();
+        self.cs.set_high();
+        self.spi = Some(s);
+        self.bufs = [Some(used), Some(spare)];
     }
 
-    /// Stream a PSRAM (or SRAM) RGB565 BE byte buffer to the panel via QSPI DMA.
-    /// Direct from PSRAM slice (no scratch copy) to let GDMA read PSRAM directly where supported.
-    /// This uses DMA + PSRAM better for higher FPS.
+    /// Stream a full RGB565-BE buffer to the panel: ping-pong DMA — the CPU
+    /// copies chunk N+1 from PSRAM into one staging buffer while chunk N
+    /// flies from the other.
     pub fn flush_bytes(&mut self, pixels_be: &[u8]) {
         if pixels_be.is_empty() {
             return;
         }
+        let spi = self.spi.take().unwrap();
+        let mut a = self.bufs[0].take().unwrap();
+        let b = self.bufs[1].take().unwrap();
+        let cap = a.capacity().min(DMA_CHUNK_BYTES);
+        let len = pixels_be.len();
 
-        let mut idx = 0usize;
-        let mut first = true;
-
-        self.cs_low();
-        while idx < pixels_be.len() {
-            let chunk = (pixels_be.len() - idx).min(DMA_CHUNK_BYTES);
-            let chunk_slice = &pixels_be[idx..idx + chunk];
-
-            let _ = if first {
-                first = false;
-                self.spi.half_duplex_write(
-                    DataMode::Quad,
-                    Command::_8Bit(QSPI_CMD_WRITE_PIXELS, DataMode::Single),
-                    Address::_24Bit(QSPI_ADDR_PIXEL_RAM, DataMode::Single),
-                    0,
-                    chunk_slice,
-                )
-            } else {
-                self.spi.half_duplex_write(
-                    DataMode::Quad,
-                    Command::None,
-                    Address::None,
-                    0,
-                    chunk_slice,
-                )
-            };
-
-            idx += chunk;
+        self.cs.set_low();
+        let n0 = len.min(cap);
+        a.as_mut_slice()[..n0].copy_from_slice(&pixels_be[..n0]);
+        let (cmd, addr) = Self::pixel_cmd(true);
+        let mut t = Self::start(spi, a, n0, DataMode::Quad, cmd, addr);
+        let mut idx = n0;
+        let mut spare = b;
+        while idx < len {
+            let n = (len - idx).min(cap);
+            spare.as_mut_slice()[..n].copy_from_slice(&pixels_be[idx..idx + n]);
+            idx += n;
+            let (s, used) = t.wait();
+            let (cmd, addr) = Self::pixel_cmd(false);
+            t = Self::start(s, spare, n, DataMode::Quad, cmd, addr);
+            spare = used;
         }
-        self.cs_high();
+        let (s, used) = t.wait();
+        self.cs.set_high();
+        self.spi = Some(s);
+        self.bufs = [Some(used), Some(spare)];
     }
 }
