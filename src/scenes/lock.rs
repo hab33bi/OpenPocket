@@ -464,6 +464,13 @@ impl Clock {
         core::str::from_utf8(&self.date_buf[..self.date_len]).unwrap_or("")
     }
 
+    /// Format + return the date line for external composers (the unlock
+    /// morph fades it out in place).
+    pub fn date_line(&mut self, now: &WallTime) -> &str {
+        self.format_date(now);
+        self.date_str()
+    }
+
     /// Repaint the whole lock scene from scratch (returning from another scene
     /// that overwrote the canvas). Ring lands complete + static; text is
     /// painted at rest AND registered in the retained-text cache — leaving the

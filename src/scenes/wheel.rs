@@ -76,10 +76,19 @@ impl WheelFx {
     pub fn invalidate(&mut self) {
         self.seeded = false;
     }
+    /// External composer hand-off (unlock morph): take ownership of the
+    /// canvas WITHOUT clearing it — the black base + lock ring stay put.
+    /// Rects pushed before the next draw_scroll queue foreign content
+    /// (the resting lock text) for its targeted erase.
+    pub fn seed_silent(&mut self) {
+        self.seeded = true;
+        self.n = 0;
+        self.intro = None;
+    }
     pub fn intro_active(&self) -> bool {
         self.intro.is_some()
     }
-    fn push(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+    pub fn push(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         if self.n < FX_RECTS {
             self.rects[self.n] = (x0 as i16, y0 as i16, x1 as i16, y1 as i16);
             self.n += 1;
@@ -95,9 +104,13 @@ fn grow(d: &mut (i32, i32, i32, i32), x0: i32, y0: i32, x1: i32, y1: i32) {
     d.3 = d.3.max(y1);
 }
 
-/// Status line, top-center: HH:MM, plus battery when present.
-fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
-    let mut s = [0u8; 12];
+/// Status line baseline / alpha (public: the unlock morph lands the lock
+/// digits exactly on this slot — the ONE fixed point of the whole UI).
+pub const STATUS_BASE_Y: i32 = 52;
+pub const STATUS_ALPHA: i32 = 200;
+
+/// Format the status line ("HH:MM" + " | 87%" when battery is known).
+fn status_str(now: &WallTime, battery: Option<u8>, s: &mut [u8; 12]) -> usize {
     let mut n = 0;
     s[n] = b'0' + now.hour / 10;
     s[n + 1] = b'0' + now.hour % 10;
@@ -126,9 +139,44 @@ fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
         s[n] = b'%';
         n += 1;
     }
+    n
+}
+
+/// Status line, top-center: HH:MM, plus battery when present.
+fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
+    let mut s = [0u8; 12];
+    let n = status_str(now, battery, &mut s);
     let text = core::str::from_utf8(&s[..n]).unwrap_or("");
     let w = text_width(text, &lock::TEXT_GLYPHS);
-    draw_text_at(fb, text, CX - w / 2, 52, 200, &lock::TEXT_GLYPHS);
+    draw_text_at(fb, text, CX - w / 2, STATUS_BASE_Y, STATUS_ALPHA, &lock::TEXT_GLYPHS);
+}
+
+/// Where the status line will rest for this time/battery: (left x of the
+/// full string, width of its "HH:MM" head, full width). The unlock morph
+/// flies the lock digits to exactly the head's slot so the hand-off to
+/// draw_status is position-perfect.
+pub fn status_metrics(now: &WallTime, battery: Option<u8>) -> (i32, i32, i32) {
+    let mut s = [0u8; 12];
+    let n = status_str(now, battery, &mut s);
+    let text = core::str::from_utf8(&s[..n]).unwrap_or("");
+    let w = text_width(text, &lock::TEXT_GLYPHS);
+    let head = text_width(&text[..5.min(text.len())], &lock::TEXT_GLYPHS);
+    (CX - w / 2, head, w)
+}
+
+/// The status line MINUS its "HH:MM" head (the " | 87%" tail), drawn at
+/// its exact resting position — faded in over the last stretch of the
+/// unlock morph while the digits are still flying in.
+pub fn draw_status_tail(fb: &mut [u8], now: &WallTime, battery: Option<u8>, alpha: i32) {
+    let mut s = [0u8; 12];
+    let n = status_str(now, battery, &mut s);
+    if n <= 5 {
+        return;
+    }
+    let text = core::str::from_utf8(&s[..n]).unwrap_or("");
+    let w = text_width(text, &lock::TEXT_GLYPHS);
+    let head = text_width(&text[..5], &lock::TEXT_GLYPHS);
+    draw_text_at(fb, &text[5..], CX - w / 2 + head, STATUS_BASE_Y, alpha, &lock::TEXT_GLYPHS);
 }
 
 /// Scroll-tracked frame: rows positioned by the continuous offset `s_q8`
@@ -141,6 +189,12 @@ fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
 /// and size scaling switches to nearest-neighbor — both restored
 /// automatically in the slow landing frames. While `fx.intro` runs, rows
 /// still rise/fade in as the wheel scrolls underneath them.
+///
+/// `reveal` = the unlock morph's scrub (0..=256 sheet progress): rows
+/// reveal as the (invisible, black-on-black) sheet boundary rises past
+/// them — bottom rows first, the focused center row last — tracked 1:1 by
+/// the finger. The status line is suppressed while scrubbed: the morphing
+/// lock digits ARE the status-line-to-be.
 pub fn draw_scroll(
     wfb: &mut WatchFb,
     now: &WallTime,
@@ -148,8 +202,13 @@ pub fn draw_scroll(
     s_q8: i32,
     fx: &mut WheelFx,
     fast: bool,
+    reveal: Option<i32>,
 ) {
-    // Entrance-reveal clock: advances once per rendered frame.
+    // Entrance-reveal clock: advances once per rendered frame (idle while
+    // the reveal is scrubbed externally by the unlock morph).
+    if reveal.is_some() {
+        fx.intro = None;
+    }
     let intro_f = fx.intro;
     if let Some(f) = intro_f {
         fx.intro = if f + 1 >= INTRO_FRAMES { None } else { Some(f + 1) };
@@ -206,7 +265,21 @@ pub fn draw_scroll(
             continue;
         }
         let (mut y_d, mut a, mut p) = (y_c, alpha, 256);
-        if let Some(f) = intro_f {
+        if let Some(pv) = reveal {
+            // Sheet-boundary reveal: a row starts rising when the boundary
+            // reaches its bottom edge and lands over ~110 px of further
+            // boundary travel — scrub back down and it sinks away again.
+            let b_vis = H - ((pv * H) >> 8);
+            let pr = (((y_c + PITCH / 2 - b_vis) * 256) / 110).clamp(0, 256);
+            if pr == 0 {
+                continue;
+            }
+            let inv = 256 - pr;
+            let pe = 256 - ((((inv * inv) >> 8) * inv) >> 8);
+            y_d = y_c + ((256 - pe) * INTRO_RISE_PX >> 8);
+            a = (alpha * pe) >> 8;
+            p = pe;
+        } else if let Some(f) = intro_f {
             let p_lin =
                 (((f as i32 - INTRO_STAG_F * i as i32) * 256) / INTRO_RISE_F).clamp(0, 256);
             if p_lin == 0 {
@@ -295,9 +368,12 @@ pub fn draw_scroll(
 
     // Status line: topmost layer, redrawn EVERY frame and tracked in the
     // rect cache — scrolling rows overlapping its band get cleared like
-    // any content, so the clock can never be left erased.
-    draw_status(fb, now, battery);
-    fx.push(CX - 110, 26, CX + 110, 66);
+    // any content, so the clock can never be left erased. Suppressed while
+    // the unlock morph scrubs (its flying digits own that slot).
+    if reveal.is_none() {
+        draw_status(fb, now, battery);
+        fx.push(CX - 110, 26, CX + 110, 66);
+    }
 
     // Damage: one union bbox (old content + new content). A single rect
     // keeps the DMI at one equal span per row, which flush_spans folds
@@ -505,7 +581,7 @@ fn blit_icon_scaled(
 
 /// Per-glyph scaled text from the large atlas (scale_q8 ≤ 256) — used only
 /// mid-transition. `fast` = nearest-neighbor sampling (motion LOD).
-fn draw_text_scaled(
+pub fn draw_text_scaled(
     fb: &mut [u8],
     text: &str,
     left_x: i32,
@@ -580,7 +656,7 @@ fn draw_glyph_scaled(
     }
 }
 
-fn draw_text_at(
+pub fn draw_text_at(
     fb: &mut [u8],
     text: &str,
     left_x: i32,
@@ -598,7 +674,7 @@ fn draw_text_at(
     }
 }
 
-fn text_width(text: &str, glyphs: &[Option<Glyph>; 128]) -> i32 {
+pub fn text_width(text: &str, glyphs: &[Option<Glyph>; 128]) -> i32 {
     let mut w = 0;
     for ch in text.chars() {
         if let Some(g) = lock::get_glyph(glyphs, ch) {

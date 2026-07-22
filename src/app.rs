@@ -1,12 +1,15 @@
-//! Application scene machine + frame loop (docs/ROADMAP.md M4).
+//! Application scene machine + frame loop (docs/ROADMAP.md M4, W3).
 //!
-//! The unlock model is one variable: the **sheet height** `b` (0..=H).
-//! Rows `[0..b)` show the lock sheet (black + ring at scrub-tracked brightness
-//! + time/date sliding with the sheet); rows `[b..H)` show the unlock image.
-//! Locked ⇔ b = H, Unlocked ⇔ b = 0. A swipe-up drag maps `b = H − dist`;
-//! a swipe-down (relock) drag maps `b = dist` — one incremental composer
-//! serves both directions, and release settles `b` to the nearest rest state
-//! with an exponential ease-out (interruption-safe, works from any height).
+//! The unlock model is one variable: the **sheet height** `b` (0..=H),
+//! Locked ⇔ b = H, the App Wheel ⇔ b = 0. Both sides of the boundary are
+//! AMOLED black, so the sheet itself is invisible — the unlock is told
+//! entirely through the morph (docs/W3-APP-SCREENS-PLAN.md §3): the lock
+//! digits scale/translate from center-large to the wheel's status slot,
+//! the ring fades, and wheel rows rise in under the boundary — all
+//! scrubbed 1:1 by sheet progress. A swipe-up drag maps `b = H − dist`; a
+//! top-edge swipe-down from the wheel (relock) maps `b = dist` — one morph
+//! composer serves both directions, and release settles `b` to the nearest
+//! rest state with an exponential ease-out (interruption-safe, any height).
 //!
 //! Loop shape: fixed 20 fps cadence while resting; during a drag the cadence
 //! is dropped for render-on-touch-move (composes capped at ~60 Hz). Flushes
@@ -23,7 +26,7 @@ use crate::display::qspi_bus::QspiBus;
 use crate::display::watch_fb::{RectAcc, WatchFb};
 use crate::drivers::{axp2101, cst9217};
 use crate::input::gestures::{GestureEvent, SwipeDir, SwipeTracker};
-use crate::scenes::{lock, unlocked, wheel};
+use crate::scenes::{lock, wheel};
 use crate::time::{WallClock, WallTime};
 
 /// Fixed 20 fps cadence while the clock is static (idle frames cost ~0).
@@ -48,7 +51,7 @@ const COMPLETE_VEL_Q8: i32 = 128;
 const RING_FADE_RANGE: i32 = LCD_HEIGHT as i32 / 3;
 const RING_LEVELS: i32 = 16;
 const Q: i32 = 16384;
-/// Auto-relock after this long in Unlocked.
+/// Auto-relock after this long out of Locked without interaction.
 const AUTO_RELOCK_SECS: u64 = 60;
 /// Exponential settle: b += diff/2 per frame; snap when |diff| ≤ this.
 /// (Was 3/8 with snap 6 — the ease-out tail crawled through near-black image
@@ -74,13 +77,11 @@ const DIM_STEP: u8 = 8;
 const IDLE_FRAME_US: u64 = 500_000;
 
 const H: i32 = LCD_HEIGHT as i32;
-const ROW_BYTES: usize = LCD_WIDTH as usize * 2;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Scene {
     Locked,
-    Unlocked,
-    /// M6 W1: static App Wheel (PWR toggles from/to Unlocked).
+    /// The App Wheel — where unlock lands (W3; `Scene::App` joins in W3.2).
     Wheel,
 }
 
@@ -173,12 +174,12 @@ impl<'a, 'd> App<'a, 'd> {
             self.wall.maybe_resync(&mut self.i2c);
             let now = self.wall.now();
 
-            // Auto-relock: sheet slides back down after a minute unlocked.
+            // Auto-relock: the morph runs back down after a minute idle.
             if scene != Scene::Locked
                 && unlocked_at.elapsed() >= Duration::from_secs(AUTO_RELOCK_SECS)
             {
                 println!("scene: auto-relock");
-                scene = self.settle(&mut sheet_b, LCD_HEIGHT, &now);
+                scene = self.settle_from(&mut sheet_b, LCD_HEIGHT, &now, wheel_batt, wheel_s_q8);
                 continue;
             }
 
@@ -224,6 +225,7 @@ impl<'a, 'd> App<'a, 'd> {
                         wheel_s_q8,
                         &mut self.wheel_fx,
                         false,
+                        None,
                     );
                 } else {
                     // Focus ring's animated gradient (partial redraw).
@@ -292,9 +294,10 @@ impl<'a, 'd> App<'a, 'd> {
             }
 
             // PWR key: while locked, a short press ignites the lightsaber
-            // flourish (waking the display first if idle). Unlocked presses
-            // stay log-only until the App Wheel lands. The chip latches
-            // presses, so once-per-frame polling never misses one.
+            // flourish (waking the display first if idle). In the wheel it
+            // will open the focused app (W3.2); log-only until then. The
+            // chip latches presses, so once-per-frame polling never misses
+            // one.
             match axp2101::poll_power_key(&mut self.i2c) {
                 axp2101::PowerKey::ShortPress => {
                     tp.last_activity = Instant::now();
@@ -306,23 +309,9 @@ impl<'a, 'd> App<'a, 'd> {
                             self.clock.start_flourish();
                             println!("pwr: short press -> flourish");
                         }
-                        Scene::Unlocked => {
-                            // Interruptible staggered reveal: the run loop
-                            // renders it frame-by-frame and ANY gesture works
-                            // immediately, scrolling under the rising rows.
-                            wheel_batt = axp2101::battery_percent(&mut self.i2c);
-                            wheel_s_q8 = 0;
-                            self.wheel_fx.begin_intro();
-                            scene = Scene::Wheel;
-                            unlocked_at = Instant::now();
-                            println!("pwr: short press -> wheel");
-                        }
                         Scene::Wheel => {
-                            unlocked::draw(&mut self.wfb);
-                            self.flush_dirty();
-                            scene = Scene::Unlocked;
                             unlocked_at = Instant::now();
-                            println!("pwr: short press -> unlocked");
+                            println!("pwr: short press (app open lands in W3.2)");
                         }
                     }
                 }
@@ -362,7 +351,7 @@ impl<'a, 'd> App<'a, 'd> {
                     GestureEvent::DragStart { dir, x, y, dist } => {
                         let mut kind = "ignored";
                         match (dir, scene) {
-                            (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked) => {
+                            (SwipeDir::Up, Scene::Locked) => {
                                 start_drag = Some((dir, dist, y));
                                 kind = "sheet";
                             }
@@ -394,10 +383,7 @@ impl<'a, 'd> App<'a, 'd> {
                             wheel_flick = Some(sign * vel_q8);
                             println!("gesture: wheel flick vel_q8={vel_q8}");
                         } else {
-                            let wanted = matches!(
-                                (dir, scene),
-                                (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked)
-                            );
+                            let wanted = matches!((dir, scene), (SwipeDir::Up, Scene::Locked));
                             println!(
                                 "gesture: flick dir={} dist={dist} vel_q8={vel_q8}{}",
                                 dir_str(dir),
@@ -440,14 +426,22 @@ impl<'a, 'd> App<'a, 'd> {
                     self.wake_display(&mut power, &mut brightness, &now);
                 }
                 self.abort_flourish();
-                scene =
-                    self.drag_session(dir, dist, start_y, &mut sheet_b, &now, anim_start, &mut tp);
-                if scene == Scene::Unlocked {
-                    unlocked_at = Instant::now();
+                if dir == SwipeDir::Up {
+                    // Fresh unlock always lands on the wheel's first row.
+                    wheel_s_q8 = 0;
                 }
+                scene = self.drag_session(
+                    dir,
+                    dist,
+                    start_y,
+                    &mut sheet_b,
+                    &now,
+                    anim_start,
+                    &mut tp,
+                    &mut wheel_batt,
+                    wheel_s_q8,
+                );
                 if scene == Scene::Wheel {
-                    // The sheet painted over the wheel canvas — reseed.
-                    self.wheel_fx.invalidate();
                     unlocked_at = Instant::now();
                 }
                 continue;
@@ -479,20 +473,18 @@ impl<'a, 'd> App<'a, 'd> {
                 unlocked_at = Instant::now();
                 continue;
             }
-            if let Some((dir, dist, vel)) = flick {
+            if let Some((_dir, dist, vel)) = flick {
                 if power != Power::Awake || brightness != 0xFF {
                     self.wake_display(&mut power, &mut brightness, &now);
                 }
                 self.abort_flourish();
                 if dist as i32 > COMPLETE_DIST || vel > COMPLETE_VEL_Q8 {
-                    let (target, bbox) = match dir {
-                        SwipeDir::Up => (0, self.clock.canvas_text_bbox()),
-                        SwipeDir::Down => (LCD_HEIGHT, (0, 0, -1, -1)),
-                    };
-                    scene = self.settle_from(&mut sheet_b, target, &now, bbox);
-                    if scene == Scene::Unlocked {
-                        unlocked_at = Instant::now();
-                    }
+                    // Whole-swipe unlock (the flick fit in one poll gap):
+                    // morph-settle straight into the wheel.
+                    wheel_s_q8 = 0;
+                    self.begin_unlock_morph(&mut wheel_batt);
+                    scene = self.settle_from(&mut sheet_b, 0, &now, wheel_batt, wheel_s_q8);
+                    unlocked_at = Instant::now();
                     continue;
                 }
             }
@@ -521,8 +513,9 @@ impl<'a, 'd> App<'a, 'd> {
         }
     }
 
-    /// Finger-tracked drag: composes on movement until lift-off, then settles.
-    /// Returns the resulting scene.
+    /// Finger-tracked sheet drag driving the unlock/relock morph (W3 §3):
+    /// composes on movement until lift-off, then settles. Returns the
+    /// resulting scene.
     fn drag_session(
         &mut self,
         dir: SwipeDir,
@@ -532,12 +525,12 @@ impl<'a, 'd> App<'a, 'd> {
         now: &WallTime,
         anim_start: Instant,
         tp: &mut TouchPoll,
+        batt: &mut Option<u8>,
+        s_q8: i32,
     ) -> Scene {
-        // Take over the sheet text from whatever the canvas currently shows.
-        let mut text_bbox = match dir {
-            SwipeDir::Up => self.clock.canvas_text_bbox(),
-            SwipeDir::Down => (0, 0, -1, -1),
-        };
+        if dir == SwipeDir::Up {
+            self.begin_unlock_morph(batt);
+        }
         // Map the REACHABLE finger travel (touch-down point → panel edge) onto
         // the full sheet travel: 1:1 mapping stalled the sheet at ~85-90% with
         // the finger ground against the edge (a drag starting inside the arm
@@ -560,11 +553,7 @@ impl<'a, 'd> App<'a, 'd> {
         let mut last_compose = Instant::now();
         let mut composes: u32 = 0;
         let mut max_step: i32 = 0;
-        // Median-of-3 on the raw travel: the CST9217's coordinates tremble
-        // when the finger sits at the panel edge (same regime as its bus
-        // stalls) — single-sample spikes and direction flapping showed as
-        // sheet stagger near the end of unlocks. The median kills both with
-        // ~one report (~10 ms) of lag; monotonic motion passes unharmed.
+        let mut lvl_prev = ring_level_idx(*sheet_b);
         // Tracking is the simple pre-filter version (user-directed revert):
         // raw mapped target, plain 2/3 pursuit — no median, no hysteresis,
         // no regime switching. The sensor's flaky top edge is handled by the
@@ -594,14 +583,16 @@ impl<'a, 'd> App<'a, 'd> {
             }
             // AUTO-COMMIT (unlock only, 85% travel): the transition completes
             // itself before the finger reaches the sensor's untrustworthy top
-            // edge. The eventual lift's DragEnd is scene-filtered by the main
-            // loop (the scene has already changed).
+            // edge. The finger is still down — CANCEL the press so its lift
+            // can't fling the wheel; further motion is picked up cleanly by
+            // the run loop's direct-manipulation takeover.
             if dir == SwipeDir::Up && (target_b as i32) < H * 3 / 20 {
                 println!(
                     "gesture: auto-commit b={} (composes={composes} gap_bot={gap_bot}ms gap_top={gap_top}ms)",
                     target_b
                 );
-                return self.settle_from(sheet_b, 0, now, text_bbox);
+                self.swipe.cancel();
+                return self.settle_from(sheet_b, 0, now, *batt, s_q8);
             }
             if target_b != *sheet_b
                 && last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US)
@@ -615,7 +606,7 @@ impl<'a, 'd> App<'a, 'd> {
                     (*sheet_b as i32 + diff * 2 / 3) as u16
                 };
                 max_step = max_step.max((next as i32 - *sheet_b as i32).abs());
-                self.compose_sheet(*sheet_b, next, now, &mut text_bbox);
+                self.compose_morph(next, now, *batt, s_q8, &mut lvl_prev);
                 *sheet_b = next;
                 let compose_ms = t0.elapsed().as_millis() as u32;
                 let (flush_ms, mode, spans) = self.flush_dirty();
@@ -647,25 +638,23 @@ impl<'a, 'd> App<'a, 'd> {
             "gesture: release dir={} dist={dist} vel_q8={vel} -> {verdict} (composes={composes} max_step={max_step} gap_bot={gap_bot}ms gap_top={gap_top}ms)",
             dir_str(dir)
         );
-        // Carry the drag text bbox into the settle (same composer).
-        self.settle_from(sheet_b, target, now, text_bbox)
+        self.settle_from(sheet_b, target, now, *batt, s_q8)
     }
 
-    /// Ease `sheet_b` to `target` (exponential decay) and finalize the scene.
-    /// Entry point for auto-relock (no prior drag).
-    fn settle(&mut self, sheet_b: &mut u16, target: u16, now: &WallTime) -> Scene {
-        self.settle_from(sheet_b, target, now, (0, 0, -1, -1))
-    }
-
+    /// Ease `sheet_b` to `target` (exponential decay), driving the morph,
+    /// then finalize the scene. Also the entry point for auto-relock (no
+    /// prior drag) and the whole-swipe flick unlock.
     fn settle_from(
         &mut self,
         sheet_b: &mut u16,
         target: u16,
         now: &WallTime,
-        mut text_bbox: (i32, i32, i32, i32),
+        batt: Option<u8>,
+        s_q8: i32,
     ) -> Scene {
         let settle_start = Instant::now();
         let mut settle_frames = 0u32;
+        let mut lvl_prev = ring_level_idx(*sheet_b);
         while *sheet_b != target {
             settle_frames += 1;
             let frame_start = Instant::now();
@@ -677,7 +666,7 @@ impl<'a, 'd> App<'a, 'd> {
                 let step = diff / 2;
                 *sheet_b as i32 + if step == 0 { diff.signum() } else { step }
             };
-            self.compose_sheet(*sheet_b, next as u16, now, &mut text_bbox);
+            self.compose_morph(next as u16, now, batt, s_q8, &mut lvl_prev);
             *sheet_b = next as u16;
             if *sheet_b == target {
                 // Final frame: flush together with the normalize below —
@@ -704,126 +693,129 @@ impl<'a, 'd> App<'a, 'd> {
             );
             Scene::Locked
         } else {
-            // Fully unlocked: normalize to the pristine image.
-            unlocked::draw(&mut self.wfb);
+            // Unlocked = the wheel. Normalize with a crisp seed frame: rows
+            // at rest and the real status line replacing the morphed digits
+            // at the exact same slot.
+            self.wheel_fx.invalidate();
+            wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, false, None);
             self.flush_dirty();
             println!(
-                "scene: -> Unlocked (settle {} frames in {}ms)",
+                "scene: -> Wheel (settle {} frames in {}ms)",
                 settle_frames,
                 settle_start.elapsed().as_millis()
             );
-            Scene::Unlocked
+            Scene::Wheel
         }
     }
 
-    /// Incremental sheet composer: update the canvas from sheet height
-    /// `b_prev` to `b`. Sheet rows `[0..b)`: black + ring (scrub-faded) +
-    /// text at shift `b − H`. Image rows `[b..H)`.
-    fn compose_sheet(
+    /// Arm the unlock morph: fresh battery for the status line, and hand
+    /// the canvas to the wheel renderer WITHOUT clearing it — the black
+    /// base and the lock ring stay put; the resting lock text is queued
+    /// for the renderer's targeted erase.
+    fn begin_unlock_morph(&mut self, batt: &mut Option<u8>) {
+        *batt = axp2101::battery_percent(&mut self.i2c);
+        let (x0, y0, x1, y1) = self.clock.canvas_text_bbox();
+        self.wheel_fx.seed_silent();
+        self.wheel_fx.push(x0, y0, x1, y1);
+    }
+
+    /// One unlock/relock morph frame at sheet height `b` (W3 §3). Both
+    /// sides of the boundary are AMOLED black, so the sheet itself is
+    /// invisible — the frame is: wheel rows revealing under the boundary,
+    /// the lock ring fading with the scrub, and the time/date morph on top.
+    fn compose_morph(
         &mut self,
-        b_prev: u16,
         b: u16,
         now: &WallTime,
-        text_bbox: &mut (i32, i32, i32, i32),
+        batt: Option<u8>,
+        s_q8: i32,
+        lvl_prev: &mut i32,
     ) {
-        let bp = b_prev as i32;
-        let bi = b as i32;
-        let mut rects: [(i32, i32, i32, i32); 4] = [(0, 0, -1, -1); 4];
-        let mut nrects = 0usize;
-
+        let p = ((H - b as i32) * 256) / H;
+        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, false, Some(p));
+        // Ring: repainted whole while visible — level steps recolor it and
+        // row/glow clears can nibble its rim pixels. Once faded, one last
+        // level-0 (black) repaint retires it for the session.
         let lvl = ring_level_idx(b);
-        let lvl_prev = ring_level_idx(b_prev);
-        let old_text = *text_bbox;
+        if lvl > 0 || *lvl_prev > 0 {
+            let mut acc = RectAcc::empty();
+            let fb = self.wfb.buf_mut();
+            self.clock.draw_ring_rows(fb, 0, H, lvl * Q / RING_LEVELS, &mut acc);
+            if !acc.is_empty() {
+                self.wfb.mark_rect(acc.x0 - 1, acc.y0, acc.x1 + 1, acc.y1);
+            }
+        }
+        *lvl_prev = lvl;
+        self.draw_morph_text(p, now, batt);
+    }
 
+    /// The unlock time-morph (M6 §11 / W3 §3): the lock digits scale and
+    /// translate from center-large (TIME_GLYPHS) to the wheel's status
+    /// slot, tracked 1:1 by sheet progress `p`; the date fades out in
+    /// place; the status tail (battery) fades in at its resting spot over
+    /// the last stretch. Endpoints are pixel-exact hand-offs: p=0 matches
+    /// the resting lock text, p=256 lands where draw_status paints.
+    fn draw_morph_text(&mut self, p: i32, now: &WallTime, batt: Option<u8>) {
+        let cx = LCD_WIDTH as i32 / 2;
+        let cy = H / 2;
+        let mut s = [b'0'; 5];
+        s[0] = b'0' + now.hour / 10;
+        s[1] = b'0' + now.hour % 10;
+        s[2] = b':';
+        s[3] = b'0' + now.minute / 10;
+        s[4] = b'0' + now.minute % 10;
+        let t_str = core::str::from_utf8(&s).unwrap_or("00:00");
+        let tw_big = wheel::text_width(t_str, &lock::TIME_GLYPHS).max(1);
+        let th_big = lock::get_glyph(&lock::TIME_GLYPHS, '0')
+            .map(|g| g.height as i32)
+            .unwrap_or(80);
+        let (tgt_left, tgt_tw, tgt_w) = wheel::status_metrics(now, batt);
+        // Uniform scale that lands the digits at exactly the status width.
+        let ratio_q8 = ((tgt_tw << 8) / tw_big).min(256);
+        let sc = 256 + (((ratio_q8 - 256) * p) >> 8);
+        let x_lock = cx - tw_big / 2;
+        let x = x_lock + (((tgt_left - x_lock) * p) >> 8);
+        let by = (cy + 5) + (((wheel::STATUS_BASE_Y - (cy + 5)) * p) >> 8);
+        let alpha = 256 + (((wheel::STATUS_ALPHA - 256) * p) >> 8);
+        // Date fades out over the first half of travel, in place.
+        let da = (256 - 2 * p).max(0);
+        let mut dbuf = [0u8; 24];
+        let mut dlen = 0usize;
+        if da > 0 {
+            let d = self.clock.date_line(now);
+            dlen = d.len().min(dbuf.len());
+            dbuf[..dlen].copy_from_slice(&d.as_bytes()[..dlen]);
+        }
+        let d_str = core::str::from_utf8(&dbuf[..dlen]).unwrap_or("");
+        let dw = wheel::text_width(d_str, &lock::TEXT_GLYPHS);
+        // Battery tail fades in over the last quarter of travel.
+        let ta = ((p - 192) * 4).clamp(0, 256);
         {
             let fb = self.wfb.buf_mut();
-
-            // 1) Band between old and new boundary.
-            if bi < bp {
-                // Sheet shrinks: reveal image rows [bi..bp).
-                let (s, e) = (bi as usize * ROW_BYTES, bp as usize * ROW_BYTES);
-                let n = e.min(fb.len()).min(unlocked::SPIKE_RGB565.len());
-                if s < n {
-                    fb[s..n].copy_from_slice(&unlocked::SPIKE_RGB565[s..n]);
-                }
-                rects[nrects] = (0, bi, LCD_WIDTH as i32 - 1, bp - 1);
-                nrects += 1;
-            } else if bi > bp {
-                // Sheet grows: black-fill rows [bp..bi) (ring/text drawn below).
-                let (s, e) = (bp as usize * ROW_BYTES, bi as usize * ROW_BYTES);
-                let e = e.min(fb.len());
-                if s < e {
-                    fb[s..e].fill(0);
-                }
-                rects[nrects] = (0, bp, LCD_WIDTH as i32 - 1, bi - 1);
-                nrects += 1;
+            wheel::draw_text_scaled(fb, t_str, x, by, alpha, &lock::TIME_GLYPHS, sc, false);
+            if da > 0 {
+                wheel::draw_text_at(fb, d_str, cx - dw / 2, cy + 70, da, &lock::TEXT_GLYPHS);
             }
-
-            // 2) Erase the text at its old spot (sheet rows only — image rows
-            // were just overwritten by the band blit). Must run BEFORE the ring
-            // pass: the erase is a black rect, and when the sliding text
-            // crosses the annulus it would otherwise punch a black box out of
-            // freshly drawn ring pixels (visible during relock).
-            let erased = old_text.2 >= old_text.0 && old_text.1 < bi;
-            if erased {
-                lock::clear_rect(fb, old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
+            if ta > 0 {
+                wheel::draw_status_tail(fb, now, batt, (ta * wheel::STATUS_ALPHA) >> 8);
             }
-
-            // 3) Ring pass — only the rows that actually need ring pixels:
-            //    - brightness stepped → all rows < bi (full recolor),
-            //    - sheet grew → just the fresh band rows [bp..bi),
-            //    - text erase reached the annulus → the erased rows.
-            // Repainting from row 0 every frame marked ~the whole screen and
-            // forced a 24 ms full flush per relock frame (visible flicker) on
-            // top of a 15+ ms PSRAM-cache-thrashing rewrite of 19k scattered
-            // pixels. Skipped entirely while the ring is uniformly faded out
-            // (level 0 → its pixels are black, same as the fresh band fill).
-            let erase_hit_ring = erased
-                && lvl > 0
-                && lock::rect_touches_ring(old_text.0, old_text.1, old_text.2, old_text.3.min(bi - 1));
-            let ring_min = if lvl != lvl_prev {
-                0
-            } else {
-                let mut m = i32::MAX;
-                if bi > bp && lvl > 0 {
-                    m = bp;
-                }
-                if erase_hit_ring {
-                    m = m.min(old_text.1.max(0));
-                }
-                m
-            };
-            if ring_min < bi {
-                let mut acc = RectAcc::empty();
-                self.clock
-                    .draw_ring_rows(fb, ring_min, bi, lvl * Q / RING_LEVELS, &mut acc);
-                if !acc.is_empty() {
-                    rects[nrects] = (acc.x0 - 1, acc.y0, acc.x1 + 1, acc.y1);
-                    nrects += 1;
-                }
-            }
-
-            // 4) Text: redraw at the new shift.
-            let nb = self.clock.draw_sheet_text(fb, now, bi - H, bi);
-            let dirty_text = if old_text.2 < old_text.0 {
-                nb
-            } else {
-                (
-                    old_text.0.min(nb.0),
-                    old_text.1.min(nb.1),
-                    old_text.2.max(nb.2),
-                    old_text.3.max(nb.3),
-                )
-            };
-            rects[nrects] = dirty_text;
-            nrects += 1;
-            *text_bbox = nb;
         }
-
-        for r in rects.iter().take(nrects) {
-            if r.2 >= r.0 && r.3 >= r.1 {
-                self.wfb.mark_rect(r.0, r.1, r.2, r.3);
-            }
+        // Damage + next-frame clear rects (pushed into the wheel's rect
+        // cache so draw_scroll erases them like any content).
+        let tw_s = (tw_big * sc) >> 8;
+        let th_s = (th_big * sc) >> 8;
+        let tr = (x - 2, by - th_s - 4, x + tw_s + 2, by + 8);
+        self.wheel_fx.push(tr.0, tr.1, tr.2, tr.3);
+        self.wfb.mark_rect(tr.0, tr.1, tr.2, tr.3);
+        if da > 0 {
+            let dr = (cx - dw / 2 - 2, cy + 70 - 32, cx + dw / 2 + 2, cy + 70 + 10);
+            self.wheel_fx.push(dr.0, dr.1, dr.2, dr.3);
+            self.wfb.mark_rect(dr.0, dr.1, dr.2, dr.3);
+        }
+        if ta > 0 {
+            let sr = (tgt_left + tgt_tw - 2, 26, tgt_left + tgt_w + 4, 66);
+            self.wheel_fx.push(sr.0, sr.1, sr.2, sr.3);
+            self.wfb.mark_rect(sr.0, sr.1, sr.2, sr.3);
         }
     }
 
@@ -1347,7 +1339,7 @@ impl<'a, 'd> App<'a, 'd> {
     /// One wheel frame through the damage-minimized renderer (targeted
     /// clear + union-bbox partial flush; motion LOD when `fast`).
     fn draw_wheel(&mut self, now: &WallTime, batt: Option<u8>, s_q8: i32, fast: bool) {
-        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast);
+        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast, None);
     }
 
     /// A gesture takes over mid-flourish: write the flourish's zero-glow

@@ -125,6 +125,17 @@ impl SwipeTracker {
         }
     }
 
+    /// ACTION_CANCEL semantics: the current press's classification was
+    /// consumed by a scene hand-off (unlock auto-commit) — swallow the rest
+    /// of this press so its eventual lift can't emit a stale DragEnd/Tap
+    /// into the new scene. Position tracking continues (`finger_down` /
+    /// `press_origin_y` stay live for the direct-manipulation takeover).
+    pub fn cancel(&mut self) {
+        if let Phase::Pending(tr) | Phase::Dragging(tr, _) = self.phase {
+            self.phase = Phase::Rejected(tr);
+        }
+    }
+
     /// Feed a report (`Some` when INT fired and the read succeeded) or an idle
     /// tick (`None`). Returns at most one event per call.
     pub fn feed(&mut self, report: Option<TouchPoint>, now_ms: u32) -> GestureEvent {
