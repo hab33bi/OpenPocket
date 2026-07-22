@@ -86,6 +86,9 @@ pub struct SwipeTracker {
     height: u16,
     /// Timestamp of the last emitted tap (refractory anchor).
     last_tap_ms: u32,
+    /// Free-scroll mode (App Wheel): any vertical-dominant drag classifies,
+    /// regardless of where it started — no edge arm zones.
+    free_scroll: bool,
 }
 
 impl SwipeTracker {
@@ -94,7 +97,12 @@ impl SwipeTracker {
             phase: Phase::Idle,
             height,
             last_tap_ms: 0,
+            free_scroll: false,
         }
+    }
+
+    pub fn set_free_scroll(&mut self, on: bool) {
+        self.free_scroll = on;
     }
 
     /// Whether a touch is currently being tracked (any non-Idle phase). The
@@ -274,10 +282,17 @@ impl SwipeTracker {
 
     /// Zone + direction-dominance classification (diagonals allowed: primary
     /// axis ≥ |dx|/2). Swipe-up arms from the bottom zone, swipe-down from the
-    /// top zone.
+    /// top zone — unless free-scroll mode is on (App Wheel), where any
+    /// vertical-dominant drag classifies from anywhere.
     fn classify_dir(&self, start_y: u16, dx: i32, dy_up: i32) -> Option<SwipeDir> {
-        let in_bottom = start_y as u32 >= self.height as u32 * (8 - ARM_ZONE_EIGHTHS) / 8;
-        let in_top = (start_y as u32) < self.height as u32 * ARM_ZONE_EIGHTHS / 8;
+        let (in_bottom, in_top) = if self.free_scroll {
+            (true, true)
+        } else {
+            (
+                start_y as u32 >= self.height as u32 * (8 - ARM_ZONE_EIGHTHS) / 8,
+                (start_y as u32) < self.height as u32 * ARM_ZONE_EIGHTHS / 8,
+            )
+        };
         if in_bottom && dy_up > 0 && dy_up * 2 >= dx.abs() {
             Some(SwipeDir::Up)
         } else if in_top && dy_up < 0 && -dy_up * 2 >= dx.abs() {

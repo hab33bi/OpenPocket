@@ -144,6 +144,9 @@ impl<'a, 'd> App<'a, 'd> {
         let mut brightness: u8 = 0xFF;
         let mut power = Power::Awake;
         let mut aod_minute: u8 = 255;
+        // Wheel scroll state (Q8 px) + battery cached at wheel entry.
+        let mut wheel_s_q8: i32 = 0;
+        let mut wheel_batt: Option<u8> = None;
 
         loop {
             let frame_start = Instant::now();
@@ -166,7 +169,9 @@ impl<'a, 'd> App<'a, 'd> {
                 self.clock.render(&mut self.wfb, elapsed, &now);
             } else if scene == Scene::Wheel && power == Power::Awake {
                 // Focus ring's animated gradient (partial redraw of its rect).
-                wheel::tick_ring(&mut self.wfb, elapsed, 0);
+                let focused = (((wheel_s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
+                    .clamp(0, wheel::rows() as i32 - 1) as usize;
+                wheel::tick_ring(&mut self.wfb, elapsed, focused);
             }
             let render_ms = render_start.elapsed().as_millis() as u32;
 
@@ -243,8 +248,7 @@ impl<'a, 'd> App<'a, 'd> {
                             println!("pwr: short press -> flourish");
                         }
                         Scene::Unlocked => {
-                            // Staggered reveal: rows slide in left-to-right,
-                            // top-to-bottom, 25 ms frames.
+                            // Staggered bottom-up reveal, 25 ms frames.
                             let batt = axp2101::battery_percent(&mut self.i2c);
                             for f in 0..wheel::INTRO_FRAMES {
                                 let fs = Instant::now();
@@ -252,6 +256,8 @@ impl<'a, 'd> App<'a, 'd> {
                                 self.flush_dirty();
                                 wheel::pace(fs);
                             }
+                            wheel_s_q8 = 0;
+                            wheel_batt = batt;
                             scene = Scene::Wheel;
                             unlocked_at = Instant::now();
                             println!("pwr: short press -> wheel");
@@ -278,6 +284,10 @@ impl<'a, 'd> App<'a, 'd> {
             // to the drag session (render-on-touch-move).
             let mut start_drag: Option<(SwipeDir, u16, u16)> = None;
             let mut flick: Option<(SwipeDir, u16, i32)> = None;
+            let mut wheel_drag: Option<(SwipeDir, u16)> = None;
+            let mut wheel_flick: Option<i32> = None;
+            let mut wheel_tap: Option<u16> = None;
+            self.swipe.set_free_scroll(scene == Scene::Wheel);
             let frame_us = match power {
                 Power::Aod | Power::Sleep => IDLE_FRAME_US,
                 _ if scene == Scene::Locked && self.clock.is_animating() => CLOCK_ANIM_FRAME_US,
@@ -289,40 +299,69 @@ impl<'a, 'd> App<'a, 'd> {
                 let ev = self.poll_touch_once(&mut tp, now_ms);
                 match ev {
                     GestureEvent::DragStart { dir, x, y, dist } => {
-                        let wanted = matches!(
-                            (dir, scene),
-                            (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked)
-                        );
-                        println!(
-                            "gesture: drag arm dir={} x={x} y={y} dist={dist}{}",
-                            dir_str(dir),
-                            if wanted { "" } else { " (ignored)" }
-                        );
-                        if wanted {
-                            start_drag = Some((dir, dist, y));
+                        let mut kind = "ignored";
+                        match (dir, scene) {
+                            (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked) => {
+                                start_drag = Some((dir, dist, y));
+                                kind = "sheet";
+                            }
+                            // Top-edge swipe-down in the wheel = relock.
+                            (SwipeDir::Down, Scene::Wheel) if (y as i32) < H * 12 / 100 => {
+                                start_drag = Some((dir, dist, y));
+                                kind = "relock";
+                            }
+                            (_, Scene::Wheel) => {
+                                wheel_drag = Some((dir, dist));
+                                kind = "wheel";
+                            }
+                            _ => {}
                         }
+                        println!(
+                            "gesture: drag arm dir={} x={x} y={y} dist={dist} ({kind})",
+                            dir_str(dir)
+                        );
                     }
                     // DragEnd without a preceding DragStart: the whole swipe
                     // fit inside one poll gap (fast flick) — the recognizer
                     // classified it from touch-down + lift-report coordinates.
                     GestureEvent::DragEnd { dir, dist, vel_q8 } => {
-                        let wanted = matches!(
-                            (dir, scene),
-                            (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked)
-                        );
-                        println!(
-                            "gesture: flick dir={} dist={dist} vel_q8={vel_q8}{}",
-                            dir_str(dir),
-                            if wanted { "" } else { " (ignored)" }
-                        );
-                        if wanted {
-                            flick = Some((dir, dist, vel_q8));
+                        if scene == Scene::Wheel {
+                            let sign = match dir {
+                                SwipeDir::Up => 1,
+                                SwipeDir::Down => -1,
+                            };
+                            wheel_flick = Some(sign * vel_q8);
+                            println!("gesture: wheel flick vel_q8={vel_q8}");
+                        } else {
+                            let wanted = matches!(
+                                (dir, scene),
+                                (SwipeDir::Up, Scene::Locked) | (SwipeDir::Down, Scene::Unlocked)
+                            );
+                            println!(
+                                "gesture: flick dir={} dist={dist} vel_q8={vel_q8}{}",
+                                dir_str(dir),
+                                if wanted { "" } else { " (ignored)" }
+                            );
+                            if wanted {
+                                flick = Some((dir, dist, vel_q8));
+                            }
                         }
                     }
-                    GestureEvent::Tap { x, y } => println!("gesture: tap x={x} y={y}"),
+                    GestureEvent::Tap { x, y } => {
+                        if scene == Scene::Wheel {
+                            wheel_tap = Some(y);
+                        }
+                        println!("gesture: tap x={x} y={y}");
+                    }
                     _ => {}
                 }
-                if start_drag.is_some() || flick.is_some() || Instant::now() >= deadline {
+                if start_drag.is_some()
+                    || flick.is_some()
+                    || wheel_drag.is_some()
+                    || wheel_flick.is_some()
+                    || wheel_tap.is_some()
+                    || Instant::now() >= deadline
+                {
                     break;
                 }
                 core::hint::spin_loop();
@@ -341,6 +380,30 @@ impl<'a, 'd> App<'a, 'd> {
                 if scene == Scene::Unlocked {
                     unlocked_at = Instant::now();
                 }
+                continue;
+            }
+            if let Some((dir, dist)) = wheel_drag {
+                self.wheel_session(dir, dist, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
+                unlocked_at = Instant::now();
+                continue;
+            }
+            if let Some(v) = wheel_flick {
+                self.wheel_momentum(&mut wheel_s_q8, v, &now, wheel_batt);
+                unlocked_at = Instant::now();
+                continue;
+            }
+            if let Some(y) = wheel_tap {
+                let s_px = wheel_s_q8 >> 8;
+                let row = (y as i32 - H / 2 + s_px + wheel::PITCH_PX / 2)
+                    .div_euclid(wheel::PITCH_PX)
+                    .clamp(0, wheel::rows() as i32 - 1) as usize;
+                let cur = (((wheel_s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
+                    .clamp(0, wheel::rows() as i32 - 1) as usize;
+                if row != cur {
+                    println!("wheel: tap -> row {row}");
+                    self.wheel_settle(&mut wheel_s_q8, row, &now, wheel_batt);
+                }
+                unlocked_at = Instant::now();
                 continue;
             }
             if let Some((dir, dist, vel)) = flick {
@@ -771,6 +834,88 @@ impl<'a, 'd> App<'a, 'd> {
         self.swipe.feed(report, now_ms)
     }
 
+    /// Finger-tracked wheel scroll (M6 W2): 2/3 pursuit of the finger with a
+    /// rubber band past the ends, then momentum + snap-to-row on release.
+    fn wheel_session(
+        &mut self,
+        dir: SwipeDir,
+        start_dist: u16,
+        s_q8: &mut i32,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) {
+        let sign: i32 = match dir {
+            SwipeDir::Up => 1,
+            SwipeDir::Down => -1,
+        };
+        let s_start = *s_q8;
+        let mut target = s_start + sign * ((start_dist as i32) << 8);
+        let mut last_compose = Instant::now();
+        let vel = loop {
+            let now_ms = anim_start.elapsed().as_millis() as u32;
+            match self.poll_touch_once(tp, now_ms) {
+                GestureEvent::DragMove { dist, .. } => {
+                    target = s_start + sign * ((dist as i32) << 8);
+                }
+                GestureEvent::DragEnd { vel_q8, .. } => break sign * vel_q8,
+                _ => {}
+            }
+            if last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US) {
+                last_compose = Instant::now();
+                let t_eff = wheel_rubber(target, wheel_s_max());
+                let diff = t_eff - *s_q8;
+                if diff != 0 {
+                    *s_q8 += if diff.abs() <= 512 { diff } else { diff * 2 / 3 };
+                    wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+                    self.flush_dirty();
+                }
+            }
+            self.maybe_reinit_touch(tp);
+            core::hint::spin_loop();
+        };
+        self.wheel_momentum(s_q8, vel, now, batt);
+    }
+
+    /// Momentum (v decays ~0.94 per 25 ms frame) → snap to the nearest row
+    /// with the settle's exponential ease. Also the tap-to-focus animator.
+    fn wheel_momentum(&mut self, s_q8: &mut i32, mut v_q8: i32, now: &WallTime, batt: Option<u8>) {
+        let s_max = wheel_s_max();
+        while v_q8.abs() > 77 {
+            let fs = Instant::now();
+            *s_q8 += v_q8 * 25;
+            if *s_q8 <= 0 {
+                *s_q8 = 0;
+                break;
+            }
+            if *s_q8 >= s_max {
+                *s_q8 = s_max;
+                break;
+            }
+            v_q8 = v_q8 * 240 / 256;
+            wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+            self.flush_dirty();
+            wheel::pace(fs);
+        }
+        let pitch_q8 = wheel::PITCH_PX << 8;
+        let row = ((*s_q8 + pitch_q8 / 2) / pitch_q8).clamp(0, wheel::rows() as i32 - 1);
+        self.wheel_settle(s_q8, row as usize, now, batt);
+    }
+
+    /// Ease the wheel to rest exactly on `row` (diff/2 per 25 ms frame).
+    fn wheel_settle(&mut self, s_q8: &mut i32, row: usize, now: &WallTime, batt: Option<u8>) {
+        let target = (row as i32 * wheel::PITCH_PX) << 8;
+        while *s_q8 != target {
+            let fs = Instant::now();
+            let diff = target - *s_q8;
+            *s_q8 += if diff.abs() <= 512 { diff } else { diff / 2 };
+            wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+            self.flush_dirty();
+            wheel::pace(fs);
+        }
+    }
+
     /// A gesture takes over mid-flourish: write the flourish's zero-glow
     /// closing frame (exact resting ring) so the drag composer starts from a
     /// clean canvas. The damage flushes with the gesture's first frame.
@@ -822,6 +967,22 @@ impl<'a, 'd> App<'a, 'd> {
             let ok = cst9217::init(&mut self.i2c, &mut self.tp_reset).is_ok();
             println!("touch: reinit after errors ok={}", ok as u8);
         }
+    }
+}
+
+/// Wheel scroll range (Q8): rows 0..N-1, row N-1 rests at (N-1)·PITCH.
+fn wheel_s_max() -> i32 {
+    ((wheel::rows() as i32 - 1) * wheel::PITCH_PX) << 8
+}
+
+/// Rubber band past the wheel's ends: displacement compresses ÷3.
+fn wheel_rubber(t: i32, max: i32) -> i32 {
+    if t < 0 {
+        t / 3
+    } else if t > max {
+        max + (t - max) / 3
+    } else {
+        t
     }
 }
 

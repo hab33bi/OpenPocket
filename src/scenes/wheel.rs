@@ -19,8 +19,14 @@ const H: i32 = 466;
 const CX: i32 = W / 2;
 const CY: i32 = H / 2;
 const R: i32 = W / 2;
-/// Row pitch in list space.
-const PITCH: i32 = 68;
+/// Row pitch in list space (public: the app's scroll state + hit-testing).
+pub const PITCH_PX: i32 = 68;
+const PITCH: i32 = PITCH_PX;
+
+/// Number of app rows.
+pub fn rows() -> usize {
+    WHEEL_APPS.len()
+}
 /// Padding between an icon's bounding box and the circular boundary — the
 /// box is fitted against the chord at its WORST row (top/bottom corner), so
 /// icons can never leave the screen.
@@ -91,7 +97,12 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
         draw_text_at(fb, app.name, x, y_d + 11, alpha, glyphs);
     }
 
-    // Status line, top-center: HH:MM, plus battery when present.
+    draw_status(fb, now, battery);
+    wfb.mark_rect(0, 0, W - 1, H - 1);
+}
+
+/// Status line, top-center: HH:MM, plus battery when present.
+fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
     let mut s = [0u8; 12];
     let mut n = 0;
     s[n] = b'0' + now.hour / 10;
@@ -124,7 +135,48 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
     let text = core::str::from_utf8(&s[..n]).unwrap_or("");
     let w = text_width(text, &lock::TEXT_GLYPHS);
     draw_text_at(fb, text, CX - w / 2, 52, 200, &lock::TEXT_GLYPHS);
+}
 
+/// Scroll-tracked frame: rows positioned by the continuous offset `s_q8`
+/// (Q8 px; row i rests centered when s = i·PITCH·256). Focus scale/alpha/
+/// glow all interpolate with the offset. Full-canvas redraw per frame.
+pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8: i32) {
+    let fb = wfb.buf_mut();
+    fb.fill(0);
+    let saber = saber_lut(0);
+    let s_px = s_q8 >> 8;
+
+    for (i, app) in WHEEL_APPS.iter().enumerate() {
+        let y_c = CY + i as i32 * PITCH - s_px;
+        if y_c < -PITCH || y_c > H + PITCH {
+            continue;
+        }
+        let (alpha, t) = row_alpha(y_c);
+        if alpha == 0 {
+            continue;
+        }
+        let (sprite, px) = if t > 128 {
+            (app.icon_l, ICON_L_PX)
+        } else {
+            (app.icon_s, ICON_S_PX)
+        };
+        let icon_cx = icon_center_x(y_c, px);
+        if t > 128 {
+            blit_glow(fb, &saber, icon_cx, y_c, (t - 128) * 2);
+        }
+        blit_icon(fb, sprite, px, icon_cx, y_c, alpha);
+        let glyphs: &[Option<Glyph>; 128] = if t > 128 {
+            &lock::LABELF_GLYPHS
+        } else {
+            &lock::TEXT_GLYPHS
+        };
+        let tw = text_width(app.name, glyphs);
+        let min_left = icon_cx + px / 2 + 10;
+        let x = (CX - tw / 2).max(min_left);
+        draw_text_at(fb, app.name, x, y_c + 11, alpha, glyphs);
+    }
+
+    draw_status(fb, now, battery);
     wfb.mark_rect(0, 0, W - 1, H - 1);
 }
 
