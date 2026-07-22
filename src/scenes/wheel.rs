@@ -210,6 +210,9 @@ pub fn draw_status_tail(fb: &mut [u8], now: &WallTime, battery: Option<u8>, alph
 /// them — bottom rows first, the focused center row last — tracked 1:1 by
 /// the finger. The status line is suppressed while scrubbed: the morphing
 /// lock digits ARE the status-line-to-be.
+/// `pill` = row index whose label gets the held-press container: a dark
+/// grey full-radius pill drawn under the label while a still finger rests
+/// on the row (tap-select / tap-open affordance).
 pub fn draw_scroll(
     wfb: &mut WatchFb,
     now: &WallTime,
@@ -218,6 +221,7 @@ pub fn draw_scroll(
     fx: &mut WheelFx,
     fast: bool,
     reveal: Option<i32>,
+    pill: Option<usize>,
 ) {
     // Entrance-reveal clock: advances once per rendered frame (idle while
     // the reveal is scrubbed externally by the unlock morph).
@@ -357,6 +361,21 @@ pub fn draw_scroll(
             fx.push(cx - s, y_d - s, cx + s, y_d + s);
         }
         let min_left = cx + px_eff / 2 + 10;
+        if pill == Some(i) {
+            // Held-press container: full-radius dark grey pill under the
+            // label (drawn first; the label composites over it).
+            let tw = if wl == 0 {
+                text_width(app.name, &lock::TEXT_GLYPHS)
+            } else if wl == 256 {
+                text_width(app.name, &lock::LABELF_GLYPHS)
+            } else {
+                (text_width(app.name, &lock::LABELF_GLYPHS) * (196 + ((60 * wl) >> 8))) >> 8
+            };
+            let x = (CX - tw / 2).max(min_left);
+            let (up, dn) = if wl >= 128 { (21, 25) } else { (16, 20) };
+            fill_pill(fb, x - 16, y_d - up, x + tw + 16, y_d + dn);
+            fx.push(x - 18, y_d - up - 1, x + tw + 18, y_d + dn + 1);
+        }
         let (x, twd) = if wl == 0 {
             let gs = &lock::TEXT_GLYPHS;
             let tw = text_width(app.name, gs);
@@ -915,6 +934,27 @@ fn write_tinted(fb: &mut [u8], x: i32, y: i32, v: i32) {
     let px = (r5 << 11) | (g6 << 5) | b5;
     fb[idx] = (px >> 8) as u8;
     fb[idx + 1] = px as u8;
+}
+
+/// Full-radius pill fill, dark grey (SET writes — the held-label
+/// container; drawn under the label, over whatever lies beneath).
+fn fill_pill(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
+    // (54, 56, 62) pre-quantized to RGB565.
+    const GREY: u16 = ((54u16 * 31 / 255) << 11) | ((56u16 * 63 / 255) << 5) | (62u16 * 31 / 255);
+    let r = (y1 - y0) / 2;
+    let cy_ = (y0 + y1) / 2;
+    for y in y0.max(0)..=y1.min(H - 1) {
+        let dy = y - cy_;
+        let ins = r - isqrt(((r * r - dy * dy).max(0)) as u32) as i32;
+        let (a, b) = ((x0 + ins).max(0), (x1 - ins).min(W - 1));
+        for x in a..=b {
+            let idx = ((y * W + x) * 2) as usize;
+            if idx + 1 < fb.len() {
+                fb[idx] = (GREY >> 8) as u8;
+                fb[idx + 1] = GREY as u8;
+            }
+        }
+    }
 }
 
 /// Pace helper for the intro (blocking, 25 ms frames like the settle).

@@ -221,7 +221,19 @@ impl<'a, 'd> App<'a, 'd> {
                     .press_origin_y()
                     .is_some_and(|y| (y as i32) >= H * 12 / 100)
             {
-                self.wheel_interact(true, 0, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
+                if let Some(open) = self.wheel_interact(
+                    true,
+                    0,
+                    &mut wheel_s_q8,
+                    &now,
+                    wheel_batt,
+                    anim_start,
+                    &mut tp,
+                ) {
+                    scene = self.open_app(
+                        open, wheel_s_q8, &mut app_state, &now, wheel_batt, anim_start, &mut tp,
+                    );
+                }
                 unlocked_at = Instant::now();
                 continue;
             }
@@ -261,6 +273,7 @@ impl<'a, 'd> App<'a, 'd> {
                         &mut self.wheel_fx,
                         false,
                         None,
+                        None,
                     );
                 } else {
                     // Focus ring's animated gradient (partial redraw).
@@ -290,7 +303,7 @@ impl<'a, 'd> App<'a, 'd> {
                     } else {
                         // The app's signature animation (partial redraw).
                         apps::tick(&mut self.wfb, idx, &now, elapsed, &mut app_state);
-                        if status_minute != now.minute {
+                        if apps::shows_status(idx) && status_minute != now.minute {
                             status_minute = now.minute;
                             wheel::tick_status(&mut self.wfb, &now, wheel_batt);
                         }
@@ -378,16 +391,8 @@ impl<'a, 'd> App<'a, 'd> {
                                 .clamp(0, wheel::rows() as i32 - 1)
                                 as usize;
                             println!("pwr: short press -> open app {focused}");
-                            if focused == apps::GALLERY {
-                                app_state.gal_page = 0;
-                                app_state.gal_settle = Some(Instant::now());
-                            }
-                            if focused == apps::TIME {
-                                app_state.t_anchor = None;
-                            }
-                            scene = self.app_morph(
+                            scene = self.open_app(
                                 focused,
-                                true,
                                 wheel_s_q8,
                                 &mut app_state,
                                 &now,
@@ -566,12 +571,36 @@ impl<'a, 'd> App<'a, 'd> {
                 // Fallback entry (the pre-poll takeover normally wins the
                 // race): the finger is still down — the session anchors at
                 // its current position.
-                self.wheel_interact(true, 0, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
+                if let Some(open) = self.wheel_interact(
+                    true,
+                    0,
+                    &mut wheel_s_q8,
+                    &now,
+                    wheel_batt,
+                    anim_start,
+                    &mut tp,
+                ) {
+                    scene = self.open_app(
+                        open, wheel_s_q8, &mut app_state, &now, wheel_batt, anim_start, &mut tp,
+                    );
+                }
                 unlocked_at = Instant::now();
                 continue;
             }
             if let Some(v) = wheel_flick {
-                self.wheel_interact(false, v, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
+                if let Some(open) = self.wheel_interact(
+                    false,
+                    v,
+                    &mut wheel_s_q8,
+                    &now,
+                    wheel_batt,
+                    anim_start,
+                    &mut tp,
+                ) {
+                    scene = self.open_app(
+                        open, wheel_s_q8, &mut app_state, &now, wheel_batt, anim_start, &mut tp,
+                    );
+                }
                 unlocked_at = Instant::now();
                 continue;
             }
@@ -605,6 +634,11 @@ impl<'a, 'd> App<'a, 'd> {
                 if row != cur {
                     println!("wheel: tap -> row {row}");
                     self.wheel_settle(&mut wheel_s_q8, row, &now, wheel_batt, anim_start, &mut tp);
+                } else {
+                    println!("wheel: tap-open row {row}");
+                    scene = self.open_app(
+                        row, wheel_s_q8, &mut app_state, &now, wheel_batt, anim_start, &mut tp,
+                    );
                 }
                 unlocked_at = Instant::now();
                 continue;
@@ -833,7 +867,7 @@ impl<'a, 'd> App<'a, 'd> {
             // at rest and the real status line replacing the morphed digits
             // at the exact same slot.
             self.wheel_fx.invalidate();
-            wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, false, None);
+            wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, false, None, None);
             self.flush_dirty();
             println!(
                 "scene: -> Wheel (settle {} frames in {}ms)",
@@ -868,7 +902,7 @@ impl<'a, 'd> App<'a, 'd> {
         lvl_prev: &mut i32,
     ) {
         let p = ((H - b as i32) * 256) / H;
-        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, false, Some(p));
+        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, false, Some(p), None);
         // Ring: repainted whole while visible — level steps recolor it and
         // row/glow clears can nibble its rim pixels. Once faded, one last
         // level-0 (black) repaint retires it for the session.
@@ -1047,6 +1081,9 @@ impl<'a, 'd> App<'a, 'd> {
     /// Momentum is ADDITIVE across quick successive flicks: a re-flick in
     /// the glide's direction stacks onto the surviving momentum; an
     /// opposite flick (or a long deliberate drag) starts fresh.
+    /// Returns Some(row) when a tap on the already-focused row asks to
+    /// OPEN that app (the run loop performs the morph).
+    #[allow(clippy::too_many_arguments)]
     fn wheel_interact(
         &mut self,
         mut grab: bool,
@@ -1056,7 +1093,7 @@ impl<'a, 'd> App<'a, 'd> {
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
-    ) {
+    ) -> Option<usize> {
         let mut vel = wheel_power(vel_raw);
         let mut carry: i32 = 0;
         loop {
@@ -1091,13 +1128,17 @@ impl<'a, 'd> App<'a, 'd> {
                             let cur = (((*s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
                                 .clamp(0, wheel::rows() as i32 - 1)
                                 as usize;
-                            if row != cur {
-                                println!("wheel: tap -> row {row}");
+                            if row == cur {
+                                // Tap on the focused row = OPEN it.
+                                println!("wheel: tap-open row {row}");
+                                self.wheel_settle(s_q8, row, now, batt, anim_start, tp);
+                                return Some(row);
                             }
-                            // Always settle: a micro-scrolled tap leaves a
-                            // sub-row offset that must ease back.
+                            println!("wheel: tap -> row {row}");
+                            // Settle: selects the tapped row (and pulls any
+                            // micro-scroll sub-row offset back).
                             self.wheel_settle(s_q8, row, now, batt, anim_start, tp);
-                            return;
+                            return None;
                         }
                     }
                 }
@@ -1110,6 +1151,7 @@ impl<'a, 'd> App<'a, 'd> {
                 }
             }
         }
+        None
     }
 
     /// Direct-manipulation scroll session: the wheel is anchored to the
@@ -1179,6 +1221,13 @@ impl<'a, 'd> App<'a, 'd> {
         // Last three distinct-position samples (y, ms) for release velocity.
         let start_ms = anim_start.elapsed().as_millis() as u32;
         let mut ring = [(anchor_y, start_ms); 3];
+        // Held-press affordance: after a beat of stillness, the pressed
+        // row's label gets its dark grey pill (drawn as one full wheel
+        // frame; erased the same way if the press becomes a drag).
+        let mut pill: Option<usize> = None;
+        let press_row = (origin_y - H / 2 + (anchor_s >> 8) + wheel::PITCH_PX / 2)
+            .div_euclid(wheel::PITCH_PX)
+            .clamp(0, wheel::rows() as i32 - 1) as usize;
 
         loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
@@ -1219,7 +1268,22 @@ impl<'a, 'd> App<'a, 'd> {
                 // burst after a chip stall eases in over ~3 frames instead
                 // of teleporting.
                 *s_q8 += if diff.abs() <= 512 { diff } else { diff * 3 / 4 };
-                self.draw_wheel(now, batt, *s_q8, diff.abs() > FAST_LOD_Q8);
+                self.draw_wheel(now, batt, *s_q8, diff.abs() > FAST_LOD_Q8, pill);
+                self.flush_dirty();
+            }
+            // Pill on: a still press past the settle beat. Pill off: the
+            // press turned into a drag.
+            if pill.is_none()
+                && !gate_open
+                && max_disp <= TAP_RADIUS_PX
+                && t0.elapsed() >= Duration::from_millis(90)
+            {
+                pill = Some(press_row);
+                self.draw_wheel(now, batt, *s_q8, false, pill);
+                self.flush_dirty();
+            } else if pill.is_some() && (gate_open || max_disp > TAP_RADIUS_PX) {
+                pill = None;
+                self.draw_wheel(now, batt, *s_q8, false, None);
                 self.flush_dirty();
             }
             self.maybe_reinit_touch(tp);
@@ -1227,10 +1291,10 @@ impl<'a, 'd> App<'a, 'd> {
         }
 
         let held_ms = t0.elapsed().as_millis() as u32;
-        // Retroactive tap: max displacement stayed inside the tap radius
-        // and the press was short — even if it micro-scrolled a few px
-        // (the settle pulls the sub-row offset back).
-        if max_disp <= TAP_RADIUS_PX && held_ms < 350 {
+        // Retroactive tap: max displacement stayed inside the tap radius —
+        // ANY hold duration (a held-still press is the select/open gesture,
+        // pill shown; micro-scroll settles back).
+        if max_disp <= TAP_RADIUS_PX {
             return Direct::Tap { y: last_y };
         }
         if !gate_open {
@@ -1424,7 +1488,7 @@ impl<'a, 'd> App<'a, 'd> {
             } else if diff.abs() <= 256 {
                 *s_q8 = target;
                 v_q8 = 0;
-                self.draw_wheel(now, batt, *s_q8, false);
+                self.draw_wheel(now, batt, *s_q8, false, None);
                 self.flush_dirty();
                 landed_at = Some(Instant::now());
                 continue;
@@ -1434,7 +1498,7 @@ impl<'a, 'd> App<'a, 'd> {
                 *s_q8 += diff * 5 / 16;
             }
             let fast = v_q8.abs() > FAST_LOD_Q8 / 25;
-            self.draw_wheel(now, batt, *s_q8, fast);
+            self.draw_wheel(now, batt, *s_q8, fast, None);
             self.flush_dirty();
             // Fixed 25 ms cadence: consistent frame intervals read premium.
             wheel::pace(fs);
@@ -1466,7 +1530,7 @@ impl<'a, 'd> App<'a, 'd> {
             }
             let diff = target - *s_q8;
             *s_q8 += if diff.abs() <= 256 { diff } else { diff * 5 / 16 };
-            self.draw_wheel(now, batt, *s_q8, false);
+            self.draw_wheel(now, batt, *s_q8, false, None);
             self.flush_dirty();
             wheel::pace(fs);
         }
@@ -1474,8 +1538,30 @@ impl<'a, 'd> App<'a, 'd> {
 
     /// One wheel frame through the damage-minimized renderer (targeted
     /// clear + union-bbox partial flush; motion LOD when `fast`).
-    fn draw_wheel(&mut self, now: &WallTime, batt: Option<u8>, s_q8: i32, fast: bool) {
-        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast, None);
+    fn draw_wheel(&mut self, now: &WallTime, batt: Option<u8>, s_q8: i32, fast: bool, pill: Option<usize>) {
+        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast, None, pill);
+    }
+
+    /// Open an app from the wheel: per-app state prime + the open morph.
+    #[allow(clippy::too_many_arguments)]
+    fn open_app(
+        &mut self,
+        idx: usize,
+        s_q8: i32,
+        st: &mut apps::State,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) -> Scene {
+        if idx == apps::GALLERY {
+            st.gal_page = 0;
+            st.gal_settle = Some(Instant::now());
+        }
+        if idx == apps::TIME {
+            st.t_anchor = None;
+        }
+        self.app_morph(idx, true, s_q8, st, now, batt, anim_start, tp)
     }
 
     /// The wheel ↔ app open/close morph with a splash beat (W3 §2, user-
@@ -1527,14 +1613,26 @@ impl<'a, 'd> App<'a, 'd> {
             t += dirn * if dirn > 0 { STEP_OPEN } else { STEP_CLOSE };
             let tc = t.clamp(0, t_end);
             // (flight, splash-icon alpha, splash-title alpha, content q).
+            // Closing is resequenced (user): the content fades out FULLY
+            // first (eased, fast), THEN the logo eases in, then it flies
+            // home — never a crossfade on the way out.
             let (f, icon_a, title_a, q) = if tc < T_FLIGHT {
                 (smooth(tc * 256 / T_FLIGHT), 256, 0, 0)
             } else if tc < T_FLIGHT + T_HOLD {
-                // Title fades in over the hold's first 120 ms.
-                (256, 256, ((tc - T_FLIGHT) * 256 / 120).min(256), 0)
+                if dirn < 0 {
+                    let ia = smooth((T_FLIGHT + T_HOLD - tc) * 256 / 140);
+                    (256, ia, ia, 0)
+                } else {
+                    // Title fades in over the hold's first 120 ms.
+                    (256, 256, ((tc - T_FLIGHT) * 256 / 120).min(256), 0)
+                }
             } else {
                 let q = smooth((tc - T_FLIGHT - T_HOLD) * 256 / T_CONTENT);
-                (256, 256 - q, 256 - q, q)
+                if dirn < 0 {
+                    (256, 0, 0, q)
+                } else {
+                    (256, 256 - q, 256 - q, q)
+                }
             };
             let elapsed = anim_start.elapsed().as_millis() as u32;
             if full_bleed && q > 0 {

@@ -93,6 +93,16 @@ pub fn has_content(idx: usize) -> bool {
     matches!(idx, TIME | GALLERY | ACTIVITY | SETTINGS | PHOTOS)
 }
 
+/// Whether the app shows the shared status clock. The Time app hides it
+/// (its big digits ARE the time — user decision) and centers its group.
+pub fn shows_status(idx: usize) -> bool {
+    idx != TIME
+}
+
+/// Time app layout: big digits + date optically centered as a group.
+const TIME_BASE_Y: i32 = 244;
+const DATE_BASE_Y: i32 = 298;
+
 /// Photos hero (glow disc) center.
 const PHOTOS_HERO: (i32, i32) = (CX, 230);
 
@@ -190,10 +200,17 @@ pub fn draw_reveal(
         let dw = wheel::text_width(d_str, &lock::TEXT_GLYPHS);
         {
             let fb = wfb.buf_mut();
-            wheel::draw_text_at(fb, t_str, CX - tw / 2, 223 + rise, q_q8, &lock::TIME_GLYPHS);
-            wheel::draw_text_at(fb, d_str, CX - dw / 2, 276 + rise, (150 * q_q8) >> 8, &lock::TEXT_GLYPHS);
+            wheel::draw_text_at(fb, t_str, CX - tw / 2, TIME_BASE_Y + rise, q_q8, &lock::TIME_GLYPHS);
+            wheel::draw_text_at(
+                fb,
+                d_str,
+                CX - dw / 2,
+                DATE_BASE_Y + rise,
+                (150 * q_q8) >> 8,
+                &lock::TEXT_GLYPHS,
+            );
         }
-        let r = (CX - tw / 2 - 2, 128 + rise, CX + tw / 2 + 2, 288 + rise);
+        let r = (CX - tw / 2 - 2, 150 + rise, CX + tw / 2 + 2, 310 + rise);
         fx.push(r.0, r.1, r.2, r.3);
         wfb.mark_rect(r.0, r.1, r.2, r.3);
         st.t_anchor = None; // reseed the arc on the first rest tick
@@ -206,7 +223,7 @@ pub fn draw_reveal(
                 let p = ((q_q8 - i as i32 * 36) * 256 / 184).clamp(0, 256);
                 let sweep = (closure * 1024 / 100) * p >> 8;
                 if sweep > 0 {
-                    draw_ring_arc(fb, CX, CY, rc - ACT_HALF_W, rc + ACT_HALF_W, sweep, *tint, 230);
+                    ring_with_caps(fb, *rc, sweep, *tint, 230);
                 }
             }
             let steps = "6 412";
@@ -216,7 +233,7 @@ pub fn draw_reveal(
             let cw2 = wheel::text_width(cap, &lock::TEXT_GLYPHS);
             wheel::draw_text_at(fb, cap, CX - cw2 / 2, 284 + rise, (102 * q_q8) >> 8, &lock::TEXT_GLYPHS);
         }
-        let r = (CX - 162, CY - 162, CX + 162, CY + 162);
+        let r = (CX - 132, CY - 132, CX + 132, CY + 132);
         fx.push(r.0, r.1, r.2, r.3);
         wfb.mark_rect(r.0, r.1, r.2, r.3);
     } else if idx == SETTINGS {
@@ -323,6 +340,9 @@ fn time_tick(wfb: &mut WatchFb, now: &WallTime, st: &mut State) {
         st.t_anchor = Some(Instant::now());
         let a = ((now.second as i32) * 1024 / 60).max(4);
         let fb = wfb.buf_mut();
+        // The Time app owns the whole face: the status clock is hidden
+        // here (the big digits ARE the time).
+        fill_rect_black(fb, CX - 110, 26, CX + 110, 66);
         clear_annulus(fb, ARC_R_IN - 2, ARC_R_OUT + 2);
         draw_ring_arc(fb, CX, CY, ARC_R_IN, ARC_R_OUT, a, AZURE, 230);
         let (vx, vy) = pseudo_dir(a);
@@ -348,10 +368,10 @@ fn time_tick(wfb: &mut WatchFb, now: &WallTime, st: &mut State) {
         let tw = wheel::text_width(t_str, &lock::TIME_GLYPHS);
         let dw = wheel::text_width(d_str, &lock::TEXT_GLYPHS);
         let fb = wfb.buf_mut();
-        fill_rect_black(fb, CX - 170, 128, CX + 170, 290);
-        wheel::draw_text_at(fb, t_str, CX - tw / 2, 223, 256, &lock::TIME_GLYPHS);
-        wheel::draw_text_at(fb, d_str, CX - dw / 2, 276, 150, &lock::TEXT_GLYPHS);
-        wfb.mark_rect(CX - 170, 128, CX + 170, 290);
+        fill_rect_black(fb, CX - 170, 150, CX + 170, 310);
+        wheel::draw_text_at(fb, t_str, CX - tw / 2, TIME_BASE_Y, 256, &lock::TIME_GLYPHS);
+        wheel::draw_text_at(fb, d_str, CX - dw / 2, DATE_BASE_Y, 150, &lock::TEXT_GLYPHS);
+        wfb.mark_rect(CX - 170, 150, CX + 170, 310);
     }
     let ms = (st.t_sec as i32) * 1000
         + (st.t_anchor.map(|t| t.elapsed().as_millis() as i32).unwrap_or(0)).min(999);
@@ -389,12 +409,39 @@ fn time_tick(wfb: &mut WatchFb, now: &WallTime, st: &mut State) {
 // ---------------------------------------------------------------------
 
 /// (center radius, closure %, tint) — outer→inner: azure, violet, teal.
+/// Outer ring tops out at y=105, safely below the title (user: rings must
+/// not overlap it).
 const ACT_RINGS: [(i32, i32, (i32, i32, i32)); 3] = [
-    (150, 82, (70, 150, 255)),
-    (118, 64, (170, 120, 255)),
-    (86, 91, (70, 220, 200)),
+    (120, 82, (70, 150, 255)),
+    (92, 64, (170, 120, 255)),
+    (64, 91, (70, 220, 200)),
 ];
-const ACT_HALF_W: i32 = 9;
+const ACT_HALF_W: i32 = 8;
+
+/// Rounded stroke caps at both arc ends (Apple-ring style): a solid AA
+/// disc of half-stroke radius, MAX-blended — merges seamlessly with the
+/// band and never self-stacks, so the sweeping tip can stamp its cap
+/// every frame (the trail coincides with the band it just drew).
+fn cap_dot(fb: &mut [u8], cx: i32, cy: i32, r: i32, tint: (i32, i32, i32), v: i32) {
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = dx * dx + dy * dy;
+            if d2 > r * r {
+                continue;
+            }
+            let a = if d2 <= (r - 1) * (r - 1) { v } else { v / 2 };
+            max_px(fb, cx + dx, cy + dy, tint, a);
+        }
+    }
+}
+
+/// One ring arc with rounded caps at 12 o'clock and at the sweep tip.
+fn ring_with_caps(fb: &mut [u8], rc: i32, sweep: i32, tint: (i32, i32, i32), v: i32) {
+    draw_ring_arc(fb, CX, CY, rc - ACT_HALF_W, rc + ACT_HALF_W, sweep, tint, v);
+    cap_dot(fb, CX, CY - rc, ACT_HALF_W, tint, v);
+    let (vx, vy) = pseudo_dir(sweep);
+    cap_dot(fb, CX + (rc * vx >> 8), CY + (rc * vy >> 8), ACT_HALF_W, tint, v);
+}
 
 fn activity_tick(wfb: &mut WatchFb, elapsed_ms: u32) {
     // Tips breathe on the shared tempo: erase each tip rect, repaint any
@@ -413,6 +460,9 @@ fn activity_tick(wfb: &mut WatchFb, elapsed_ms: u32) {
         for (rc2, closure2, tint2) in ACT_RINGS.iter() {
             let sweep2 = closure2 * 1024 / 100;
             arc_in_rect(fb, rc2 - ACT_HALF_W, rc2 + ACT_HALF_W, sweep2, *tint2, 230, r);
+            // Restore any cap the erase rect clipped.
+            let (vx2, vy2) = pseudo_dir(sweep2);
+            cap_dot(fb, CX + (rc2 * vx2 >> 8), CY + (rc2 * vy2 >> 8), ACT_HALF_W, *tint2, 230);
         }
         soft_dot(fb, tx, ty, 10, *tint, (b * 240) >> 8);
         rects[i] = r;
@@ -963,13 +1013,17 @@ fn disc(fb: &mut [u8], cx: i32, cy: i32, r: i32, tint: (i32, i32, i32), vmax: i3
     }
 }
 
-/// Uppercase + letter-spaced title metrics: (left_x, width).
+/// Title styling (user-tuned): a little smaller than TEXT (78%), white.
+const TITLE_SCALE_Q8: i32 = 200;
+const TITLE_WHITE: (i32, i32, i32) = (245, 246, 250);
+
+/// Uppercase + letter-spaced title metrics at TITLE_SCALE: (left_x, width).
 fn title_metrics(name: &str) -> (i32, i32) {
     let mut w = 0;
     let mut n = 0;
     for ch in name.chars() {
         if let Some(g) = lock::get_glyph(&lock::TEXT_GLYPHS, ch.to_ascii_uppercase()) {
-            w += g.advance as i32 + TITLE_SPACING;
+            w += ((g.advance as i32 * TITLE_SCALE_Q8) >> 8) + TITLE_SPACING;
             n += 1;
         }
     }
@@ -980,40 +1034,69 @@ fn title_metrics(name: &str) -> (i32, i32) {
 }
 
 fn draw_title(fb: &mut [u8], name: &str, left_x: i32, base_y: i32, alpha: i32, tint: (i32, i32, i32)) {
+    let _ = tint; // titles are white by design (user); accents stay on art
     let mut x = left_x;
     for ch in name.chars() {
         if let Some(g) = lock::get_glyph(&lock::TEXT_GLYPHS, ch.to_ascii_uppercase()) {
-            let gy = base_y - (g.height as i32 + g.ymin as i32);
-            draw_glyph_tint(fb, x, gy, g, alpha, tint);
-            x += g.advance as i32 + TITLE_SPACING;
+            if g.width > 0 && g.height > 0 {
+                let dst_w = ((g.width as i32 * TITLE_SCALE_Q8) >> 8).max(1);
+                let dst_h = ((g.height as i32 * TITLE_SCALE_Q8) >> 8).max(1);
+                let gy = base_y - (((g.height as i32 + g.ymin as i32) * TITLE_SCALE_Q8) >> 8);
+                draw_glyph_scaled_tint(fb, x, gy, g, alpha, dst_w, dst_h, TITLE_WHITE);
+            }
+            x += ((g.advance as i32 * TITLE_SCALE_Q8) >> 8) + TITLE_SPACING;
         }
     }
 }
 
-/// 4-bit-alpha glyph through a custom tint (accent titles) — the wheel's
-/// draw_glyph is hard-tinted ice; this is its accent twin.
-fn draw_glyph_tint(fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, alpha: i32, tint: (i32, i32, i32)) {
-    let w = g.width as i32;
-    let h = g.height as i32;
+/// Bilinear-scaled 4-bit glyph through a custom tint (the scaled twin of
+/// draw_glyph_tint; titles render at 78%).
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_scaled_tint(
+    fb: &mut [u8],
+    ox: i32,
+    oy: i32,
+    g: &Glyph,
+    alpha: i32,
+    dst_w: i32,
+    dst_h: i32,
+    tint: (i32, i32, i32),
+) {
+    let src_w = g.width as i32;
+    let src_h = g.height as i32;
     let stride = (g.width as usize + 1) / 2;
-    for gy in 0..h {
-        let y = oy + gy;
+    let sample = |x: i32, y: i32| -> i32 {
+        let x = x.clamp(0, src_w - 1);
+        let y = y.clamp(0, src_h - 1);
+        let byte = g.data[y as usize * stride + (x as usize) / 2];
+        let a4 = if x % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+        (a4 as i32) * 17
+    };
+    let step_x = (src_w << 8) / dst_w;
+    let step_y = (src_h << 8) / dst_h;
+    for dy in 0..dst_h {
+        let y = oy + dy;
         if y < 0 || y >= H {
             continue;
         }
-        let row = &g.data[gy as usize * stride..(gy as usize + 1) * stride];
-        for gx in 0..w {
-            let x = ox + gx;
+        let sy_q8 = dy * step_y;
+        let (sy, fy) = (sy_q8 >> 8, sy_q8 & 255);
+        for dx in 0..dst_w {
+            let x = ox + dx;
             if x < 0 || x >= W {
                 continue;
             }
-            let byte = row[gx as usize / 2];
-            let a4 = if gx % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-            if a4 == 0 {
+            let sx_q8 = dx * step_x;
+            let (sx, fx) = (sx_q8 >> 8, sx_q8 & 255);
+            let a = (sample(sx, sy) * (256 - fx) * (256 - fy)
+                + sample(sx + 1, sy) * fx * (256 - fy)
+                + sample(sx, sy + 1) * (256 - fx) * fy
+                + sample(sx + 1, sy + 1) * fx * fy)
+                >> 16;
+            if a < 8 {
                 continue;
             }
-            let v = ((a4 as i32) * 17 * alpha) >> 8;
-            blend_px(fb, x, y, tint, v);
+            blend_px(fb, x, y, tint, (a * alpha) >> 8);
         }
     }
 }
