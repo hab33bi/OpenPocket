@@ -219,8 +219,12 @@ pub fn draw_reveal(
         fx.push(CX - cw / 2 - 2, cy - 32, CX + cw / 2 + 2, cy + 10);
         wfb.mark_rect(CX - cw / 2 - 2, cy - 32, CX + cw / 2 + 2, cy + 10);
     } else if idx == TIME {
-        // §4.1 — big centered time + date; the seconds arc is seeded by
-        // the first rest tick (its rim damage wants one clean full flush).
+        // §4.1 — big centered time + date. Fades in PLACE (no rise) under
+        // one generous static clear rect: while the reveal scrubbed, a
+        // moving draw vs its trailing clear could strand 1-2 px digit
+        // slivers for a beat (user-observed). Static draw + static rect
+        // makes draw and clear identical by construction. The seconds arc
+        // is seeded by the first rest tick (one clean full flush).
         let (tbuf, dbuf, dlen) = time_strings(now);
         let t_str = core::str::from_utf8(&tbuf).unwrap_or("00:00");
         let d_str = core::str::from_utf8(&dbuf[..dlen]).unwrap_or("");
@@ -228,17 +232,10 @@ pub fn draw_reveal(
         let dw = wheel::text_width(d_str, &lock::TEXT_GLYPHS);
         {
             let fb = wfb.buf_mut();
-            wheel::draw_text_at(fb, t_str, CX - tw / 2, TIME_BASE_Y + rise, q_q8, &lock::TIME_GLYPHS);
-            wheel::draw_text_at(
-                fb,
-                d_str,
-                CX - dw / 2,
-                DATE_BASE_Y + rise,
-                (150 * q_q8) >> 8,
-                &lock::TEXT_GLYPHS,
-            );
+            wheel::draw_text_at(fb, t_str, CX - tw / 2, TIME_BASE_Y, q_q8, &lock::TIME_GLYPHS);
+            wheel::draw_text_at(fb, d_str, CX - dw / 2, DATE_BASE_Y, (150 * q_q8) >> 8, &lock::TEXT_GLYPHS);
         }
-        let r = (CX - tw / 2 - 2, 150 + rise, CX + tw / 2 + 2, 310 + rise);
+        let r = (CX - 180, 140, CX + 180, 322);
         fx.push(r.0, r.1, r.2, r.3);
         wfb.mark_rect(r.0, r.1, r.2, r.3);
         st.t_anchor = None; // reseed the arc on the first rest tick

@@ -29,8 +29,9 @@ pub fn rows() -> usize {
 }
 /// Padding between an icon's bounding box and the circular boundary — the
 /// box is fitted against the chord at its WORST row (top/bottom corner), so
-/// icons can never leave the screen.
-const EDGE_PAD: i32 = 10;
+/// icons can never leave the screen. 15 (was 10): the focus glow ring was
+/// kissing the panel edge (user).
+const EDGE_PAD: i32 = 15;
 /// Ice-blue tint shared with the lock scene's text.
 const TINT: (i32, i32, i32) = (200, 215, 255);
 

@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=__force_rerun_for_build_time__");
 
     generate_sin_lut();
+    generate_noise_luts();
     generate_inter_font();
     generate_bezel_schedules();
     generate_build_time();
@@ -204,6 +205,47 @@ fn ingest_to_rgb565(src_path: &std::path::Path, out_path: &std::path::Path) {
     }
     std::fs::write(out_path, out)
         .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
+}
+
+/// Periodic value-noise LUTs for the Aurora ring flow (lock flourish):
+/// smooth wrap-continuous 256-entry bands at two frequencies, scrolled in
+/// opposite directions at runtime and summed — organic, never-repeating
+/// color flow with zero per-frame generation cost.
+fn generate_noise_luts() {
+    let mk_noise = |n_ctrl: usize, seed: u64| -> Vec<u8> {
+        // Deterministic LCG control points, cosine-interpolated, periodic.
+        let mut s = seed;
+        let mut rnd = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) % 256) as f64
+        };
+        let ctrl: Vec<f64> = (0..n_ctrl).map(|_| 40.0 + rnd() * 175.0 / 255.0).collect();
+        (0..256)
+            .map(|i| {
+                let pos = i as f64 * n_ctrl as f64 / 256.0;
+                let k = pos.floor() as usize;
+                let t = pos - k as f64;
+                let a = ctrl[k % n_ctrl];
+                let b = ctrl[(k + 1) % n_ctrl];
+                let w = (1.0 - (t * std::f64::consts::PI).cos()) / 2.0;
+                (a + (b - a) * w).round().clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    };
+    let mut body = String::from("/// Auto-generated periodic value noise (Aurora ring).\n");
+    for (name, n, seed) in [("NOISE_A", 7usize, 0x517cc1b727220a95u64), ("NOISE_B", 13, 0x2545f4914f6cdd1d)] {
+        body.push_str(&format!("pub static {name}: [u8; 256] = ["));
+        for (i, v) in mk_noise(n, seed).iter().enumerate() {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!("{v}"));
+        }
+        body.push_str("];\n");
+    }
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let path = std::path::Path::new(&out_dir).join("noise_lut.rs");
+    std::fs::write(path, body).expect("write noise_lut.rs");
 }
 
 /// 512-entry Q14 sine LUT for src/trig.rs.

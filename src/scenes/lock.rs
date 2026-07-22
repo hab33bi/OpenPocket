@@ -20,6 +20,7 @@ use crate::trig::lut_sin_cos_q14;
 
 include!(concat!(env!("OUT_DIR"), "/inter_font.rs"));
 include!(concat!(env!("OUT_DIR"), "/watch_anim.rs"));
+include!(concat!(env!("OUT_DIR"), "/noise_lut.rs"));
 
 /// Correct Q14 value for +90° (pi/2).
 const FRAC_PI_2_Q14: i32 = 25736;
@@ -80,6 +81,8 @@ const FL_BLOOM_F: u32 = 10;
 const FL_SHIMMER_F: u32 = 64;
 const FL_RETRACT_F: u32 = 14;
 const FL_TOTAL_F: u32 = FL_BLOOM_F + FL_SHIMMER_F + FL_RETRACT_F;
+/// Ember spray population (transition sparks).
+const EMBER_N: usize = 24;
 
 /// Bayer 4×4 ordered-dither offsets (≈ ±half an RGB565 blue step) — breaks
 /// the 32-level blue quantization into invisible noise across the glow.
@@ -139,6 +142,12 @@ pub struct Clock {
     /// biased +128) in a parallel array.
     flourish_runs: Vec<(u32, u16)>,
     flourish_d: Vec<u8>,
+    /// Parallel per-pixel ANGLE (diamond pseudo-angle, 0..=255 wrapping)
+    /// — turns the flourish run-iterator into a polar fragment shader.
+    flourish_a: Vec<u8>,
+    /// Ember spray particles: [x_q8, y_q8, vx_q8, vy_q8, life].
+    embers: [[i32; 5]; EMBER_N],
+    rng: u32,
     /// Frame counter; u32::MAX = inactive.
     flourish_frame: u32,
     /// Saber gradient, packed RGB565-BE: black → electric blue → neon azure
@@ -184,6 +193,9 @@ impl Clock {
             ring_lut: [(0, 0); 256],
             flourish_runs: Vec::new(),
             flourish_d: Vec::new(),
+            flourish_a: Vec::new(),
+            embers: [[0; 5]; EMBER_N],
+            rng: 0x2F6E_2B1D,
             flourish_frame: u32::MAX,
             flourish_lut: [(0, 0); 256],
             saber_rgb: [(0, 0, 0); 256],
@@ -284,6 +296,7 @@ impl Clock {
         let (r_out2, r_in2) = (r_out * r_out, r_in * r_in);
         let mut fruns: Vec<(u32, u16)> = Vec::with_capacity(4_096);
         let mut fd: Vec<u8> = Vec::with_capacity(72_000);
+        let mut fa: Vec<u8> = Vec::with_capacity(72_000);
         for py in 0..H {
             let dy = py - CY;
             for px in 0..W {
@@ -302,10 +315,12 @@ impl Clock {
                     _ => fruns.push((off, 1)),
                 }
                 fd.push(d_biased);
+                fa.push(diamond_angle(dx, dy));
             }
         }
         self.flourish_runs = fruns;
         self.flourish_d = fd;
+        self.flourish_a = fa;
 
         // Electric-azure saber gradient (user-chosen): black → deep indigo
         // veil → azure glow → neon azure blade → white-hot core. The
@@ -965,32 +980,53 @@ impl Clock {
         let g_in = (((fr + 1) * 256) / FL_FADE_F).min(256) as i32;
         let g_out = (((FL_TOTAL_F - 1 - fr) * 256) / FL_FADE_F).min(256) as i32;
         let g = g_in.min(g_out);
+        // The LUT is rebuilt EVERY lit frame (256 entries — free) so it can
+        // carry the living color layer: a white-hot core pulse breathing on
+        // the hold, and ±2-index chromatic fringing (R samples ahead, B
+        // behind) that gives gradients a colored halo. g=0 stays the exact
+        // resting ring LUT — the closing frame's pixel-exact handback.
         let mut lut_local = [(0u8, 0u8); 256];
-        let lut: &[(u8, u8); 256] = if g >= 256 {
-            &self.flourish_lut
-        } else if g <= 0 {
-            &self.ring_lut
+        let lut: [(u8, u8); 256] = if g <= 0 {
+            self.ring_lut
         } else {
+            let pulse = {
+                let ph = ((fr * 12) % 512) as i32;
+                let t = if ph < 256 { ph } else { 511 - ph };
+                (t * 40) >> 8 // 0..40 brightness lift at the core
+            };
             for (i, e) in lut_local.iter_mut().enumerate() {
-                let (sr, sg, sb) = self.saber_rgb[i];
+                let sr = self.saber_rgb[(i + 2).min(255)].0 as i32;
+                let sg = self.saber_rgb[i].1 as i32;
+                let sb = self.saber_rgb[i.saturating_sub(2)].2 as i32;
+                let boost = if i >= 200 { (i as i32 - 200) * pulse / 55 } else { 0 };
+                let (sr, sg, sb) = ((sr + boost).min(255), (sg + boost).min(255), (sb + boost).min(255));
                 let i = i as i32;
                 let (rr, rg, rb) = (200 * i / 255, 215 * i / 255, i);
-                let r = rr + (((sr as i32 - rr) * g) >> 8);
-                let gg = rg + (((sg as i32 - rg) * g) >> 8);
-                let b = rb + (((sb as i32 - rb) * g) >> 8);
+                let r = rr + (((sr - rr) * g) >> 8);
+                let gg = rg + (((sg - rg) * g) >> 8);
+                let b = rb + (((sb - rb) * g) >> 8);
                 let r5 = ((r as u16) * 31 / 255) & 0x1F;
                 let g6 = ((gg as u16) * 63 / 255) & 0x3F;
                 let b5 = ((b as u16) * 31 / 255) & 0x1F;
                 let px = (r5 << 11) | (g6 << 5) | b5;
                 *e = ((px >> 8) as u8, px as u8);
             }
-            &lut_local
+            lut_local
         };
 
         // Dither only while the saber look is active (g > 0) — the closing
         // frame must write exact ring-LUT values, and dither noise must never
         // persist on the resting canvas.
         let do_dither = g > 0;
+
+        // Aurora Flow: two periodic noise bands scrolled in opposite
+        // directions, sampled by each pixel's ring angle, displacing the
+        // gradient index. The parabola weight w = val·(255−val) keeps the
+        // endpoints EXACT (black stays black, the white core stays white),
+        // so the retract handback is untouched.
+        let t1 = (fr as usize) * 3;
+        let t2 = (fr as usize) * 5;
+        let aurora = g > 0;
 
         let mut writes = 0usize;
         let mut pi = 0usize;
@@ -1002,6 +1038,15 @@ impl Clock {
                 let sab = prof[self.flourish_d[pi + k] as usize] as i32;
                 let p = px_base + k;
                 let mut val = (self.ring_alpha[p] as i32).max(sab);
+                if aurora && val > 0 {
+                    let ang = self.flourish_a[pi + k] as usize;
+                    let sh = (NOISE_A[(ang + t1) & 255] as i32
+                        + NOISE_B[(ang * 2 + 512 - t2) & 255] as i32)
+                        / 2
+                        - 128;
+                    let w = (val * (255 - val)) >> 6;
+                    val = (val + ((((sh * w) >> 9) * bloom) >> 8)).clamp(0, 255);
+                }
                 if do_dither && val > 0 && val < 232 {
                     let x = p % W as usize;
                     let y = p / W as usize;
@@ -1017,6 +1062,18 @@ impl Clock {
             pi += n;
             writes += n;
         }
+
+        // Ember spray (transitions only): sparks scatter along the band at
+        // ignition and retract, riding over the glow with MAX writes. They
+        // live entirely inside the annulus, so the next frame's full band
+        // rewrite erases them for free.
+        if fr == 0 || fr == FL_BLOOM_F + FL_SHIMMER_F {
+            self.spawn_embers();
+        }
+        if g > 0 {
+            self.step_embers(fb, &lut);
+        }
+
         acc.add(CX - BEZEL_R - FL_OUT_PX - 1, CY - BEZEL_R - FL_OUT_PX - 1);
         acc.add(CX + BEZEL_R + FL_OUT_PX + 1, CY + BEZEL_R + FL_OUT_PX + 1);
 
@@ -1025,6 +1082,71 @@ impl Clock {
             self.flourish_frame = u32::MAX;
         }
         writes
+    }
+
+    fn rnd(&mut self) -> u32 {
+        // xorshift32 — deterministic spark scatter.
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        x
+    }
+
+    /// Scatter the spray: embers born on the ring's centerline with mostly
+    /// tangential velocity + a small inward drift — bounded so every spark
+    /// lives and dies inside the flourish annulus.
+    fn spawn_embers(&mut self) {
+        for e in 0..EMBER_N {
+            let a = (self.rnd() & 255) as i32;
+            let (dx, dy) = diamond_dir(a);
+            let r0 = (BEZEL_R - 14) + (self.rnd() % 10) as i32;
+            let t_sign: i32 = if self.rnd() & 1 == 0 { 1 } else { -1 };
+            let sp = 50 + (self.rnd() % 90) as i32;
+            let inw = 14 + (self.rnd() % 26) as i32;
+            self.embers[e] = [
+                (CX << 8) + r0 * dx,
+                (CY << 8) + r0 * dy,
+                (-dy * t_sign * sp - dx * inw) >> 8,
+                (dx * t_sign * sp - dy * inw) >> 8,
+                (9 + (self.rnd() % 7)) as i32,
+            ];
+        }
+    }
+
+    /// Advance + draw embers: 2×2 white-hot dots, per-channel MAX over the
+    /// glow (idempotent layering; erased by the band rewrite next frame).
+    fn step_embers(&mut self, fb: &mut [u8], lut: &[(u8, u8); 256]) {
+        for e in self.embers.iter_mut() {
+            if e[4] <= 0 {
+                continue;
+            }
+            e[4] -= 1;
+            e[0] += e[2];
+            e[1] += e[3];
+            e[2] = e[2] * 243 / 256;
+            e[3] = e[3] * 243 / 256;
+            let v = (170 + e[4] * 12).min(255) as usize;
+            let (hi, lo) = lut[v];
+            let new = ((hi as u16) << 8) | lo as u16;
+            let (x0, y0) = (e[0] >> 8, e[1] >> 8);
+            for (px, py) in [(x0, y0), (x0 + 1, y0), (x0, y0 + 1), (x0 + 1, y0 + 1)] {
+                if px < 0 || px >= W || py < 0 || py >= H {
+                    continue;
+                }
+                let idx = ((py * W + px) * 2) as usize;
+                if idx + 1 >= fb.len() {
+                    continue;
+                }
+                let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
+                let m = ((new >> 11).max(old >> 11) << 11)
+                    | (((new >> 5) & 0x3F).max((old >> 5) & 0x3F) << 5)
+                    | (new & 0x1F).max(old & 0x1F);
+                fb[idx] = (m >> 8) as u8;
+                fb[idx + 1] = m as u8;
+            }
+        }
     }
 
     /// AOD minimal frame: black canvas, HH:MM only, drifted by a
@@ -1233,6 +1355,35 @@ pub fn rect_touches_ring(x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
 }
 
 #[inline]
+/// Diamond pseudo-angle, 0..=255 wrapping clockwise from 12 o'clock —
+/// cheap, monotonic, seam-continuous; exactly what periodic noise needs.
+fn diamond_angle(dx: i32, dy: i32) -> u8 {
+    let ax = dx.abs();
+    let ay = dy.abs();
+    let d = (ax + ay).max(1);
+    let a = match (dx >= 0, dy >= 0) {
+        (true, false) => (ax << 6) / d,
+        (true, true) => 64 + ((ay << 6) / d),
+        (false, true) => 128 + ((ax << 6) / d),
+        (false, false) => 192 + ((ay << 6) / d),
+    };
+    a as u8
+}
+
+/// Unit direction (Q8) for a diamond pseudo-angle.
+fn diamond_dir(a: i32) -> (i32, i32) {
+    let a = a.rem_euclid(256);
+    let (q, f) = (a >> 6, (a & 63) << 2);
+    let (dx, dy) = match q {
+        0 => (f, -(256 - f)),
+        1 => (256 - f, f),
+        2 => (-f, 256 - f),
+        _ => (-(256 - f), -f),
+    };
+    let len = isqrt(((dx * dx + dy * dy) as u32) as u32).max(1) as i32;
+    ((dx << 8) / len, (dy << 8) / len)
+}
+
 pub fn clear_rect(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
     for y in y0..=y1 {
         for x in x0..=x1 {
