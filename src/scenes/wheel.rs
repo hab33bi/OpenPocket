@@ -156,9 +156,12 @@ pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8:
             continue;
         }
         // Continuous size interpolation: crossfade the two pre-rendered
-        // sizes (icons AND labels) through the focus band, anchored at the
-        // blended center — reads as one smoothly scaling element.
-        let wl = ((t - 64) * 2).clamp(0, 256);
+        // sizes (icons AND labels) through a NARROW focus band (t 160..224)
+        // that resting rows never occupy — the focused row (t=256) is purely
+        // large, resting neighbors (t=128) purely small; the crossfade only
+        // exists mid-scroll. (A wide band left neighbors permanently
+        // double-rendered.)
+        let wl = ((t - 160) * 4).clamp(0, 256);
         let cx_s = icon_center_x(y_c, ICON_S_PX);
         let cx_l = icon_center_x(y_c, ICON_L_PX);
         let cx = cx_s + (((cx_l - cx_s) * wl) >> 8);

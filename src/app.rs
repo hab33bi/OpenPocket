@@ -383,12 +383,28 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
             if let Some((dir, dist)) = wheel_drag {
-                self.wheel_session(dir, dist, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
+                self.wheel_interact(
+                    Some((dir, dist)),
+                    0,
+                    &mut wheel_s_q8,
+                    &now,
+                    wheel_batt,
+                    anim_start,
+                    &mut tp,
+                );
                 unlocked_at = Instant::now();
                 continue;
             }
             if let Some(v) = wheel_flick {
-                self.wheel_momentum(&mut wheel_s_q8, v, &now, wheel_batt);
+                self.wheel_interact(
+                    None,
+                    v * 3 / 2,
+                    &mut wheel_s_q8,
+                    &now,
+                    wheel_batt,
+                    anim_start,
+                    &mut tp,
+                );
                 unlocked_at = Instant::now();
                 continue;
             }
@@ -834,9 +850,32 @@ impl<'a, 'd> App<'a, 'd> {
         self.swipe.feed(report, now_ms)
     }
 
-    /// Finger-tracked wheel scroll (M6 W2): 2/3 pursuit of the finger with a
-    /// rubber band past the ends, then momentum + snap-to-row on release.
-    fn wheel_session(
+    /// Wheel interaction umbrella: track → coast → (regrab?) → track …
+    /// A touch during any phase catches the wheel instantly.
+    fn wheel_interact(
+        &mut self,
+        mut grab: Option<(SwipeDir, u16)>,
+        mut vel: i32,
+        s_q8: &mut i32,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) {
+        loop {
+            if let Some((d, ds)) = grab.take() {
+                vel = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp) * 3 / 2;
+            }
+            grab = self.wheel_coast(s_q8, vel, now, batt, anim_start, tp);
+            if grab.is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Finger-tracked scroll: true 1:1 (rubber band past the ends). Returns
+    /// the release velocity (sign in scroll space).
+    fn wheel_track(
         &mut self,
         dir: SwipeDir,
         start_dist: u16,
@@ -845,48 +884,59 @@ impl<'a, 'd> App<'a, 'd> {
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
-    ) {
+    ) -> i32 {
         let sign: i32 = match dir {
             SwipeDir::Up => 1,
             SwipeDir::Down => -1,
         };
         let s_start = *s_q8;
         let mut target = s_start + sign * ((start_dist as i32) << 8);
-        let vel = loop {
+        loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragMove { dist, .. } => {
                     target = s_start + sign * ((dist as i32) << 8);
                 }
-                GestureEvent::DragEnd { vel_q8, .. } => break sign * vel_q8,
+                GestureEvent::DragEnd { vel_q8, .. } => return sign * vel_q8,
                 _ => {}
             }
-            // Compose continuously — the flush itself is the pacer.
             let t_eff = wheel_rubber(target, wheel_s_max());
-            let diff = t_eff - *s_q8;
-            if diff != 0 {
-                // Near-1:1 tracking (7/8): light, immediate.
-                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 7 / 8 };
+            if t_eff != *s_q8 {
+                *s_q8 = t_eff; // true 1:1 — glued to the finger
                 wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
                 self.flush_dirty();
             }
             self.maybe_reinit_touch(tp);
             core::hint::spin_loop();
-        };
-        self.wheel_momentum(s_q8, vel, now, batt);
+        }
     }
 
-    /// Momentum (real-dt integration, gentle decay) → snap to the nearest
-    /// row. Also the flick entry point.
-    fn wheel_momentum(&mut self, s_q8: &mut i32, mut v_q8: i32, now: &WallTime, batt: Option<u8>) {
+    /// Momentum coast (elastic boundary bounce) then snap-to-row — fully
+    /// interruptible: a new drag returns Some(grab); a plain touch catches
+    /// the wheel (freezes it) and the eventual lift snaps it.
+    fn wheel_coast(
+        &mut self,
+        s_q8: &mut i32,
+        mut v_q8: i32,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) -> Option<(SwipeDir, u16)> {
         let s_max = wheel_s_max();
         let mut dt_ms: i32 = 25;
         while v_q8.abs() > 64 {
             let fs = Instant::now();
+            let now_ms = anim_start.elapsed().as_millis() as u32;
+            if let GestureEvent::DragStart { dir, dist, .. } = self.poll_touch_once(tp, now_ms) {
+                return Some((dir, dist));
+            }
+            if self.swipe.finger_down() {
+                break; // caught mid-coast — freeze under the finger
+            }
             *s_q8 += v_q8 * dt_ms;
-            // Elastic boundary: a hard flick BOUNCES off the ends (halved
-            // penetration, ~30% restitution) instead of dead-stopping —
-            // then coasts back and settles like everything else.
+            // Elastic boundary: hard flicks BOUNCE (halved penetration,
+            // ~30% restitution) and coast back to a normal snap.
             if *s_q8 < 0 {
                 *s_q8 = -*s_q8 / 2;
                 v_q8 = -v_q8 * 5 / 16;
@@ -894,16 +944,32 @@ impl<'a, 'd> App<'a, 'd> {
                 *s_q8 = s_max - (*s_q8 - s_max) / 2;
                 v_q8 = -v_q8 * 5 / 16;
             }
-            // ~0.97 per 25 ms — a long, luxurious coast (decay scaled to
-            // the actual frame time).
+            // ~0.97 per 25 ms, scaled to the measured frame time.
             v_q8 = v_q8 * (256 - (8 * dt_ms) / 25) / 256;
             wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
             self.flush_dirty();
             dt_ms = (fs.elapsed().as_millis() as i32).clamp(10, 50);
         }
+        // Snap to the nearest row — also interruptible; holds while a finger
+        // rests on the wheel.
         let pitch_q8 = wheel::PITCH_PX << 8;
         let row = ((*s_q8 + pitch_q8 / 2) / pitch_q8).clamp(0, wheel::rows() as i32 - 1);
-        self.wheel_settle(s_q8, row as usize, now, batt);
+        let target = row * pitch_q8;
+        while *s_q8 != target {
+            let now_ms = anim_start.elapsed().as_millis() as u32;
+            if let GestureEvent::DragStart { dir, dist, .. } = self.poll_touch_once(tp, now_ms) {
+                return Some((dir, dist));
+            }
+            if self.swipe.finger_down() {
+                core::hint::spin_loop();
+                continue;
+            }
+            let diff = target - *s_q8;
+            *s_q8 += if diff.abs() <= 768 { diff } else { diff * 2 / 3 };
+            wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+            self.flush_dirty();
+        }
+        None
     }
 
     /// Ease the wheel to rest exactly on `row` — decisive 2/3 steps.
