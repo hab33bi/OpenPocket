@@ -39,20 +39,28 @@ pub fn accent(idx: usize) -> (i32, i32, i32) {
     }
 }
 
-/// Where the open morph lands the focused icon (§2). Apps with their own
-/// hero element fly the icon onto it for the crossfade; template apps rest
-/// the icon under the title.
-pub fn hero_pos(idx: usize) -> (i32, i32) {
-    match idx {
-        PHOTOS => (CX, 230),
-        _ => (CX, 158),
-    }
+/// Whether the app has real content behind its splash. Content apps
+/// crossfade splash → content at the end of the open morph; template apps
+/// REST on the splash (big centered logo + title below — the honest
+/// placeholder until their W3.3–3.5 passes).
+pub fn has_content(idx: usize) -> bool {
+    idx == PHOTOS
 }
 
-/// Whether the flying icon crossfades OUT at the end of the open morph
-/// (the app has its own hero element) or stays as the resting hero.
-pub fn icon_fades(idx: usize) -> bool {
-    idx == PHOTOS
+/// Photos hero (glow disc) center.
+const PHOTOS_HERO: (i32, i32) = (CX, 230);
+
+/// Splash title: spaced caps in the app accent, under the centered logo.
+pub fn draw_splash_title(wfb: &mut WatchFb, fx: &mut wheel::WheelFx, idx: usize, alpha: i32) {
+    let name = wheel::WHEEL_APPS[idx].name;
+    let (tx, tw) = title_metrics(name);
+    let by = wheel::SPLASH_TITLE_BASE_Y;
+    {
+        let fb = wfb.buf_mut();
+        draw_title(fb, name, tx, by, (200 * alpha) >> 8, accent(idx));
+    }
+    fx.push(tx - 2, by - 32, tx + tw + 2, by + 10);
+    wfb.mark_rect(tx - 2, by - 32, tx + tw + 2, by + 10);
 }
 
 /// Breathing amplitude on the wheel-ring tempo (~4 s triangle): the whole
@@ -95,7 +103,7 @@ pub fn draw_reveal(
     if idx == PHOTOS {
         // §4.8 — the elegant empty state: breathing azure inner-glow disc,
         // aperture at 50%, honest caption.
-        let (hx, hy0) = hero_pos(idx);
+        let (hx, hy0) = PHOTOS_HERO;
         let hy = hy0 + rise;
         let lut = wheel::azure_lut();
         let r = wheel::PHOTOS_DISC_PX / 2;
@@ -132,9 +140,9 @@ pub fn draw_reveal(
 /// flush, tick_ring doctrine — clear the rect, redraw, mark).
 pub fn tick(wfb: &mut WatchFb, idx: usize, elapsed_ms: u32) {
     if idx != PHOTOS {
-        return; // template apps rest perfectly still
+        return; // template apps rest perfectly still (on their splash)
     }
-    let (hx, hy) = hero_pos(idx);
+    let (hx, hy) = PHOTOS_HERO;
     let r = wheel::PHOTOS_DISC_PX / 2;
     let lut = wheel::azure_lut();
     let fb = wfb.buf_mut();

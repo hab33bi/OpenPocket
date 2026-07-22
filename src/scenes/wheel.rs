@@ -109,6 +109,13 @@ fn grow(d: &mut (i32, i32, i32, i32), x0: i32, y0: i32, x1: i32, y1: i32) {
 pub const STATUS_BASE_Y: i32 = 52;
 pub const STATUS_ALPHA: i32 = 200;
 
+/// Splash logo geometry (the open/close morph's loading beat): the focused
+/// icon flies to screen center at this size, the app title sits below it.
+/// The icon/title group is optically centered on the panel.
+pub const SPLASH_PX: i32 = 128;
+pub const SPLASH_ICON_Y: i32 = 210;
+pub const SPLASH_TITLE_BASE_Y: i32 = 322;
+
 /// Format the status line ("HH:MM" + " | 87%" when battery is known).
 fn status_str(now: &WallTime, battery: Option<u8>, s: &mut [u8; 12]) -> usize {
     let mut n = 0;
@@ -433,13 +440,13 @@ pub fn tick_status(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>) {
 }
 
 /// Wheel-side frame of the open/close morph (W3 §2), driven by two scrub
-/// values: `f_q8` = the focused icon's flight (56→96 px, row slot → the
-/// app's hero slot) while its glow dissolves, its label fades fast, and
-/// every other row fades + slides 12 px away from center; `icon_q8` = the
-/// hero crossfade (the flying icon fades OUT as the app's own hero element
-/// fades in — 0 for apps whose hero IS the icon). The app's content is
-/// drawn by apps::draw_reveal AFTER this, sharing the same rect cache.
-/// Status stays topmost and never blinks.
+/// values: `f_q8` = the focused icon's flight (56→128 px, row slot → the
+/// centered splash slot) while its glow dissolves, its label fades fast,
+/// and every other row fades + slides 12 px away from center; `icon_a` =
+/// the splash logo's alpha (fades out during a content app's load
+/// crossfade). The splash title and the app's content are drawn AFTER
+/// this by apps::draw_splash_title / apps::draw_reveal, sharing the same
+/// rect cache. Status stays topmost and never blinks.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_open_morph(
     wfb: &mut WatchFb,
@@ -449,9 +456,7 @@ pub fn draw_open_morph(
     fx: &mut WheelFx,
     focused: usize,
     f_q8: i32,
-    icon_q8: i32,
-    hero_x: i32,
-    hero_y: i32,
+    icon_a: i32,
 ) {
     fx.intro = None;
     let s_px = s_q8 >> 8;
@@ -531,12 +536,12 @@ pub fn draw_open_morph(
         draw_text_at(fb, app.name, x, y_c + 11, la, gl);
         fx.push(x - 1, y_c - 36, x + tw + 1, y_c + 36);
     }
-    let ia = (256 - icon_q8).clamp(0, 256);
+    let ia = icon_a.clamp(0, 256);
     if ia > 8 {
-        let px_eff = ICON_L_PX + (((ICON_H_PX - ICON_L_PX) * f_q8) >> 8);
-        let ix = icon_from + (((hero_x - icon_from) * f_q8) >> 8);
-        let iy = y_c + (((hero_y - y_c) * f_q8) >> 8);
-        blit_icon_scaled(fb, app.icon_h, ICON_H_PX, px_eff, ix, iy, ia, false);
+        let px_eff = ICON_L_PX + (((SPLASH_PX - ICON_L_PX) * f_q8) >> 8);
+        let ix = icon_from + (((CX - icon_from) * f_q8) >> 8);
+        let iy = y_c + (((SPLASH_ICON_Y - y_c) * f_q8) >> 8);
+        blit_icon_scaled(fb, app.icon_x, ICON_X_PX, px_eff, ix, iy, ia, false);
         let s2 = px_eff / 2 + 1;
         fx.push(ix - s2, iy - s2, ix + s2, iy + s2);
     }

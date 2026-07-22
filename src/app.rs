@@ -1392,15 +1392,16 @@ impl<'a, 'd> App<'a, 'd> {
         wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast, None);
     }
 
-    /// The wheel ↔ app open/close morph (W3 §2): the focused icon flies
-    /// between its row slot and the app's hero slot (56→96 px) while its
-    /// glow dissolves, the other rows fade away from center, and the app
-    /// content rises in with a hero crossfade over the tail. ~350 ms open,
-    /// ~240 ms close (returns are always faster), smoothstep-eased (the
-    /// integer stand-in for the (0.4,0,0.2,1) standard curve), 25 ms
-    /// cadence. PWR mid-morph REVERSES from the current progress — never
-    /// queues, never snaps.
-    #[allow(clippy::too_many_arguments)]
+    /// The wheel ↔ app open/close morph with a splash beat (W3 §2, user-
+    /// refined): the focused icon flies from its row slot to screen center
+    /// growing 56→128 px while the other rows fade away — then the LOGO
+    /// HOLDS, big and centered with the app title beneath it (the loading
+    /// beat) — then a content app crossfades splash → content. Template
+    /// apps simply REST on the splash. Close runs the same timeline
+    /// backward, faster (content fades under the persistent status bar,
+    /// the logo shows, the icon flies home). Smoothstep-eased phases,
+    /// 25 ms cadence. PWR mid-morph REVERSES from the current progress —
+    /// never queues, never snaps.
     fn app_morph(
         &mut self,
         idx: usize,
@@ -1411,27 +1412,38 @@ impl<'a, 'd> App<'a, 'd> {
         anim_start: Instant,
         tp: &mut TouchPoll,
     ) -> Scene {
-        const OPEN_STEP: i32 = 256 * 25 / 350;
-        const CLOSE_STEP: i32 = 256 * 25 / 240;
-        let (hero_x, hero_y) = apps::hero_pos(idx);
-        let fades = apps::icon_fades(idx);
-        let mut t: i32 = if opening { 0 } else { 256 };
+        // Timeline (ms, open direction): flight → splash hold → content.
+        const T_FLIGHT: i32 = 260;
+        const T_HOLD: i32 = 480;
+        const T_CONTENT: i32 = 280;
+        const STEP_OPEN: i32 = 25;
+        const STEP_CLOSE: i32 = 34; // returns are always faster
+        let t_end = T_FLIGHT + T_HOLD + if apps::has_content(idx) { T_CONTENT } else { 0 };
+        let mut t: i32 = if opening { 0 } else { t_end };
         let mut dirn: i32 = if opening { 1 } else { -1 };
         if !opening {
             // Coming from the app's rest frame: the canvas holds content
             // the rect cache doesn't track — reseed on the first frame.
             self.wheel_fx.invalidate();
         }
+        let smooth = |x: i32| {
+            let x = x.clamp(0, 256);
+            (x * x * (768 - 2 * x)) >> 16
+        };
         loop {
             let fs = Instant::now();
-            t += dirn * if dirn > 0 { OPEN_STEP } else { CLOSE_STEP };
-            let t_c = t.clamp(0, 256);
-            // Smoothstep in Q8: e = t²·(3 − 2t).
-            let e = (t_c * t_c * (768 - 2 * t_c)) >> 16;
-            // Flight leads; content rises in over the tail (crossfade).
-            let f = (e * 256 / 176).min(256);
-            let q = ((e - 160) * 256 / 96).clamp(0, 256);
-            let icon_q = if fades { q } else { 0 };
+            t += dirn * if dirn > 0 { STEP_OPEN } else { STEP_CLOSE };
+            let tc = t.clamp(0, t_end);
+            // (flight, splash-icon alpha, splash-title alpha, content q).
+            let (f, icon_a, title_a, q) = if tc < T_FLIGHT {
+                (smooth(tc * 256 / T_FLIGHT), 256, 0, 0)
+            } else if tc < T_FLIGHT + T_HOLD {
+                // Title fades in over the hold's first 120 ms.
+                (256, 256, ((tc - T_FLIGHT) * 256 / 120).min(256), 0)
+            } else {
+                let q = smooth((tc - T_FLIGHT - T_HOLD) * 256 / T_CONTENT);
+                (256, 256 - q, 256 - q, q)
+            };
             wheel::draw_open_morph(
                 &mut self.wfb,
                 now,
@@ -1440,22 +1452,25 @@ impl<'a, 'd> App<'a, 'd> {
                 &mut self.wheel_fx,
                 idx,
                 f,
-                icon_q,
-                hero_x,
-                hero_y,
+                icon_a,
             );
+            if title_a > 0 {
+                apps::draw_splash_title(&mut self.wfb, &mut self.wheel_fx, idx, title_a);
+            }
             let elapsed = anim_start.elapsed().as_millis() as u32;
-            apps::draw_reveal(&mut self.wfb, &mut self.wheel_fx, now, idx, q, elapsed);
+            if q > 0 {
+                apps::draw_reveal(&mut self.wfb, &mut self.wheel_fx, now, idx, q, elapsed);
+            }
             self.flush_dirty();
             // PWR mid-morph: reverse from the current progress.
             if axp2101::poll_power_key(&mut self.i2c) == axp2101::PowerKey::ShortPress {
                 dirn = -dirn;
                 println!("pwr: morph reverse");
             }
-            // Keep the recognizer fed; gestures during the ≤350 ms morph
-            // are superseded by it.
+            // Keep the recognizer fed; gestures during the morph are
+            // superseded by it.
             let _ = self.poll_touch_once(tp, elapsed);
-            if t >= 256 && dirn > 0 {
+            if t >= t_end && dirn > 0 {
                 return Scene::App(idx);
             }
             if t <= 0 && dirn < 0 {
