@@ -4,4 +4,5 @@
 
 pub mod apps;
 pub mod lock;
+pub mod water;
 pub mod wheel;

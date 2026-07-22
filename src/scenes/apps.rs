@@ -10,6 +10,7 @@
 
 use crate::display::watch_fb::WatchFb;
 use crate::scenes::lock::{self, Glyph};
+use crate::scenes::water::Water;
 use crate::scenes::wheel;
 use crate::time::WallTime;
 use esp_hal::time::Instant;
@@ -60,6 +61,8 @@ pub struct State {
     pub we_arc: i32,
     /// Phone dial drift offset last drawn (pseudo units).
     pub ph_drift: i32,
+    /// Water liquid simulation (particles/hash/calibration — internal SRAM).
+    pub wa: Water,
 }
 
 impl State {
@@ -77,9 +80,14 @@ impl State {
             mu_theta: -1,
             we_arc: -1,
             ph_drift: 0,
+            wa: Water::new(),
         }
     }
 }
+
+/// Clip line shared with water.rs's CLOCK_Y1 — the reveal rect matches the
+/// sim's clip so the status clock (band ~26..66) stays topmost.
+const CLOCK_Y1_APPS: i32 = 70;
 
 /// Brightness slider geometry (Settings row 0): a real drag control.
 pub const SLIDER_X0: i32 = CX - 90;
@@ -121,10 +129,18 @@ pub fn accent(idx: usize) -> (i32, i32, i32) {
 /// REST on the splash (big centered logo + title below — the honest
 /// placeholder until their W3.3–3.5 passes).
 pub fn has_content(idx: usize) -> bool {
-    // Every app has real content behind its splash EXCEPT Water, which
-    // rests on its splash (waves logo) until the liquid sim lands
-    // (docs/WATER-APP-PLAN.md — an ultracode pass).
-    idx != WATER
+    // Every app has real content behind its splash. Water's is the liquid sim.
+    let _ = idx;
+    true
+}
+
+/// Water's per-frame entry: the run loop reads the IMU (it owns `self.i2c`)
+/// and hands the raw triple in; `imu = None` on a bus fault. Keeps `apps`
+/// I2C-free (docs/water/IMPL-SPEC.md §5–7). Water stays in the generic
+/// `tick`'s `_ => {}` arm — it is driven from the run-loop call site because
+/// it needs the accelerometer.
+pub fn water_tick(wfb: &mut WatchFb, imu: Option<(i16, i16, i16)>, elapsed_ms: u32, st: &mut State) {
+    st.wa.tick(wfb, imu, elapsed_ms);
 }
 
 /// Every app shows the shared status clock — the one fixed point (§1). The
@@ -286,6 +302,13 @@ pub fn draw_reveal(
             blit_icon_tint(fb, wheel::TR_PLAY, wheel::TR_PLAY_PX, CX, CY + 74, ICE, (70 * q_q8) >> 8);
         }
         let r = (CX - TIMER_R - 8, CY - TIMER_R - 8, CX + TIMER_R + 8, CY + TIMER_R + 8);
+        fx.push(r.0, r.1, r.2, r.3);
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
+    } else if idx == WATER {
+        // The pool fades up from black as the morph completes; the first
+        // water_tick (run loop) calibrates and takes over the physics.
+        st.wa.reveal(wfb, q_q8, elapsed_ms);
+        let r = (CX - 226, CLOCK_Y1_APPS, CX + 226, H - 1);
         fx.push(r.0, r.1, r.2, r.3);
         wfb.mark_rect(r.0, r.1, r.2, r.3);
     }

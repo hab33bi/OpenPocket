@@ -319,6 +319,16 @@ impl<'a, 'd> App<'a, 'd> {
                             settle_ms,
                             &mut status_minute,
                         );
+                    } else if idx == apps::WATER {
+                        // The run loop owns self.i2c: read gravity for the
+                        // liquid this frame (~0.2 ms; None on a bus fault →
+                        // the sim reuses its last vector).
+                        let imu = crate::drivers::qmi8658::read_accel(&mut self.i2c).ok();
+                        apps::water_tick(&mut self.wfb, imu, elapsed, &mut app_state);
+                        if status_minute != now.minute {
+                            status_minute = now.minute;
+                            wheel::tick_status(&mut self.wfb, &now, wheel_batt);
+                        }
                     } else {
                         // The app's signature animation (partial redraw).
                         apps::tick(&mut self.wfb, idx, &now, elapsed, &mut app_state);
@@ -459,6 +469,9 @@ impl<'a, 'd> App<'a, 'd> {
                 _ if scene == Scene::Locked && self.clock.is_animating() => CLOCK_ANIM_FRAME_US,
                 // Entrance reveal animates at full cadence.
                 _ if scene == Scene::Wheel && self.wheel_fx.intro_active() => ANIM_FRAME_US,
+                // Water is always alive — 40 fps while Awake (freezes when
+                // Dim: water_tick only runs at Power::Awake).
+                _ if scene == Scene::App(apps::WATER) && power == Power::Awake => ANIM_FRAME_US,
                 _ => FRAME_US,
             };
             let deadline = frame_start + Duration::from_micros(frame_us);
@@ -1581,6 +1594,9 @@ impl<'a, 'd> App<'a, 'd> {
         }
         if idx == apps::TIME {
             st.t_anchor = None;
+        }
+        if idx == apps::WATER {
+            st.wa.open(); // spawn the pool; first live tick calibrates the rest bias
         }
         self.app_morph(idx, true, s_q8, st, now, batt, anim_start, tp)
     }
