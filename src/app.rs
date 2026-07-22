@@ -171,10 +171,11 @@ impl<'a, 'd> App<'a, 'd> {
         // Wheel scroll state (Q8 px) + battery cached at wheel entry.
         let mut wheel_s_q8: i32 = 0;
         let mut wheel_batt: Option<u8> = None;
-        // Gallery strip state: resting page + when it last settled (the
-        // finale caption fades in 300 ms after settle).
-        let mut gal_page: usize = 0;
-        let mut gal_settle: Option<Instant> = None;
+        // Cross-frame app-screen state (gallery page, settings, time arc).
+        let mut app_state = apps::State::new();
+        // The user's chosen full-brightness level (Settings preset): what
+        // wake restores and the idle ladder dims from.
+        let mut bright_full: u8 = 0xFF;
 
         loop {
             let frame_start = Instant::now();
@@ -234,8 +235,8 @@ impl<'a, 'd> App<'a, 'd> {
                     .is_some_and(|y| (y as i32) >= H * 12 / 100)
             {
                 self.gallery_interact(
-                    &mut gal_page,
-                    &mut gal_settle,
+                    &mut app_state.gal_page,
+                    &mut app_state.gal_settle,
                     &now,
                     wheel_batt,
                     anim_start,
@@ -276,18 +277,19 @@ impl<'a, 'd> App<'a, 'd> {
                     if idx == apps::GALLERY {
                         // Full-bleed art keeps its own status/caption upkeep
                         // (bands re-blit from the page, never cleared black).
-                        let settle_ms = gal_settle.map(|t| t.elapsed().as_millis() as u32);
+                        let settle_ms =
+                            app_state.gal_settle.map(|t| t.elapsed().as_millis() as u32);
                         apps::gallery_tick(
                             &mut self.wfb,
                             &now,
                             wheel_batt,
-                            gal_page,
+                            app_state.gal_page,
                             settle_ms,
                             &mut status_minute,
                         );
                     } else {
-                        // The app's ONE breathing element (partial redraw).
-                        apps::tick(&mut self.wfb, idx, elapsed);
+                        // The app's signature animation (partial redraw).
+                        apps::tick(&mut self.wfb, idx, &now, elapsed, &mut app_state);
                         if status_minute != now.minute {
                             status_minute = now.minute;
                             wheel::tick_status(&mut self.wfb, &now, wheel_batt);
@@ -314,8 +316,8 @@ impl<'a, 'd> App<'a, 'd> {
             };
             match desired {
                 Power::Awake => {
-                    if power != Power::Awake || brightness != 0xFF {
-                        self.wake_display(&mut power, &mut brightness, &now);
+                    if power != Power::Awake || brightness != bright_full {
+                        self.wake_display(&mut power, &mut brightness, &now, bright_full);
                     }
                 }
                 Power::Dim => {
@@ -362,8 +364,8 @@ impl<'a, 'd> App<'a, 'd> {
             match axp2101::poll_power_key(&mut self.i2c) {
                 axp2101::PowerKey::ShortPress => {
                     tp.last_activity = Instant::now();
-                    if power != Power::Awake || brightness != 0xFF {
-                        self.wake_display(&mut power, &mut brightness, &now);
+                    if power != Power::Awake || brightness != bright_full {
+                        self.wake_display(&mut power, &mut brightness, &now, bright_full);
                     }
                     match scene {
                         Scene::Locked => {
@@ -377,11 +379,20 @@ impl<'a, 'd> App<'a, 'd> {
                                 as usize;
                             println!("pwr: short press -> open app {focused}");
                             if focused == apps::GALLERY {
-                                gal_page = 0;
-                                gal_settle = Some(Instant::now());
+                                app_state.gal_page = 0;
+                                app_state.gal_settle = Some(Instant::now());
+                            }
+                            if focused == apps::TIME {
+                                app_state.t_anchor = None;
                             }
                             scene = self.app_morph(
-                                focused, true, wheel_s_q8, gal_page, &now, wheel_batt, anim_start,
+                                focused,
+                                true,
+                                wheel_s_q8,
+                                &mut app_state,
+                                &now,
+                                wheel_batt,
+                                anim_start,
                                 &mut tp,
                             );
                             unlocked_at = Instant::now();
@@ -389,7 +400,13 @@ impl<'a, 'd> App<'a, 'd> {
                         Scene::App(idx) => {
                             println!("pwr: short press -> close app {idx}");
                             scene = self.app_morph(
-                                idx, false, wheel_s_q8, gal_page, &now, wheel_batt, anim_start,
+                                idx,
+                                false,
+                                wheel_s_q8,
+                                &mut app_state,
+                                &now,
+                                wheel_batt,
+                                anim_start,
                                 &mut tp,
                             );
                             unlocked_at = Instant::now();
@@ -412,6 +429,7 @@ impl<'a, 'd> App<'a, 'd> {
             let mut wheel_drag: Option<(SwipeDir, u16)> = None;
             let mut wheel_flick: Option<i32> = None;
             let mut wheel_tap: Option<u16> = None;
+            let mut app_tap: Option<(usize, u16)> = None;
             let frame_us = match power {
                 Power::Aod | Power::Sleep => IDLE_FRAME_US,
                 _ if scene == Scene::Locked && self.clock.is_animating() => CLOCK_ANIM_FRAME_US,
@@ -481,6 +499,9 @@ impl<'a, 'd> App<'a, 'd> {
                         if scene == Scene::Wheel {
                             wheel_tap = Some(y);
                         }
+                        if let Scene::App(idx) = scene {
+                            app_tap = Some((idx, y));
+                        }
                         println!("gesture: tap x={x} y={y}");
                     }
                     _ => {}
@@ -490,6 +511,7 @@ impl<'a, 'd> App<'a, 'd> {
                     || wheel_drag.is_some()
                     || wheel_flick.is_some()
                     || wheel_tap.is_some()
+                    || app_tap.is_some()
                     // A finger on the wheel ends the frame NOW — the next
                     // frame-top takeover hands it to the direct session
                     // within a few ms instead of waiting out the deadline.
@@ -511,8 +533,8 @@ impl<'a, 'd> App<'a, 'd> {
             if let Some((dir, dist, start_y)) = start_drag {
                 // A drag can arm while dimmed/AOD — the composer needs the
                 // normal lock canvas and full brightness before it renders.
-                if power != Power::Awake || brightness != 0xFF {
-                    self.wake_display(&mut power, &mut brightness, &now);
+                if power != Power::Awake || brightness != bright_full {
+                    self.wake_display(&mut power, &mut brightness, &now, bright_full);
                 }
                 self.abort_flourish();
                 if dir == SwipeDir::Up {
@@ -553,6 +575,26 @@ impl<'a, 'd> App<'a, 'd> {
                 unlocked_at = Instant::now();
                 continue;
             }
+            if let Some((idx, y)) = app_tap {
+                if idx == apps::SETTINGS {
+                    if let Some(level) = apps::settings_tap(
+                        &mut self.wfb,
+                        &mut app_state,
+                        y as i32,
+                        wheel_batt,
+                        elapsed,
+                    ) {
+                        // The one real control we own: CO5300 brightness.
+                        self.bus.write_c8d8(0x51, level);
+                        brightness = level;
+                        bright_full = level;
+                        println!("settings: brightness -> {level:#04x}");
+                    }
+                    self.flush_dirty();
+                }
+                unlocked_at = Instant::now();
+                continue;
+            }
             if let Some(y) = wheel_tap {
                 let s_px = wheel_s_q8 >> 8;
                 let row = (y as i32 - H / 2 + s_px + wheel::PITCH_PX / 2)
@@ -568,8 +610,8 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
             if let Some((_dir, dist, vel)) = flick {
-                if power != Power::Awake || brightness != 0xFF {
-                    self.wake_display(&mut power, &mut brightness, &now);
+                if power != Power::Awake || brightness != bright_full {
+                    self.wake_display(&mut power, &mut brightness, &now, bright_full);
                 }
                 self.abort_flourish();
                 if dist as i32 > COMPLETE_DIST || vel > COMPLETE_VEL_Q8 {
@@ -1452,7 +1494,7 @@ impl<'a, 'd> App<'a, 'd> {
         idx: usize,
         opening: bool,
         s_q8: i32,
-        page: usize,
+        st: &mut apps::State,
         now: &WallTime,
         batt: Option<u8>,
         anim_start: Instant,
@@ -1500,7 +1542,14 @@ impl<'a, 'd> App<'a, 'd> {
                     was_full = true;
                     self.wheel_fx.invalidate();
                 }
-                apps::draw_gallery_load(&mut self.wfb, &mut self.wheel_fx, now, batt, page, q);
+                apps::draw_gallery_load(
+                    &mut self.wfb,
+                    &mut self.wheel_fx,
+                    now,
+                    batt,
+                    st.gal_page,
+                    q,
+                );
             } else {
                 if core::mem::replace(&mut was_full, false) {
                     self.wheel_fx.invalidate();
@@ -1519,7 +1568,16 @@ impl<'a, 'd> App<'a, 'd> {
                     apps::draw_splash_title(&mut self.wfb, &mut self.wheel_fx, idx, title_a);
                 }
                 if q > 0 {
-                    apps::draw_reveal(&mut self.wfb, &mut self.wheel_fx, now, idx, q, elapsed);
+                    apps::draw_reveal(
+                        &mut self.wfb,
+                        &mut self.wheel_fx,
+                        now,
+                        batt,
+                        idx,
+                        q,
+                        elapsed,
+                        st,
+                    );
                 }
             }
             self.flush_dirty();
@@ -1560,8 +1618,12 @@ impl<'a, 'd> App<'a, 'd> {
         const GATE_PX: i32 = 6;
         const STALE_MS: u32 = 50;
         const DT_FLOOR_MS: i32 = 5;
-        /// Release speed (Q8 px/ms) that turns a page.
-        const PAGE_FLING_Q8: i32 = 64;
+        /// Release speed (Q8 px/ms) that turns a page — gentle by design,
+        /// a page flip should be effortless (user-tuned down from 64).
+        const PAGE_FLING_Q8: i32 = 38;
+        /// Drag verdict: travel past this fraction of a page advances even
+        /// without a flick (ViewPager-style 30%, down from nearest's 50%).
+        const PAGE_DRAG_PCT: i32 = 30;
         let n = apps::GALLERY_PAGES as i32;
         let s_max = (n - 1) * PG_W;
         let rubber = |t: i32| -> i32 {
@@ -1574,7 +1636,8 @@ impl<'a, 'd> App<'a, 'd> {
                 t
             }
         };
-        let mut s: i32 = (*page as i32).clamp(0, n - 1) * PG_W;
+        let start_pg = (*page as i32).clamp(0, n - 1);
+        let mut s: i32 = start_pg * PG_W;
         *settled = None;
         'grab: loop {
             // Anchor at the finger's current X (wait one report if raced).
@@ -1624,8 +1687,10 @@ impl<'a, 'd> App<'a, 'd> {
                                 }
                             }
                             if gate && t.pressed {
-                                // Strip space: finger left = forward.
-                                target = anchor_s + (ax - x);
+                                // Strip space: finger left = forward. The
+                                // CST9217's X axis is MIRRORED (hardware-
+                                // measured, like Y): x grows leftward.
+                                target = anchor_s + (x - ax);
                             }
                         }
                     }
@@ -1649,8 +1714,9 @@ impl<'a, 'd> App<'a, 'd> {
                     if now_ms.wrapping_sub(ring[2].1) <= STALE_MS {
                         let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(DT_FLOOR_MS as u32) as i32;
                         let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(DT_FLOOR_MS as u32) as i32;
-                        let v_b = ((ring[1].0 - ring[2].0) << 8) / dt_b;
-                        let v_a = ((ring[0].0 - ring[1].0) << 8) / dt_a;
+                        // Mirrored X: forward velocity = x increasing.
+                        let v_b = ((ring[2].0 - ring[1].0) << 8) / dt_b;
+                        let v_a = ((ring[1].0 - ring[0].0) << 8) / dt_a;
                         let v_w = (2 * v_b + v_a) / 3;
                         v = if dt_b > 60 {
                             v_b
@@ -1662,14 +1728,15 @@ impl<'a, 'd> App<'a, 'd> {
                     }
                     if held <= 180 {
                         let vp =
-                            ((origin_x - last_x) << 8) / held.max(DT_FLOOR_MS as u32) as i32 * 3 / 2;
+                            ((last_x - origin_x) << 8) / held.max(DT_FLOOR_MS as u32) as i32 * 3 / 2;
                         if v == 0 || ((vp >= 0) == (v >= 0) && vp.abs() > v.abs()) {
                             v = vp;
                         }
                     }
                 }
             }
-            // Verdict: one page per definite flick, else nearest detent.
+            // Verdict: one page per definite flick; otherwise a drag past
+            // 30% of a page (from the session's start page) advances.
             let tgt = if gate && v.abs() >= PAGE_FLING_Q8 {
                 if v > 0 {
                     s.div_euclid(PG_W) + 1
@@ -1677,7 +1744,13 @@ impl<'a, 'd> App<'a, 'd> {
                     (s + PG_W - 1).div_euclid(PG_W) - 1
                 }
             } else {
-                (s + PG_W / 2).div_euclid(PG_W)
+                let delta = s - start_pg * PG_W;
+                let adv = if delta >= 0 {
+                    (delta + PG_W * (100 - PAGE_DRAG_PCT) / 100) / PG_W
+                } else {
+                    -((-delta + PG_W * (100 - PAGE_DRAG_PCT) / 100) / PG_W)
+                };
+                start_pg + adv
             }
             .clamp(0, n - 1);
             if v != 0 {
@@ -1717,8 +1790,9 @@ impl<'a, 'd> App<'a, 'd> {
     }
 
     /// Instant wake from any idle state: sleep-out / AOD repaint as needed,
-    /// full brightness, minute animation re-enabled.
-    fn wake_display(&mut self, power: &mut Power, brightness: &mut u8, now: &WallTime) {
+    /// restore to `full` (the user's Settings brightness preset), minute
+    /// animation re-enabled.
+    fn wake_display(&mut self, power: &mut Power, brightness: &mut u8, now: &WallTime, full: u8) {
         match *power {
             Power::Sleep => {
                 println!("power: wake from sleep");
@@ -1740,9 +1814,9 @@ impl<'a, 'd> App<'a, 'd> {
             _ => {}
         }
         self.clock.set_minute_anim(true);
-        if *brightness != 0xFF {
-            *brightness = 0xFF;
-            self.bus.write_c8d8(0x51, 0xFF);
+        if *brightness != full {
+            *brightness = full;
+            self.bus.write_c8d8(0x51, full);
         }
         *power = Power::Awake;
     }
