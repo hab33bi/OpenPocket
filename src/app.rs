@@ -864,7 +864,7 @@ impl<'a, 'd> App<'a, 'd> {
     ) {
         loop {
             if let Some((d, ds)) = grab.take() {
-                vel = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp) * 3 / 2;
+                vel = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp);
             }
             grab = self.wheel_coast(s_q8, vel, now, batt, anim_start, tp);
             if grab.is_none() {
@@ -901,8 +901,10 @@ impl<'a, 'd> App<'a, 'd> {
                 _ => {}
             }
             let t_eff = wheel_rubber(target, wheel_s_max());
-            if t_eff != *s_q8 {
-                *s_q8 = t_eff; // true 1:1 — glued to the finger
+            let diff = t_eff - *s_q8;
+            if diff != 0 {
+                // 7/8 pursuit: near-1:1 with a whisper of weight.
+                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 7 / 8 };
                 wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
                 self.flush_dirty();
             }
@@ -911,75 +913,95 @@ impl<'a, 'd> App<'a, 'd> {
         }
     }
 
-    /// Momentum coast (elastic boundary bounce) then snap-to-row — fully
+    /// Velocity-projected glide (WWDC-803 / SnapHelper model, per
+    /// docs/research/WHEEL-FEEL-RESEARCH.md): project the natural stopping
+    /// point from the release velocity, clamp it to the list, round to a
+    /// row, and decelerate STRAIGHT to that row as one continuous motion —
+    /// no free coast, no boundary bounce (an overshooting fling dampens onto
+    /// the first/last row, never reverses), no disjoint snap. Fully
     /// interruptible: a new drag returns Some(grab); a plain touch catches
-    /// the wheel (freezes it) and the eventual lift snaps it.
+    /// the wheel and the lift settles it.
     fn wheel_coast(
         &mut self,
         s_q8: &mut i32,
-        mut v_q8: i32,
+        v0_q8: i32,
         now: &WallTime,
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
     ) -> Option<(SwipeDir, u16)> {
+        // iOS-normal deceleration: f = 243/256 per 25 ms (≈0.998/ms).
+        // Projection horizon K = dt/(1−f) = 25·256/13 ≈ 492 ms.
+        const DECAY_NUM: i32 = 243;
+        const K_MS: i32 = 492;
+        /// Fling floor: slower releases settle to the nearest row.
+        const FLING_FLOOR_Q8: i32 = 77;
+
         let s_max = wheel_s_max();
+        let pitch_q8 = wheel::PITCH_PX << 8;
+        let nearest = |s: i32| -> i32 {
+            ((s + pitch_q8 / 2) / pitch_q8).clamp(0, wheel::rows() as i32 - 1) * pitch_q8
+        };
+        let mut target = if v0_q8.abs() < FLING_FLOOR_Q8 {
+            nearest(*s_q8)
+        } else {
+            let proj = (*s_q8 as i64 + v0_q8 as i64 * K_MS as i64).clamp(0, s_max as i64) as i32;
+            nearest(proj)
+        };
+        // Velocity that lands exactly on the target under the decay — for an
+        // unclamped projection this ≈ v0 (continuity); for a clamped one it
+        // becomes a smooth damped approach to the edge row.
+        let mut v_q8 = (target - *s_q8) / K_MS;
         let mut dt_ms: i32 = 25;
-        while v_q8.abs() > 64 {
+
+        loop {
             let fs = Instant::now();
             let now_ms = anim_start.elapsed().as_millis() as u32;
             if let GestureEvent::DragStart { dir, dist, .. } = self.poll_touch_once(tp, now_ms) {
                 return Some((dir, dist));
             }
             if self.swipe.finger_down() {
-                break; // caught mid-coast — freeze under the finger
-            }
-            *s_q8 += v_q8 * dt_ms;
-            // Elastic boundary: hard flicks BOUNCE (halved penetration,
-            // ~30% restitution) and coast back to a normal snap.
-            if *s_q8 < 0 {
-                *s_q8 = -*s_q8 / 2;
-                v_q8 = -v_q8 * 5 / 16;
-            } else if *s_q8 > s_max {
-                *s_q8 = s_max - (*s_q8 - s_max) / 2;
-                v_q8 = -v_q8 * 5 / 16;
-            }
-            // ~0.97 per 25 ms, scaled to the measured frame time.
-            v_q8 = v_q8 * (256 - (8 * dt_ms) / 25) / 256;
-            wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
-            self.flush_dirty();
-            dt_ms = (fs.elapsed().as_millis() as i32).clamp(10, 50);
-        }
-        // Snap to the nearest row — also interruptible; holds while a finger
-        // rests on the wheel.
-        let pitch_q8 = wheel::PITCH_PX << 8;
-        let row = ((*s_q8 + pitch_q8 / 2) / pitch_q8).clamp(0, wheel::rows() as i32 - 1);
-        let target = row * pitch_q8;
-        while *s_q8 != target {
-            let now_ms = anim_start.elapsed().as_millis() as u32;
-            if let GestureEvent::DragStart { dir, dist, .. } = self.poll_touch_once(tp, now_ms) {
-                return Some((dir, dist));
-            }
-            if self.swipe.finger_down() {
+                // Caught: freeze under the finger; land on the nearest row
+                // after the lift.
+                v_q8 = 0;
+                target = nearest(*s_q8);
                 core::hint::spin_loop();
                 continue;
             }
             let diff = target - *s_q8;
-            *s_q8 += if diff.abs() <= 768 { diff } else { diff * 2 / 3 };
+            if v_q8.abs() >= FLING_FLOOR_Q8 && diff.signum() == v_q8.signum() {
+                // Decelerating glide toward the projected row.
+                *s_q8 += v_q8 * dt_ms;
+                v_q8 = v_q8 * (256 - (256 - DECAY_NUM) * dt_ms / 25) / 256;
+            } else if diff.abs() <= 256 {
+                *s_q8 = target;
+                wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+                self.flush_dirty();
+                return None;
+            } else {
+                // Soft damped landing (τ≈90 ms) — blends out of the glide
+                // with no velocity seam; also the caught/slow path.
+                *s_q8 += diff * 5 / 16;
+            }
             wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
             self.flush_dirty();
+            // Fixed 25 ms cadence: consistent frame intervals read premium.
+            wheel::pace(fs);
+            dt_ms = (fs.elapsed().as_millis() as i32).clamp(10, 50);
         }
-        None
     }
 
-    /// Ease the wheel to rest exactly on `row` — decisive 2/3 steps.
+    /// Ease the wheel to rest exactly on `row` — soft damped landing
+    /// (5/16 per 25 ms frame, τ≈90 ms), matching the glide's tail.
     fn wheel_settle(&mut self, s_q8: &mut i32, row: usize, now: &WallTime, batt: Option<u8>) {
         let target = (row as i32 * wheel::PITCH_PX) << 8;
         while *s_q8 != target {
+            let fs = Instant::now();
             let diff = target - *s_q8;
-            *s_q8 += if diff.abs() <= 768 { diff } else { diff * 2 / 3 };
+            *s_q8 += if diff.abs() <= 256 { diff } else { diff * 5 / 16 };
             wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
             self.flush_dirty();
+            wheel::pace(fs);
         }
     }
 
@@ -1042,13 +1064,20 @@ fn wheel_s_max() -> i32 {
     ((wheel::rows() as i32 - 1) * wheel::PITCH_PX) << 8
 }
 
-/// Rubber band past the wheel's ends: displacement compresses ÷2 — a
-/// stretchy, elastic give.
+/// Progressive rubber band past the wheel's ends (Apple's curve, integer
+/// form): give = x·c·d / (d + c·x) with c=0.55 (141/256), d=96 px — stretchy
+/// at first pull, stiffening the harder you drag.
 fn wheel_rubber(t: i32, max: i32) -> i32 {
+    // d = 64 px: firm, "normal-feeling" stretch (user-tuned down from 96).
+    const D_Q8: i64 = 64 << 8;
+    let give = |x: i32| -> i32 {
+        let x = x as i64;
+        ((x * 141 * D_Q8) / (256 * D_Q8 + 141 * x)) as i32
+    };
     if t < 0 {
-        t / 2
+        -give(-t)
     } else if t > max {
-        max + (t - max) / 2
+        max + give(t - max)
     } else {
         t
     }

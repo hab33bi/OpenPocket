@@ -68,6 +68,8 @@ struct Track {
     last_ms: u32,
     prev_y: u16,
     prev_ms: u32,
+    prev2_y: u16,
+    prev2_ms: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +135,8 @@ impl SwipeTracker {
                             last_ms: now_ms,
                             prev_y: t.y,
                             prev_ms: now_ms,
+                            prev2_y: t.y,
+                            prev2_ms: now_ms,
                         });
                     }
                 }
@@ -141,6 +145,8 @@ impl SwipeTracker {
 
             Phase::Pending(mut tr) => match self.classify_input(&tr, report, now_ms) {
                 Input::Move(t) => {
+                    tr.prev2_y = tr.prev_y;
+                    tr.prev2_ms = tr.prev_ms;
                     tr.prev_y = tr.last_y;
                     tr.prev_ms = tr.last_ms;
                     tr.last_x = t.x;
@@ -212,6 +218,8 @@ impl SwipeTracker {
 
             Phase::Dragging(mut tr, dir) => match self.classify_input(&tr, report, now_ms) {
                 Input::Move(t) => {
+                    tr.prev2_y = tr.prev_y;
+                    tr.prev2_ms = tr.prev_ms;
                     tr.prev_y = tr.last_y;
                     tr.prev_ms = tr.last_ms;
                     tr.last_x = t.x;
@@ -230,6 +238,8 @@ impl SwipeTracker {
                     // arrives only in the lift report.
                     if let Some(t) = lift {
                         if t.x != tr.last_x || t.y != tr.last_y {
+                            tr.prev2_y = tr.prev_y;
+                            tr.prev2_ms = tr.prev_ms;
                             tr.prev_y = tr.last_y;
                             tr.prev_ms = tr.last_ms;
                             tr.last_x = t.x;
@@ -237,15 +247,29 @@ impl SwipeTracker {
                             tr.last_ms = now_ms;
                         }
                     }
-                    let dt = tr.last_ms.wrapping_sub(tr.prev_ms).max(1) as i32;
-                    let dpx = match dir {
-                        SwipeDir::Up => tr.prev_y as i32 - tr.last_y as i32,
-                        SwipeDir::Down => tr.last_y as i32 - tr.prev_y as i32,
+                    // Recency-weighted release velocity over the last two
+                    // movement segments (VelocityTracker/iOS intent): robust
+                    // to single-sample noise; a stale older segment (>60 ms)
+                    // is discarded.
+                    let dt_b = tr.last_ms.wrapping_sub(tr.prev_ms).max(1) as i32;
+                    let dt_a = tr.prev_ms.wrapping_sub(tr.prev2_ms).max(1) as i32;
+                    let (dpx_b, dpx_a) = match dir {
+                        SwipeDir::Up => (
+                            tr.prev_y as i32 - tr.last_y as i32,
+                            tr.prev2_y as i32 - tr.prev_y as i32,
+                        ),
+                        SwipeDir::Down => (
+                            tr.last_y as i32 - tr.prev_y as i32,
+                            tr.prev_y as i32 - tr.prev2_y as i32,
+                        ),
                     };
+                    let v_b = (dpx_b << 8) / dt_b;
+                    let v_a = (dpx_a << 8) / dt_a;
+                    let vel_q8 = if dt_b > 60 { v_b } else { (2 * v_b + v_a) / 3 };
                     GestureEvent::DragEnd {
                         dir,
                         dist: dist_along(&tr, dir),
-                        vel_q8: (dpx << 8) / dt,
+                        vel_q8,
                     }
                 }
                 Input::Nothing => GestureEvent::None,
