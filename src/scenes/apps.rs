@@ -33,6 +33,11 @@ pub const SETTINGS: usize = 5;
 pub const MUSIC: usize = 6;
 pub const PHOTOS: usize = 7;
 pub const WEATHER: usize = 8;
+pub const TIMER: usize = 9;
+
+/// Timer template ring radius — sized to clear the status clock band at
+/// the top (a full-rim ring would cross it; §1: the clock never moves).
+const TIMER_R: i32 = 155;
 
 /// Cross-frame app state owned by the run loop (one instance).
 pub struct State {
@@ -116,9 +121,9 @@ pub fn accent(idx: usize) -> (i32, i32, i32) {
 /// crossfade splash → content at the end of the open morph; template apps
 /// REST on the splash (big centered logo + title below — the honest
 /// placeholder until their W3.3–3.5 passes).
-pub fn has_content(idx: usize) -> bool {
-    // Everything but Timer (its template ships in W3.6).
-    idx != 9
+pub fn has_content(_idx: usize) -> bool {
+    // Every app now has real content behind its splash (W3.6 lands Timer).
+    true
 }
 
 /// Whether the app shows the shared status clock. The Time app hides it
@@ -301,8 +306,25 @@ pub fn draw_reveal(
         let r = (56, 104 + rise, W - 56, 352 + rise);
         fx.push(r.0, r.1, r.2, r.3);
         wfb.mark_rect(r.0, r.1, r.2, r.3);
+    } else if idx == TIMER {
+        // §4.10 — TEMPLATE ONLY: a full azure rim ring at 100%, "05:00"
+        // centered, a ghosted start glyph beneath. The functional
+        // countdown (tap start/pause, ring depleting azure→red, triple
+        // pulse at zero) is specced and deferred to W4; rests perfectly
+        // still (no tick) — an honest, beautiful placeholder.
+        {
+            let fb = wfb.buf_mut();
+            draw_ring_arc(fb, CX, CY, TIMER_R - 5, TIMER_R + 5, 1024, AZURE, (210 * q_q8) >> 8);
+            let t = "05:00";
+            let tw = wheel::text_width(t, &lock::LABELF_GLYPHS);
+            wheel::draw_text_at(fb, t, CX - tw / 2, CY + 16, q_q8, &lock::LABELF_GLYPHS);
+            blit_icon_tint(fb, wheel::TR_PLAY, wheel::TR_PLAY_PX, CX, CY + 74, ICE, (70 * q_q8) >> 8);
+        }
+        let r = (CX - TIMER_R - 8, CY - TIMER_R - 8, CX + TIMER_R + 8, CY + TIMER_R + 8);
+        fx.push(r.0, r.1, r.2, r.3);
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
     }
-    // Template apps: the flown icon (wheel-side) IS the hero; nothing more.
+    // Any remaining app: the flown icon (wheel-side) IS the hero.
 }
 
 /// Rest-frame signature animation (§1: ONE breathing element per app,
