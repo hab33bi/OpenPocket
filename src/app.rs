@@ -930,10 +930,11 @@ impl<'a, 'd> App<'a, 'd> {
         anim_start: Instant,
         tp: &mut TouchPoll,
     ) -> Option<(SwipeDir, u16)> {
-        // iOS-normal deceleration: f = 243/256 per 25 ms (≈0.998/ms).
-        // Projection horizon K = dt/(1−f) = 25·256/13 ≈ 492 ms.
-        const DECAY_NUM: i32 = 243;
-        const K_MS: i32 = 492;
+        // iOS-FAST deceleration (the picker rate): f = 199/256 per 25 ms
+        // (≈0.99/ms). Projection horizon K = dt/(1−f) = 25·256/57 ≈ 112 ms —
+        // a medium flick lands 2–4 rows away, considered, picker-like.
+        const DECAY_NUM: i32 = 199;
+        const K_MS: i32 = 112;
         /// Fling floor: slower releases settle to the nearest row.
         const FLING_FLOOR_Q8: i32 = 77;
 
@@ -969,8 +970,9 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
             let diff = target - *s_q8;
-            if v_q8.abs() >= FLING_FLOOR_Q8 && diff.signum() == v_q8.signum() {
-                // Decelerating glide toward the projected row.
+            // Glide until ~16 px out, then hand to the damped tail — at that
+            // range the tail is invisible continuation, not a second flick.
+            if diff.signum() == v_q8.signum() && diff.abs() > (16 << 8) {
                 *s_q8 += v_q8 * dt_ms;
                 v_q8 = v_q8 * (256 - (256 - DECAY_NUM) * dt_ms / 25) / 256;
             } else if diff.abs() <= 256 {

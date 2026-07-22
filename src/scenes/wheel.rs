@@ -168,25 +168,36 @@ pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8:
         if t > 128 {
             blit_glow(fb, &saber, cx, y_c, (t - 128) * 2);
         }
-        if wl < 256 {
-            blit_icon(fb, app.icon_s, ICON_S_PX, cx, y_c, (alpha * (256 - wl)) >> 8);
-        }
-        if wl > 0 {
-            blit_icon(fb, app.icon_l, ICON_L_PX, cx, y_c, (alpha * wl) >> 8);
-        }
+        // TRUE size interpolation: mid-transition, render the large sprite
+        // bilinearly scaled to the exact intermediate size. At rest (wl 0 or
+        // 256) the pixel-perfect pre-rendered sizes are used, so the crisp
+        // AA holds wherever the eye lingers.
         let px_eff = ICON_S_PX + (((ICON_L_PX - ICON_S_PX) * wl) >> 8);
+        if wl == 0 {
+            blit_icon(fb, app.icon_s, ICON_S_PX, cx, y_c, alpha);
+        } else if wl == 256 {
+            blit_icon(fb, app.icon_l, ICON_L_PX, cx, y_c, alpha);
+        } else {
+            blit_icon_scaled(fb, app.icon_l, ICON_L_PX, px_eff, cx, y_c, alpha);
+        }
         let min_left = cx + px_eff / 2 + 10;
-        if wl < 256 {
+        if wl == 0 {
             let gs = &lock::TEXT_GLYPHS;
             let tw = text_width(app.name, gs);
             let x = (CX - tw / 2).max(min_left);
-            draw_text_at(fb, app.name, x, y_c + 11, (alpha * (256 - wl)) >> 8, gs);
-        }
-        if wl > 0 {
+            draw_text_at(fb, app.name, x, y_c + 11, alpha, gs);
+        } else if wl == 256 {
             let gl = &lock::LABELF_GLYPHS;
             let tw = text_width(app.name, gl);
             let x = (CX - tw / 2).max(min_left);
-            draw_text_at(fb, app.name, x, y_c + 11, (alpha * wl) >> 8, gl);
+            draw_text_at(fb, app.name, x, y_c + 11, alpha, gl);
+        } else {
+            // Scale from small-size ratio (~196/256) up to full (256/256).
+            let gl = &lock::LABELF_GLYPHS;
+            let scale_q8 = 196 + ((60 * wl) >> 8);
+            let tw = (text_width(app.name, gl) * scale_q8) >> 8;
+            let x = (CX - tw / 2).max(min_left);
+            draw_text_scaled(fb, app.name, x, y_c + 11, alpha, gl, scale_q8);
         }
     }
 
@@ -316,6 +327,111 @@ fn blit_icon(fb: &mut [u8], sprite: &[u8], px: i32, cx: i32, cy: i32, alpha: i32
             }
             let v = (a * alpha) >> 8;
             write_tinted(fb, x, y, v);
+        }
+    }
+}
+
+/// Bilinear-scaled icon blit (downscale from the large sprite to any
+/// intermediate size) — used only mid-transition.
+fn blit_icon_scaled(
+    fb: &mut [u8],
+    sprite: &[u8],
+    src_px: i32,
+    dst_px: i32,
+    cx: i32,
+    cy: i32,
+    alpha: i32,
+) {
+    let step_q8 = (src_px << 8) / dst_px;
+    let s = |x: i32, y: i32| -> i32 {
+        sprite[(y.min(src_px - 1) * src_px + x.min(src_px - 1)) as usize] as i32
+    };
+    for dy in 0..dst_px {
+        let y = cy - dst_px / 2 + dy;
+        if y < 0 || y >= H {
+            continue;
+        }
+        let sy_q8 = dy * step_q8;
+        let (sy, fy) = (sy_q8 >> 8, sy_q8 & 255);
+        for dx in 0..dst_px {
+            let x = cx - dst_px / 2 + dx;
+            if x < 0 || x >= W {
+                continue;
+            }
+            let sx_q8 = dx * step_q8;
+            let (sx, fx) = (sx_q8 >> 8, sx_q8 & 255);
+            let a = (s(sx, sy) * (256 - fx) * (256 - fy)
+                + s(sx + 1, sy) * fx * (256 - fy)
+                + s(sx, sy + 1) * (256 - fx) * fy
+                + s(sx + 1, sy + 1) * fx * fy)
+                >> 16;
+            if a < 8 {
+                continue;
+            }
+            write_tinted(fb, x, y, (a * alpha) >> 8);
+        }
+    }
+}
+
+/// Per-glyph bilinear-scaled text from the large atlas (scale_q8 ≤ 256) —
+/// used only mid-transition.
+fn draw_text_scaled(
+    fb: &mut [u8],
+    text: &str,
+    left_x: i32,
+    base_y: i32,
+    alpha: i32,
+    glyphs: &[Option<Glyph>; 128],
+    scale_q8: i32,
+) {
+    let mut x_q8 = left_x << 8;
+    for ch in text.chars() {
+        if let Some(g) = lock::get_glyph(glyphs, ch) {
+            let dst_w = ((g.width as i32 * scale_q8) >> 8).max(1);
+            let dst_h = ((g.height as i32 * scale_q8) >> 8).max(1);
+            let glyph_y = base_y - (((g.height as i32 + g.ymin as i32) * scale_q8) >> 8);
+            draw_glyph_scaled(fb, x_q8 >> 8, glyph_y, g, alpha, dst_w, dst_h);
+            x_q8 += (g.advance as i32) * scale_q8;
+        }
+    }
+}
+
+fn draw_glyph_scaled(fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, alpha: i32, dst_w: i32, dst_h: i32) {
+    let src_w = g.width as i32;
+    let src_h = g.height as i32;
+    let stride = (g.width as usize + 1) / 2;
+    let sample = |x: i32, y: i32| -> i32 {
+        let x = x.min(src_w - 1);
+        let y = y.min(src_h - 1);
+        let byte = g.data[y as usize * stride + (x as usize) / 2];
+        let a4 = if x % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+        (a4 as i32) * 17
+    };
+    let step_x_q8 = (src_w << 8) / dst_w;
+    let step_y_q8 = (src_h << 8) / dst_h;
+    for dy in 0..dst_h {
+        let y = oy + dy;
+        if y < 0 || y >= H {
+            continue;
+        }
+        let sy_q8 = dy * step_y_q8;
+        let (sy, fy) = (sy_q8 >> 8, sy_q8 & 255);
+        for dx in 0..dst_w {
+            let x = ox + dx;
+            if x < 0 || x >= W {
+                continue;
+            }
+            let sx_q8 = dx * step_x_q8;
+            let (sx, fx) = (sx_q8 >> 8, sx_q8 & 255);
+            let a = (sample(sx, sy) * (256 - fx) * (256 - fy)
+                + sample(sx + 1, sy) * fx * (256 - fy)
+                + sample(sx, sy + 1) * (256 - fx) * fy
+                + sample(sx + 1, sy + 1) * fx * fy)
+                >> 16;
+            if a < 8 {
+                continue;
+            }
+            write_tinted(fb, x, y, (a * alpha) >> 8);
         }
     }
 }
