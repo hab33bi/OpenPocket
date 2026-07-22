@@ -14,6 +14,7 @@ pub const LCD_COL_OFFSET: u16 = 6;
 pub const AXP2101_ADDR: u8 = 0x34;
 pub const PCF85063_ADDR: u8 = 0x51;
 pub const CST9217_ADDR: u8 = 0x5A;
+pub const QMI8658_ADDR: u8 = 0x6B;
 
 /// Touch controller pins (driver claims them at init).
 pub const TP_INT_GPIO: u8 = 11;

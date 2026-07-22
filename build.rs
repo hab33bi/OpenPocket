@@ -28,7 +28,7 @@ const WHEEL_APPS: [(&str, &str); 10] = [
     ("Activity", "activity"),
     ("Settings", "settings"),
     ("Music", "music"),
-    ("Photos", "images"),
+    ("Water", "waves"),
     ("Weather", "cloud-sun"),
     ("Timer", "timer"),
 ];

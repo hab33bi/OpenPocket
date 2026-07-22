@@ -31,7 +31,7 @@ pub const MESSAGES: usize = 3;
 pub const ACTIVITY: usize = 4;
 pub const SETTINGS: usize = 5;
 pub const MUSIC: usize = 6;
-pub const PHOTOS: usize = 7;
+pub const WATER: usize = 7;
 pub const WEATHER: usize = 8;
 pub const TIMER: usize = 9;
 
@@ -98,8 +98,7 @@ pub fn slider_zone(y: i32) -> bool {
     (CY - 64 - 34..=CY - 64 + 44).contains(&y)
 }
 
-/// Title baseline (§1) and content geometry.
-const TITLE_BASE_Y: i32 = 92;
+/// Letter-spacing for spaced-caps titles (splash only now).
 const TITLE_SPACING: i32 = 4;
 /// Per-app accent color (§4). One restrained accent per app.
 pub fn accent(idx: usize) -> (i32, i32, i32) {
@@ -111,7 +110,7 @@ pub fn accent(idx: usize) -> (i32, i32, i32) {
         4 => (90, 160, 255),  // Activity — saber trio (azure lead)
         5 => (200, 215, 255), // Settings — ice
         6 => (255, 240, 220), // Music — warm white
-        7 => (90, 160, 255),  // Photos — azure
+        7 => (0, 190, 255),   // Water — neon blue
         8 => (255, 165, 80),  // Weather — amber
         _ => (90, 160, 255),  // Timer — azure
     }
@@ -121,25 +120,27 @@ pub fn accent(idx: usize) -> (i32, i32, i32) {
 /// crossfade splash → content at the end of the open morph; template apps
 /// REST on the splash (big centered logo + title below — the honest
 /// placeholder until their W3.3–3.5 passes).
-pub fn has_content(_idx: usize) -> bool {
-    // Every app now has real content behind its splash (W3.6 lands Timer).
-    true
+pub fn has_content(idx: usize) -> bool {
+    // Every app has real content behind its splash EXCEPT Water, which
+    // rests on its splash (waves logo) until the liquid sim lands
+    // (docs/WATER-APP-PLAN.md — an ultracode pass).
+    idx != WATER
 }
 
-/// Whether the app shows the shared status clock. The Time app hides it
-/// (its big digits ARE the time — user decision) and centers its group.
-pub fn shows_status(idx: usize) -> bool {
-    idx != TIME
+/// Every app shows the shared status clock — the one fixed point (§1). The
+/// Time app used to hide it, which produced a disappear artifact on open;
+/// it now keeps the clock like everything else (user).
+pub fn shows_status(_idx: usize) -> bool {
+    true
 }
 
 /// Time app layout: big digits + date optically centered as a group.
 const TIME_BASE_Y: i32 = 244;
 const DATE_BASE_Y: i32 = 298;
 
-/// Photos hero (glow disc) center.
-const PHOTOS_HERO: (i32, i32) = (CX, 230);
-
 /// Splash title: spaced caps in the app accent, under the centered logo.
+/// (The only remaining title — the in-app titles were removed; the splash
+/// still names the app on the way in.)
 pub fn draw_splash_title(wfb: &mut WatchFb, fx: &mut wheel::WheelFx, idx: usize, alpha: i32) {
     let name = wheel::WHEEL_APPS[idx].name;
     let (tx, tw) = title_metrics(name);
@@ -179,51 +180,11 @@ pub fn draw_reveal(
     if q_q8 <= 0 {
         return;
     }
+    // App titles removed (user): the splash logo names the app on the way
+    // in; the content is the hero. Content now has the top of the screen.
     let rise = ((256 - q_q8) * 20) >> 8;
 
-    // Title: spaced caps, accent at 60%.
-    let name = wheel::WHEEL_APPS[idx].name;
-    let (tx, tw) = title_metrics(name);
-    {
-        let fb = wfb.buf_mut();
-        draw_title(fb, name, tx, TITLE_BASE_Y + rise, (153 * q_q8) >> 8, accent(idx));
-    }
-    fx.push(tx - 2, TITLE_BASE_Y + rise - 32, tx + tw + 2, TITLE_BASE_Y + rise + 10);
-    wfb.mark_rect(tx - 2, TITLE_BASE_Y + rise - 32, tx + tw + 2, TITLE_BASE_Y + rise + 10);
-
-    if idx == PHOTOS {
-        // §4.8 — the elegant empty state: breathing azure inner-glow disc,
-        // aperture at 50%, honest caption.
-        let (hx, hy0) = PHOTOS_HERO;
-        let hy = hy0 + rise;
-        let lut = wheel::azure_lut();
-        let r = wheel::PHOTOS_DISC_PX / 2;
-        {
-            let fb = wfb.buf_mut();
-            wheel::blit_lut_sprite(
-                fb,
-                wheel::PHOTOS_DISC,
-                wheel::PHOTOS_DISC_PX,
-                &lut,
-                hx,
-                hy,
-                (breath(elapsed_ms) * q_q8) >> 8,
-            );
-            wheel::blit_icon(fb, wheel::APERTURE, wheel::APERTURE_PX, hx, hy, (128 * q_q8) >> 8);
-        }
-        fx.push(hx - r, hy - r, hx + r, hy + r);
-        wfb.mark_rect(hx - r, hy - r, hx + r, hy + r);
-
-        let cap = "nothing captured yet";
-        let cw = wheel::text_width(cap, &lock::TEXT_GLYPHS);
-        let cy = 356 + rise;
-        {
-            let fb = wfb.buf_mut();
-            wheel::draw_text_at(fb, cap, CX - cw / 2, cy, (102 * q_q8) >> 8, &lock::TEXT_GLYPHS);
-        }
-        fx.push(CX - cw / 2 - 2, cy - 32, CX + cw / 2 + 2, cy + 10);
-        wfb.mark_rect(CX - cw / 2 - 2, cy - 32, CX + cw / 2 + 2, cy + 10);
-    } else if idx == TIME {
+    if idx == TIME {
         // §4.1 — big centered time + date. Fades in PLACE (no rise) under
         // one generous static clear rect: while the reveal scrubbed, a
         // moving draw vs its trailing clear could strand 1-2 px digit
@@ -256,12 +217,16 @@ pub fn draw_reveal(
                     ring_with_caps(fb, *rc, sweep, *tint, 230);
                 }
             }
-            let steps = "6 412";
-            let sw2 = wheel::text_width(steps, &lock::LABELF_GLYPHS);
-            wheel::draw_text_at(fb, steps, CX - sw2 / 2, 248 + rise, q_q8, &lock::LABELF_GLYPHS);
+            // Center readout fitted INSIDE the innermost ring (r=64): the
+            // step count auto-scales to the hole width, "steps" beneath.
+            let steps = "6412";
+            let full = wheel::text_width(steps, &lock::LABELF_GLYPHS).max(1);
+            let sc = ((90 << 8) / full).min(256);
+            let sw2 = (full * sc) >> 8;
+            wheel::draw_text_scaled(fb, steps, CX - sw2 / 2, CY + 2, q_q8, &lock::LABELF_GLYPHS, sc, false);
             let cap = "steps";
             let cw2 = wheel::text_width(cap, &lock::TEXT_GLYPHS);
-            wheel::draw_text_at(fb, cap, CX - cw2 / 2, 284 + rise, (102 * q_q8) >> 8, &lock::TEXT_GLYPHS);
+            wheel::draw_text_at(fb, cap, CX - cw2 / 2, CY + 30, (102 * q_q8) >> 8, &lock::TEXT_GLYPHS);
         }
         let r = (CX - 132, CY - 132, CX + 132, CY + 132);
         fx.push(r.0, r.1, r.2, r.3);
@@ -331,38 +296,16 @@ pub fn draw_reveal(
 /// partial flush, tick_ring doctrine — clear the rect, redraw, mark).
 pub fn tick(wfb: &mut WatchFb, idx: usize, now: &WallTime, elapsed_ms: u32, st: &mut State) {
     match idx {
-        PHOTOS => photos_tick(wfb, elapsed_ms),
         TIME => time_tick(wfb, now, st),
         ACTIVITY => activity_tick(wfb, elapsed_ms),
         MUSIC => music_tick(wfb, st, elapsed_ms),
         WEATHER => weather_tick(wfb, st, elapsed_ms),
         PHONE => phone_tick(wfb, st, elapsed_ms),
         MESSAGES => messages_tick(wfb, elapsed_ms),
-        _ => {} // template apps (and Settings) rest perfectly still
+        // Water rests on its splash until the liquid sim lands; template
+        // apps rest perfectly still.
+        _ => {}
     }
-}
-
-fn photos_tick(wfb: &mut WatchFb, elapsed_ms: u32) {
-    let (hx, hy) = PHOTOS_HERO;
-    let r = wheel::PHOTOS_DISC_PX / 2;
-    let lut = wheel::azure_lut();
-    let fb = wfb.buf_mut();
-    for y in (hy - r).max(0)..(hy + r).min(H) {
-        let a = ((y * W + (hx - r).max(0)) * 2) as usize;
-        let b = ((y * W + (hx + r).min(W)) * 2) as usize;
-        fb[a..b].fill(0);
-    }
-    wheel::blit_lut_sprite(
-        fb,
-        wheel::PHOTOS_DISC,
-        wheel::PHOTOS_DISC_PX,
-        &lut,
-        hx,
-        hy,
-        breath(elapsed_ms),
-    );
-    wheel::blit_icon(fb, wheel::APERTURE, wheel::APERTURE_PX, hx, hy, 128);
-    wfb.mark_rect(hx - r, hy - r, hx + r, hy + r);
 }
 
 // ---------------------------------------------------------------------
@@ -418,11 +361,12 @@ fn weekday(y: u16, m: u8, d: u8) -> usize {
 
 fn time_tick(wfb: &mut WatchFb, now: &WallTime, st: &mut State) {
     if st.t_anchor.is_none() {
-        // Fresh open: ONE deterministic seed frame — full black fill, then
-        // the complete face redrawn from scratch (title, big time, date,
-        // arc, tip). Nothing painted by the morph can survive as an
-        // artifact, and the hidden status clock stays hidden by
-        // construction.
+        // Fresh open: seed the full face deterministically, but with
+        // TARGETED clears (center rect + arc annulus) rather than a full
+        // fill — a full fill wiped the status clock the morph had drawn at
+        // the top, which is exactly what made it vanish. The status band
+        // (y 26..66) is left untouched, so the clock stays live; the
+        // run-loop keeps it on minute rollover.
         st.t_sec = now.second;
         st.t_min = now.minute;
         st.t_anchor = Some(Instant::now());
@@ -433,9 +377,8 @@ fn time_tick(wfb: &mut WatchFb, now: &WallTime, st: &mut State) {
         let tw = wheel::text_width(t_str, &lock::TIME_GLYPHS);
         let dw = wheel::text_width(d_str, &lock::TEXT_GLYPHS);
         let fb = wfb.buf_mut();
-        fb.fill(0);
-        let (tx0, _) = title_metrics(wheel::WHEEL_APPS[TIME].name);
-        draw_title(fb, wheel::WHEEL_APPS[TIME].name, tx0, TITLE_BASE_Y, 200, accent(TIME));
+        fill_rect_black(fb, CX - 180, 140, CX + 180, 322);
+        clear_annulus(fb, ARC_R_IN - 2, ARC_R_OUT + 2);
         wheel::draw_text_at(fb, t_str, CX - tw / 2, TIME_BASE_Y, 256, &lock::TIME_GLYPHS);
         wheel::draw_text_at(fb, d_str, CX - dw / 2, DATE_BASE_Y, 150, &lock::TEXT_GLYPHS);
         draw_ring_arc(fb, CX, CY, ARC_R_IN, ARC_R_OUT, a, AZURE, 230);

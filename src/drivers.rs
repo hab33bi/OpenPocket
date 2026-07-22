@@ -4,5 +4,7 @@
 pub mod axp2101;
 #[cfg(feature = "esp")]
 pub mod cst9217;
+
+pub mod qmi8658;
 #[cfg(feature = "esp")]
 pub mod pcf85063;

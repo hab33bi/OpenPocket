@@ -26,7 +26,7 @@ use openpocket::app::App;
 use openpocket::board::{LCD_COL_OFFSET, LCD_HEIGHT, LCD_WIDTH};
 use openpocket::display::qspi_bus::{QspiBus, DMA_CHUNK_BYTES};
 use openpocket::display::watch_fb::WatchFb;
-use openpocket::drivers::{axp2101, cst9217};
+use openpocket::drivers::{axp2101, cst9217, qmi8658};
 use openpocket::input::gestures::SwipeTracker;
 use openpocket::scenes::lock::Clock;
 use openpocket::time::WallClock;
@@ -107,6 +107,14 @@ fn main() -> ! {
             a.chip_type, a.res_x, a.res_y, a.fw_version
         ),
         Err(()) => println!("touch: INIT FAILED"),
+    }
+
+    // QMI8658 6-axis IMU: gravity source for the Water app. Probe-only at
+    // boot (configure + confirm WHO_AM_I); the sim reads it live later. A
+    // missing IMU logs and is ignored — never fatal.
+    match qmi8658::init(&mut i2c) {
+        Ok(id) => println!("imu: QMI8658 who_am_i=0x{id:02X} (0x05 healthy)"),
+        Err(()) => println!("imu: QMI8658 init failed (bus)"),
     }
 
     // QSPI display bus + CO5300 init (Waveshare reference sequence).
