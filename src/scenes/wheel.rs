@@ -55,7 +55,6 @@ pub struct WheelFx {
     n: usize,
     seeded: bool,
     intro: Option<u32>,
-    status_key: (u8, u8, u8),
 }
 
 impl WheelFx {
@@ -65,7 +64,6 @@ impl WheelFx {
             n: 0,
             seeded: false,
             intro: None,
-            status_key: (255, 255, 255),
         }
     }
     /// Restart the entrance reveal; the next frame reseeds the full canvas.
@@ -163,7 +161,6 @@ pub fn draw_scroll(
     if seed {
         // Seed frame (scene entry / unknown canvas): full clear + full mark.
         fx.seeded = true;
-        fx.status_key = (255, 255, 255);
         wfb.buf_mut().fill(0);
     } else {
         // Targeted clear: only where content actually was last frame.
@@ -296,32 +293,18 @@ pub fn draw_scroll(
         fx.push(x - 1, y_d - 36, x + twd + 1, y_d + 36);
     }
 
-    // Status line: fixed position, redrawn only when its content changes.
-    let key = (now.hour, now.minute, battery.unwrap_or(255));
-    let mut status_rect = None;
-    if seed || fx.status_key != key {
-        fx.status_key = key;
-        let (sx0, sy0, sx1, sy1) = (CX - 110, 26, CX + 110, 66);
-        if !seed {
-            for y in sy0..=sy1 {
-                let a = ((y * W + sx0) * 2) as usize;
-                let b = ((y * W + sx1) * 2 + 2) as usize;
-                fb[a..b].fill(0);
-            }
-        }
-        draw_status(fb, now, battery);
-        status_rect = Some((sx0, sy0, sx1, sy1));
-    }
+    // Status line: topmost layer, redrawn EVERY frame and tracked in the
+    // rect cache — scrolling rows overlapping its band get cleared like
+    // any content, so the clock can never be left erased.
+    draw_status(fb, now, battery);
+    fx.push(CX - 110, 26, CX + 110, 66);
 
-    // Damage: one union bbox (old content + new content + status). A single
-    // rect keeps the DMI at one equal span per row, which flush_spans folds
+    // Damage: one union bbox (old content + new content). A single rect
+    // keeps the DMI at one equal span per row, which flush_spans folds
     // into ONE window burst — the fast partial path.
     for k in 0..fx.n {
         let (x0, y0, x1, y1) = fx.rects[k];
         grow(&mut d, x0 as i32, y0 as i32, x1 as i32, y1 as i32);
-    }
-    if let Some((x0, y0, x1, y1)) = status_rect {
-        grow(&mut d, x0, y0, x1, y1);
     }
     if seed {
         wfb.mark_rect(0, 0, W - 1, H - 1);

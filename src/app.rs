@@ -1122,14 +1122,28 @@ impl<'a, 'd> App<'a, 'd> {
             } else {
                 v_w
             };
+            // End-of-flick acceleration carry (AOSP impulse spirit — the
+            // energy the finger was still ADDING at lift counts): a flick
+            // speeding up through its final segments reads as its last
+            // velocity plus half the measured gain. Velocity-domain only —
+            // never position prediction.
+            if (v_b >= 0) == (v_a >= 0) && v_b.abs() > v_a.abs() {
+                let acc = v_b + (v_b - v_a) / 2;
+                if (acc >= 0) == (raw >= 0) && acc.abs() > raw.abs() {
+                    raw = acc;
+                }
+            }
         }
         // Whole-press fallback for quick flicks: the chip may emit only
         // one or two motion reports for a short ballistic swipe, gutting
         // the segment estimate (huge dt or a stale repeated-coord lift
-        // report). A short press is one motion by construction — its
-        // total displacement over its duration is an honest velocity.
+        // report). A short press is one motion by construction. Its mean
+        // velocity understates the RELEASE velocity of an accelerating
+        // swipe by ~2x (constant-acceleration kinematics: v_end = 2·v_avg
+        // from rest) — corrected by the conservative middle, 3/2.
         if held_ms <= 180 {
             let vp = ((origin_y - last_y) << 8) / held_ms.max(DT_FLOOR_MS as u32) as i32;
+            let vp = vp * 3 / 2;
             if raw == 0 || ((vp >= 0) == (raw >= 0) && vp.abs() > raw.abs()) {
                 raw = vp;
             }

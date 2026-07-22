@@ -150,3 +150,12 @@ concentric arcs** — ice-blue, amber, violet. v1 rings are **decorative**
 
 Tracked separately (before/parallel to M6): the **locked-state PWR
 lightsaber flourish** and the **unlock end-of-travel lag** fix.
+
+## 11. W3 addendum (user, 2026-07-22): unlock time-morph
+
+When unlock lands in the wheel (W3), the lock screen's large time digits
+must MORPH into the wheel's small top status time: as the sheet travels
+up, the digits scale/translate continuously toward the status-line
+position and size, tracked 1:1 by unlock progress (scrubbing the sheet
+scrubs the morph). The wheel's status clock is the morph's destination —
+its position/size are the landing keyframe.
