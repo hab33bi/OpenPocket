@@ -164,6 +164,9 @@ impl<'a, 'd> App<'a, 'd> {
             let render_start = Instant::now();
             if scene == Scene::Locked && power != Power::Aod && power != Power::Sleep {
                 self.clock.render(&mut self.wfb, elapsed, &now);
+            } else if scene == Scene::Wheel && power == Power::Awake {
+                // Focus ring's animated gradient (partial redraw of its rect).
+                wheel::tick_ring(&mut self.wfb, elapsed, 0);
             }
             let render_ms = render_start.elapsed().as_millis() as u32;
 
@@ -240,9 +243,15 @@ impl<'a, 'd> App<'a, 'd> {
                             println!("pwr: short press -> flourish");
                         }
                         Scene::Unlocked => {
+                            // Staggered reveal: rows slide in left-to-right,
+                            // top-to-bottom, 25 ms frames.
                             let batt = axp2101::battery_percent(&mut self.i2c);
-                            wheel::draw(&mut self.wfb, &now, batt, 0);
-                            self.flush_dirty();
+                            for f in 0..wheel::INTRO_FRAMES {
+                                let fs = Instant::now();
+                                wheel::draw(&mut self.wfb, &now, batt, 0, f);
+                                self.flush_dirty();
+                                wheel::pace(fs);
+                            }
                             scene = Scene::Wheel;
                             unlocked_at = Instant::now();
                             println!("pwr: short press -> wheel");

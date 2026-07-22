@@ -1,14 +1,16 @@
-//! M6 W1 — the App Wheel, static frame (docs/M6-APPWHEEL-PLAN.md).
+//! M6 W1 — the App Wheel (docs/M6-APPWHEEL-PLAN.md).
 //!
-//! Right-aligned vertical carousel hugging the round bezel: each row's right
-//! edge follows the circle's chord at that row's y, the focused row renders
-//! large and bright with the saber-glow focus ring (an iteration of the
-//! lightsaber flourish's bloom frame), neighbors dim and indent along the
-//! curve. W1 renders a static frame (scroll physics land in W2).
+//! Left-aligned icons hugging the circle's chord (with padding so an icon
+//! can never clip the round boundary), labels screen-centered on each row,
+//! the focused row large and bright with the saber-glow focus ring (an
+//! iteration of the lightsaber flourish's bloom frame) whose gradient
+//! animates through azure ↔ violet. Rows enter with a staggered slide-in
+//! reveal. Static layout otherwise (scroll physics land in W2).
 
 use crate::display::watch_fb::WatchFb;
 use crate::scenes::lock::{self, Glyph};
 use crate::time::WallTime;
+use esp_hal::time::{Duration, Instant};
 
 include!(concat!(env!("OUT_DIR"), "/wheel_assets.rs"));
 
@@ -19,44 +21,52 @@ const CY: i32 = H / 2;
 const R: i32 = W / 2;
 /// Row pitch in list space.
 const PITCH: i32 = 68;
-/// Gap between a row's icon and the circle's chord at that row's y.
-const EDGE_MARGIN: i32 = 14;
-/// Gap between a label's right edge and its icon's left edge.
-const LABEL_GAP: i32 = 12;
+/// Padding between an icon's bounding box and the circular boundary — the
+/// box is fitted against the chord at its WORST row (top/bottom corner), so
+/// icons can never leave the screen.
+const EDGE_PAD: i32 = 10;
 /// Ice-blue tint shared with the lock scene's text.
 const TINT: (i32, i32, i32) = (200, 215, 255);
 
-/// Draw the full wheel: rows around `focused`, status line top-center.
-/// Full-canvas redraw (static scene; W2 makes it incremental).
-pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usize) {
+/// Staggered reveal: per-row start offset and rise time, in 25 ms frames.
+const INTRO_STAG_F: i32 = 2;
+const INTRO_RISE_F: i32 = 8;
+pub const INTRO_FRAMES: u32 = (INTRO_STAG_F as u32 * 9) + INTRO_RISE_F as u32 + 1;
+
+/// One frame of the staggered reveal (`frame` ≥ INTRO_FRAMES = final state).
+/// Full-canvas redraw.
+pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usize, frame: u32) {
     let fb = wfb.buf_mut();
     fb.fill(0);
-    let saber = saber_lut();
+    let saber = saber_lut(0);
 
     for (i, app) in WHEEL_APPS.iter().enumerate() {
         let y_c = CY + (i as i32 - focused as i32) * PITCH;
         if y_c < -PITCH || y_c > H + PITCH {
             continue;
         }
-        // Focus proximity 0..=256 and row alpha 0.45..=1.0.
-        let t = (256 - ((y_c - CY).abs() * 256 / (2 * PITCH)).min(256)).max(0);
-        let alpha = 115 + (141 * t) / 256;
+        // Reveal progress for this row (slide in from the left + fade).
+        let p = (((frame as i32 - INTRO_STAG_F * i as i32) * 256) / INTRO_RISE_F).clamp(0, 256);
+        if p == 0 {
+            continue;
+        }
+        let slide = -((256 - p) * 48) >> 8;
 
-        // Chord-following right edge at this row's y.
-        let dy = (y_c - CY).abs().min(R - 1);
-        let half_w = isqrt(((R * R - dy * dy) as u32) << 8) as i32 >> 4;
-        let x_r = CX + half_w - EDGE_MARGIN;
+        let (alpha, t) = row_alpha(y_c);
+        if alpha == 0 {
+            continue;
+        }
+        let alpha = (alpha * p) >> 8;
 
         let (sprite, px) = if t > 128 {
             (app.icon_l, ICON_L_PX)
         } else {
             (app.icon_s, ICON_S_PX)
         };
-        let icon_cx = x_r - px / 2;
+        let icon_cx = icon_center_x(y_c, px) + slide;
 
         if t > 128 {
-            // Saber-glow focus ring beneath the focused icon.
-            blit_glow(fb, &saber, icon_cx, y_c, (t - 128) * 2);
+            blit_glow(fb, &saber, icon_cx, y_c, ((t - 128) * 2 * p) >> 8);
         }
         blit_icon(fb, sprite, px, icon_cx, y_c, alpha);
 
@@ -65,8 +75,12 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
         } else {
             &lock::TEXT_GLYPHS
         };
-        // Baseline ≈ optical center of the row.
-        draw_text_right(fb, app.name, x_r - px - LABEL_GAP, y_c + 11, alpha, glyphs);
+        // Label centered on the screen, vertically in line with the icon,
+        // never overlapping it.
+        let tw = text_width(app.name, glyphs);
+        let min_left = icon_cx + px / 2 + 10;
+        let x = (CX - tw / 2).max(min_left) + slide / 2;
+        draw_text_at(fb, app.name, x, y_c + 11, alpha, glyphs);
     }
 
     // Status line, top-center: HH:MM, plus battery when present.
@@ -101,32 +115,82 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
     }
     let text = core::str::from_utf8(&s[..n]).unwrap_or("");
     let w = text_width(text, &lock::TEXT_GLYPHS);
-    draw_text_right(fb, text, CX + w / 2, 52, 200, &lock::TEXT_GLYPHS);
+    draw_text_at(fb, text, CX - w / 2, 52, 200, &lock::TEXT_GLYPHS);
 
     wfb.mark_rect(0, 0, W - 1, H - 1);
 }
 
-/// The electric-azure saber gradient (same stops as the lock flourish) —
-/// intensity 0..=255 → RGB565-BE.
-fn saber_lut() -> [(u8, u8); 256] {
+/// Per-frame focus-ring tick while the wheel is resting: redraw the glow
+/// through a phase-shifted gradient (azure ↔ violet breathing cycle) and
+/// re-blit the focused icon on top. Damage = the glow sprite's rect only.
+pub fn tick_ring(wfb: &mut WatchFb, elapsed_ms: u32, focused: usize) {
+    // Triangle wave over ~4 s.
+    let ph = (elapsed_ms / 8) % 512;
+    let phase = if ph < 256 { ph } else { 511 - ph } as i32;
+    let saber = saber_lut(phase);
+
+    let y_c = CY; // focused row sits at center (static W1)
+    let app = &WHEEL_APPS[focused];
+    let px = ICON_L_PX;
+    let icon_cx = icon_center_x(y_c, px);
+
+    let fb = wfb.buf_mut();
+    blit_glow(fb, &saber, icon_cx, y_c, 256);
+    blit_icon(fb, app.icon_l, px, icon_cx, y_c, 256);
+    let s = GLOW_RING_PX / 2;
+    wfb.mark_rect(icon_cx - s, y_c - s, icon_cx + s, y_c + s);
+}
+
+/// Focus proximity + row alpha with a fade tail past 2 rows from center.
+fn row_alpha(y_c: i32) -> (i32, i32) {
+    let ady = (y_c - CY).abs();
+    let t = (256 - (ady * 256 / (2 * PITCH)).min(256)).max(0);
+    let mut alpha = 115 + (141 * t) / 256;
+    if ady > 2 * PITCH {
+        let fade = (256 - ((ady - 2 * PITCH) * 256) / PITCH).max(0);
+        alpha = (alpha * fade) >> 8;
+    }
+    (alpha, t)
+}
+
+/// Icon center x: fitted against the chord at the icon's WORST row (its
+/// top/bottom corner), plus EDGE_PAD — the box never clips the circle.
+fn icon_center_x(y_c: i32, px: i32) -> i32 {
+    let s = px / 2;
+    let dyw = ((y_c - CY).abs() + s).min(R - 1);
+    let half_w = (isqrt(((R * R - dyw * dyw) as u32) << 8) >> 4) as i32;
+    CX - half_w + EDGE_PAD + s
+}
+
+/// The electric-azure saber gradient, phase-blended toward violet
+/// (phase 0..=256). Same stop structure as the lock flourish.
+fn saber_lut(phase: i32) -> [(u8, u8); 256] {
+    // (azure, violet) endpoints per stop channel.
+    let mix = |a: i32, b: i32| a + ((b - a) * phase) / 256;
     let mut lut = [(0u8, 0u8); 256];
     for (i, e) in lut.iter_mut().enumerate() {
         let v = i as i32;
         let (r, g, b) = if v < 72 {
-            (v * 10 / 72, v * 40 / 72, v * 140 / 72)
+            let (r1, g1, b1) = (mix(10, 60), mix(40, 20), mix(140, 160));
+            (v * r1 / 72, v * g1 / 72, v * b1 / 72)
         } else if v < 160 {
             let t = v - 72;
-            (10 - t * 10 / 88, 40 + t * 70 / 88, 140 + t * 90 / 88)
+            let (r0, g0, b0) = (mix(10, 60), mix(40, 20), mix(140, 160));
+            let (r1, g1, b1) = (mix(0, 90), mix(110, 70), mix(230, 255));
+            (r0 + t * (r1 - r0) / 88, g0 + t * (g1 - g0) / 88, b0 + t * (b1 - b0) / 88)
         } else if v < 216 {
             let t = v - 160;
-            (0, 110 + t * 60 / 56, 230 + t * 25 / 56)
+            let (r0, g0, b0) = (mix(0, 90), mix(110, 70), mix(230, 255));
+            let (r1, g1, b1) = (mix(0, 140), mix(170, 130), 255);
+            (r0 + t * (r1 - r0) / 56, g0 + t * (g1 - g0) / 56, b0 + t * (b1 - b0) / 56)
         } else {
             let t = v - 216;
-            (t * 190 / 39, 170 + t * 85 / 39, 255)
+            let (r0, g0, b0) = (mix(0, 140), mix(170, 130), 255);
+            (r0 + t * (mix(190, 220) - r0) / 39, g0 + t * (255 - g0) / 39, b0 + t * (255 - b0) / 39)
         };
-        let r5 = ((r as u16) * 31 / 255) & 0x1F;
-        let g6 = ((g as u16) * 63 / 255) & 0x3F;
-        let b5 = ((b as u16) * 31 / 255) & 0x1F;
+        let r5 = ((r.clamp(0, 255) as u16) * 31 / 255) & 0x1F;
+        let g6 = ((g.clamp(0, 255) as u16) * 63 / 255) & 0x3F;
+        let b5 = ((b.clamp(0, 255) as u16) * 31 / 255) & 0x1F;
         let px = (r5 << 11) | (g6 << 5) | b5;
         *e = ((px >> 8) as u8, px as u8);
     }
@@ -182,16 +246,15 @@ fn blit_icon(fb: &mut [u8], sprite: &[u8], px: i32, cx: i32, cy: i32, alpha: i32
     }
 }
 
-/// Right-aligned text: the string ends at `right_x`.
-fn draw_text_right(
+fn draw_text_at(
     fb: &mut [u8],
     text: &str,
-    right_x: i32,
+    left_x: i32,
     base_y: i32,
     alpha: i32,
     glyphs: &[Option<Glyph>; 128],
 ) {
-    let mut x = right_x - text_width(text, glyphs);
+    let mut x = left_x;
     for ch in text.chars() {
         if let Some(g) = lock::get_glyph(glyphs, ch) {
             let glyph_y = base_y - (g.height as i32 + g.ymin as i32);
@@ -251,6 +314,13 @@ fn write_tinted(fb: &mut [u8], x: i32, y: i32, v: i32) {
     if idx + 1 < fb.len() {
         fb[idx] = (px >> 8) as u8;
         fb[idx + 1] = px as u8;
+    }
+}
+
+/// Pace helper for the intro (blocking, 25 ms frames like the settle).
+pub fn pace(frame_start: Instant) {
+    while frame_start.elapsed() < Duration::from_micros(25_000) {
+        core::hint::spin_loop();
     }
 }
 
