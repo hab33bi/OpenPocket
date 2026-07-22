@@ -159,3 +159,11 @@ up, the digits scale/translate continuously toward the status-line
 position and size, tracked 1:1 by unlock progress (scrubbing the sheet
 scrubs the morph). The wheel's status clock is the morph's destination —
 its position/size are the landing keyframe.
+
+## 12. W3 scope update (user, 2026-07-22): Bebop -> Gallery
+
+The W4 "Bebop surprise" is CANCELLED as a standalone moment. Cowboy Bebop
+lives in the Gallery app instead (curated stills, final page carries
+"SEE YOU SPACE COWBOY..."). Every other app ships an elegant high-fidelity
+placeholder/template per docs/W3-APP-SCREENS-PLAN.md (the W3 design
+contract - per-app layouts, accents, signature motions, build order).
