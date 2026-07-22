@@ -480,7 +480,14 @@ fn generate_wheel_assets() {
                 };
                 (l(150.0, 6.0) + l(70.0, 14.0)).min(220.0)
             };
-            let v = ((v as i32) + BAYER[(y & 3) as usize][(x & 3) as usize]).clamp(0, 255);
+            // Dither ONLY lit pixels — dithering the empty regions turned the
+            // sprite's transparent square into near-black speckle that
+            // stamped over neighboring icons at blit time.
+            let v = if v >= 1.0 {
+                ((v as i32) + BAYER[(y & 3) as usize][(x & 3) as usize]).clamp(1, 255)
+            } else {
+                0
+            };
             if !(x == 0 && y == 0) {
                 body.push(',');
             }

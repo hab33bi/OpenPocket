@@ -267,7 +267,7 @@ fn blit_glow(fb: &mut [u8], lut: &[(u8, u8); 256], cx: i32, cy: i32, alpha: i32)
         }
         for ix in 0..px {
             let a = GLOW_RING[(iy * px + ix) as usize] as i32;
-            if a == 0 {
+            if a < 6 {
                 continue;
             }
             let x = cx - px / 2 + ix;

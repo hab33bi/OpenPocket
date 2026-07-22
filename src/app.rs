@@ -852,7 +852,6 @@ impl<'a, 'd> App<'a, 'd> {
         };
         let s_start = *s_q8;
         let mut target = s_start + sign * ((start_dist as i32) << 8);
-        let mut last_compose = Instant::now();
         let vel = loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
@@ -862,15 +861,13 @@ impl<'a, 'd> App<'a, 'd> {
                 GestureEvent::DragEnd { vel_q8, .. } => break sign * vel_q8,
                 _ => {}
             }
-            if last_compose.elapsed() >= Duration::from_micros(COMPOSE_MIN_US) {
-                last_compose = Instant::now();
-                let t_eff = wheel_rubber(target, wheel_s_max());
-                let diff = t_eff - *s_q8;
-                if diff != 0 {
-                    *s_q8 += if diff.abs() <= 512 { diff } else { diff * 2 / 3 };
-                    wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
-                    self.flush_dirty();
-                }
+            // Compose continuously — the flush itself is the pacer.
+            let t_eff = wheel_rubber(target, wheel_s_max());
+            let diff = t_eff - *s_q8;
+            if diff != 0 {
+                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 3 / 4 };
+                wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+                self.flush_dirty();
             }
             self.maybe_reinit_touch(tp);
             core::hint::spin_loop();
@@ -878,13 +875,14 @@ impl<'a, 'd> App<'a, 'd> {
         self.wheel_momentum(s_q8, vel, now, batt);
     }
 
-    /// Momentum (v decays ~0.94 per 25 ms frame) → snap to the nearest row
-    /// with the settle's exponential ease. Also the tap-to-focus animator.
+    /// Momentum (real-dt integration, gentle decay) → snap to the nearest
+    /// row. Also the flick entry point.
     fn wheel_momentum(&mut self, s_q8: &mut i32, mut v_q8: i32, now: &WallTime, batt: Option<u8>) {
         let s_max = wheel_s_max();
-        while v_q8.abs() > 77 {
+        let mut dt_ms: i32 = 25;
+        while v_q8.abs() > 64 {
             let fs = Instant::now();
-            *s_q8 += v_q8 * 25;
+            *s_q8 += v_q8 * dt_ms;
             if *s_q8 <= 0 {
                 *s_q8 = 0;
                 break;
@@ -893,26 +891,26 @@ impl<'a, 'd> App<'a, 'd> {
                 *s_q8 = s_max;
                 break;
             }
-            v_q8 = v_q8 * 240 / 256;
+            // ~0.97 per 25 ms — a long, luxurious coast (decay scaled to
+            // the actual frame time).
+            v_q8 = v_q8 * (256 - (8 * dt_ms) / 25) / 256;
             wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
             self.flush_dirty();
-            wheel::pace(fs);
+            dt_ms = (fs.elapsed().as_millis() as i32).clamp(10, 50);
         }
         let pitch_q8 = wheel::PITCH_PX << 8;
         let row = ((*s_q8 + pitch_q8 / 2) / pitch_q8).clamp(0, wheel::rows() as i32 - 1);
         self.wheel_settle(s_q8, row as usize, now, batt);
     }
 
-    /// Ease the wheel to rest exactly on `row` (diff/2 per 25 ms frame).
+    /// Ease the wheel to rest exactly on `row` — decisive 2/3 steps.
     fn wheel_settle(&mut self, s_q8: &mut i32, row: usize, now: &WallTime, batt: Option<u8>) {
         let target = (row as i32 * wheel::PITCH_PX) << 8;
         while *s_q8 != target {
-            let fs = Instant::now();
             let diff = target - *s_q8;
-            *s_q8 += if diff.abs() <= 512 { diff } else { diff / 2 };
+            *s_q8 += if diff.abs() <= 768 { diff } else { diff * 2 / 3 };
             wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
             self.flush_dirty();
-            wheel::pace(fs);
         }
     }
 
@@ -975,12 +973,13 @@ fn wheel_s_max() -> i32 {
     ((wheel::rows() as i32 - 1) * wheel::PITCH_PX) << 8
 }
 
-/// Rubber band past the wheel's ends: displacement compresses ÷3.
+/// Rubber band past the wheel's ends: displacement compresses ÷2 — a
+/// stretchy, elastic give.
 fn wheel_rubber(t: i32, max: i32) -> i32 {
     if t < 0 {
-        t / 3
+        t / 2
     } else if t > max {
-        max + (t - max) / 3
+        max + (t - max) / 2
     } else {
         t
     }
