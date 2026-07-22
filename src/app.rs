@@ -1108,21 +1108,35 @@ impl<'a, 'd> App<'a, 'd> {
         // (recency-weighted, hotter-of like the recognizer); a pause
         // before lift means the drag ends where it stands.
         let now_ms = anim_start.elapsed().as_millis() as u32;
-        if now_ms.wrapping_sub(ring[2].1) > STALE_MS {
+        let mut raw = 0;
+        if now_ms.wrapping_sub(ring[2].1) <= STALE_MS {
+            let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(DT_FLOOR_MS as u32) as i32;
+            let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(DT_FLOOR_MS as u32) as i32;
+            let v_b = ((ring[1].0 - ring[2].0) << 8) / dt_b;
+            let v_a = ((ring[0].0 - ring[1].0) << 8) / dt_a;
+            let v_w = (2 * v_b + v_a) / 3;
+            raw = if dt_b > 60 {
+                v_b
+            } else if (v_b >= 0) == (v_w >= 0) && v_b.abs() > v_w.abs() {
+                v_b
+            } else {
+                v_w
+            };
+        }
+        // Whole-press fallback for quick flicks: the chip may emit only
+        // one or two motion reports for a short ballistic swipe, gutting
+        // the segment estimate (huge dt or a stale repeated-coord lift
+        // report). A short press is one motion by construction — its
+        // total displacement over its duration is an honest velocity.
+        if held_ms <= 180 {
+            let vp = ((origin_y - last_y) << 8) / held_ms.max(DT_FLOOR_MS as u32) as i32;
+            if raw == 0 || ((vp >= 0) == (raw >= 0) && vp.abs() > raw.abs()) {
+                raw = vp;
+            }
+        }
+        if raw == 0 {
             return Direct::Rest;
         }
-        let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(DT_FLOOR_MS as u32) as i32;
-        let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(DT_FLOOR_MS as u32) as i32;
-        let v_b = ((ring[1].0 - ring[2].0) << 8) / dt_b;
-        let v_a = ((ring[0].0 - ring[1].0) << 8) / dt_a;
-        let v_w = (2 * v_b + v_a) / 3;
-        let raw = if dt_b > 60 {
-            v_b
-        } else if (v_b >= 0) == (v_w >= 0) && v_b.abs() > v_w.abs() {
-            v_b
-        } else {
-            v_w
-        };
         Direct::Fling { raw, held_ms }
     }
 
@@ -1163,7 +1177,17 @@ impl<'a, 'd> App<'a, 'd> {
                 nearest((s as i64 + v as i64 * K_MS as i64).clamp(0, s_max as i64) as i32)
             }
         };
-        let mut target = project(*s_q8, v0_q8);
+        // Picker detent floor: a definite flick ALWAYS advances at least
+        // one row — small flicks never die on the current row.
+        let aim = |s: i32, v: i32| -> i32 {
+            let t = project(s, v);
+            if v.abs() >= FLING_FLOOR_Q8 && t == nearest(s) {
+                (nearest(s) + v.signum() * pitch_q8).clamp(0, s_max)
+            } else {
+                t
+            }
+        };
+        let mut target = aim(*s_q8, v0_q8);
         if v0_q8 != 0 {
             println!("wheel: glide v={v0_q8} -> row {}", target / pitch_q8);
         }
@@ -1198,7 +1222,7 @@ impl<'a, 'd> App<'a, 'd> {
                         wheel_power(raw)
                     };
                     landed_at = None;
-                    target = project(*s_q8, v_q8);
+                    target = aim(*s_q8, v_q8);
                     println!("wheel: chain v={v_q8} -> row {}", target / pitch_q8);
                     v_q8 = (target - *s_q8) / K_MS;
                 }
@@ -1240,6 +1264,12 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
             let diff = target - *s_q8;
+            // Overscroll spring-back: released out of range, the wheel
+            // returns with a fast damped spring (~110 ms) — the glide's
+            // velocity math would crawl back instead.
+            if (*s_q8 < 0 || *s_q8 > s_max) && diff != 0 {
+                *s_q8 += if diff.abs() <= 512 { diff } else { diff / 2 };
+            } else
             // Glide until ~16 px out, then hand to the damped tail — at that
             // range the tail is invisible continuation, not a second flick.
             if diff.signum() == v_q8.signum() && diff.abs() > (16 << 8) {
