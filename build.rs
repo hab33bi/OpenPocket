@@ -468,7 +468,7 @@ fn generate_inter_font() {
 fn generate_wheel_assets() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     const ICON_S: u32 = 40; // unfocused
-    const ICON_L: u32 = 56; // focused
+    const ICON_L: u32 = 48; // focused (sized to leave the glow ring a few px of padding)
     const ICON_H: u32 = 96; // hero (app content elements)
     const ICON_X: u32 = 128; // splash logo (open/close morph loading beat)
 

@@ -372,7 +372,7 @@ pub fn draw_scroll(
                 (text_width(app.name, &lock::LABELF_GLYPHS) * (196 + ((60 * wl) >> 8))) >> 8
             };
             let x = (CX - tw / 2).max(min_left);
-            let (up, dn) = if wl >= 128 { (21, 25) } else { (16, 20) };
+            let (up, dn) = if wl >= 128 { (28, 26) } else { (20, 22) };
             fill_pill(fb, x - 16, y_d - up, x + tw + 16, y_d + dn);
             fx.push(x - 18, y_d - up - 1, x + tw + 18, y_d + dn + 1);
         }
@@ -484,6 +484,7 @@ pub fn draw_open_morph(
     focused: usize,
     f_q8: i32,
     icon_a: i32,
+    show_status: bool,
 ) {
     fx.intro = None;
     let s_px = s_q8 >> 8;
@@ -573,9 +574,13 @@ pub fn draw_open_morph(
         fx.push(ix - s2, iy - s2, ix + s2, iy + s2);
     }
 
-    // Status: topmost, every frame — the one fixed point.
-    draw_status(fb, now, battery);
-    fx.push(CX - 110, 26, CX + 110, 66);
+    // Status: topmost, every frame — the one fixed point (suppressed for
+    // apps that hide it, e.g. Time: the frame-start targeted clear erased
+    // the wheel's copy, so it simply never reappears during the morph).
+    if show_status {
+        draw_status(fb, now, battery);
+        fx.push(CX - 110, 26, CX + 110, 66);
+    }
 
     for k in 0..fx.n {
         let (x0, y0, x1, y1) = fx.rects[k];
@@ -936,11 +941,15 @@ fn write_tinted(fb: &mut [u8], x: i32, y: i32, v: i32) {
     fb[idx + 1] = px as u8;
 }
 
-/// Full-radius pill fill, dark grey (SET writes — the held-label
-/// container; drawn under the label, over whatever lies beneath).
+/// Full-radius pill: the held-label container. Dark charcoal at ~78%
+/// opacity, blended source-over so the glow beneath ghosts through — the
+/// premium AMOLED look (a flat SET fill read as a sticker).
 fn fill_pill(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
-    // (54, 56, 62) pre-quantized to RGB565.
-    const GREY: u16 = ((54u16 * 31 / 255) << 11) | ((56u16 * 63 / 255) << 5) | (62u16 * 31 / 255);
+    const T: (i32, i32, i32) = (34, 36, 42);
+    const A: i32 = 200; // ~78% opacity
+    const TR5: i32 = T.0 * 31 / 255;
+    const TG6: i32 = T.1 * 63 / 255;
+    const TB5: i32 = T.2 * 31 / 255;
     let r = (y1 - y0) / 2;
     let cy_ = (y0 + y1) / 2;
     for y in y0.max(0)..=y1.min(H - 1) {
@@ -949,10 +958,21 @@ fn fill_pill(fb: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32) {
         let (a, b) = ((x0 + ins).max(0), (x1 - ins).min(W - 1));
         for x in a..=b {
             let idx = ((y * W + x) * 2) as usize;
-            if idx + 1 < fb.len() {
-                fb[idx] = (GREY >> 8) as u8;
-                fb[idx + 1] = GREY as u8;
+            if idx + 1 >= fb.len() {
+                continue;
             }
+            let old = ((fb[idx] as u16) << 8) | fb[idx + 1] as u16;
+            let (or5, og6, ob5) = (
+                (old >> 11) as i32,
+                ((old >> 5) & 0x3F) as i32,
+                (old & 0x1F) as i32,
+            );
+            let r5 = (or5 + (TR5 - or5) * A / 255) as u16 & 0x1F;
+            let g6 = (og6 + (TG6 - og6) * A / 255) as u16 & 0x3F;
+            let b5 = (ob5 + (TB5 - ob5) * A / 255) as u16 & 0x1F;
+            let px = (r5 << 11) | (g6 << 5) | b5;
+            fb[idx] = (px >> 8) as u8;
+            fb[idx + 1] = px as u8;
         }
     }
 }

@@ -237,6 +237,25 @@ impl<'a, 'd> App<'a, 'd> {
                 unlocked_at = Instant::now();
                 continue;
             }
+            // Settings brightness slider: a live drag control — any press
+            // in its row band owns the knob until lift.
+            if scene == Scene::App(apps::SETTINGS)
+                && power == Power::Awake
+                && !app_state.set_about
+                && self.swipe.finger_down()
+                && self
+                    .swipe
+                    .press_origin_y()
+                    .is_some_and(|y| apps::slider_zone(y as i32))
+            {
+                if let Some(level) = self.settings_slider(&mut app_state, anim_start, &mut tp) {
+                    brightness = level;
+                    bright_full = level;
+                    println!("settings: brightness -> {level:#04x}");
+                }
+                unlocked_at = Instant::now();
+                continue;
+            }
             // Gallery strip: same direct-manipulation doctrine, X axis.
             if scene == Scene::App(apps::GALLERY)
                 && power == Power::Awake
@@ -606,19 +625,7 @@ impl<'a, 'd> App<'a, 'd> {
             }
             if let Some((idx, y)) = app_tap {
                 if idx == apps::SETTINGS {
-                    if let Some(level) = apps::settings_tap(
-                        &mut self.wfb,
-                        &mut app_state,
-                        y as i32,
-                        wheel_batt,
-                        elapsed,
-                    ) {
-                        // The one real control we own: CO5300 brightness.
-                        self.bus.write_c8d8(0x51, level);
-                        brightness = level;
-                        bright_full = level;
-                        println!("settings: brightness -> {level:#04x}");
-                    }
+                    apps::settings_tap(&mut self.wfb, &mut app_state, y as i32, wheel_batt, elapsed);
                     self.flush_dirty();
                 }
                 unlocked_at = Instant::now();
@@ -1640,13 +1647,17 @@ impl<'a, 'd> App<'a, 'd> {
                     was_full = true;
                     self.wheel_fx.invalidate();
                 }
+                // Open: art at full under the fading splash. Close: the
+                // art itself fades out first (standard close sequence).
+                let (ia, aa) = if dirn < 0 { (0, q) } else { (256 - q, 256) };
                 apps::draw_gallery_load(
                     &mut self.wfb,
                     &mut self.wheel_fx,
                     now,
                     batt,
                     st.gal_page,
-                    q,
+                    ia,
+                    aa,
                 );
             } else {
                 if core::mem::replace(&mut was_full, false) {
@@ -1661,6 +1672,7 @@ impl<'a, 'd> App<'a, 'd> {
                     idx,
                     f,
                     icon_a,
+                    apps::shows_status(idx),
                 );
                 if title_a > 0 {
                     apps::draw_splash_title(&mut self.wfb, &mut self.wheel_fx, idx, title_a);
@@ -1691,6 +1703,12 @@ impl<'a, 'd> App<'a, 'd> {
                 return Scene::App(idx);
             }
             if t <= 0 && dirn < 0 {
+                if !apps::shows_status(idx) {
+                    // The status was suppressed for this app — the wheel
+                    // needs it back before resting frames take over.
+                    wheel::tick_status(&mut self.wfb, now, batt);
+                    self.flush_dirty();
+                }
                 return Scene::Wheel;
             }
             wheel::pace(fs);
@@ -1872,6 +1890,46 @@ impl<'a, 'd> App<'a, 'd> {
             *settled = Some(Instant::now());
             return;
         }
+    }
+
+    /// Brightness slider drag session: the finger owns the knob until
+    /// lift — every report maps (mirror-corrected) X to a level, writes
+    /// the panel register live, and redraws the row. Returns the final
+    /// level (the new wake-restore target).
+    fn settings_slider(
+        &mut self,
+        st: &mut apps::State,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) -> Option<u8> {
+        let mut last: Option<u8> = None;
+        let mut seq = tp.raw_seq;
+        loop {
+            let now_ms = anim_start.elapsed().as_millis() as u32;
+            let _ = self.poll_touch_once(tp, now_ms);
+            if seq != tp.raw_seq {
+                seq = tp.raw_seq;
+                if let Some(t) = tp.last_raw {
+                    if t.pressed {
+                        // CST9217 X is mirrored (hardware-measured).
+                        let sx = LCD_WIDTH as i32 - 1 - t.x as i32;
+                        let level = apps::slider_level_from_x(sx);
+                        if last != Some(level) {
+                            last = Some(level);
+                            apps::settings_set_level(&mut self.wfb, st, level);
+                            self.flush_dirty();
+                            self.bus.write_c8d8(0x51, level);
+                        }
+                    }
+                }
+            }
+            if !self.swipe.finger_down() {
+                break;
+            }
+            self.maybe_reinit_touch(tp);
+            core::hint::spin_loop();
+        }
+        last
     }
 
     /// A gesture takes over mid-flourish: write the flourish's zero-glow

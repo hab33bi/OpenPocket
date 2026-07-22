@@ -34,9 +34,9 @@ pub const PHOTOS: usize = 7;
 pub struct State {
     pub gal_page: usize,
     pub gal_settle: Option<Instant>,
-    /// Settings: About panel open; brightness preset index.
+    /// Settings: About panel open; live brightness level (reg 0x51).
     pub set_about: bool,
-    pub set_bright: usize,
+    pub set_level: u8,
     /// Time app seconds-arc: last RTC second + when it was observed (for
     /// sub-second sweep), last drawn pseudo-angle, last tip rect, and the
     /// minute the big digits show. t_anchor=None ⇒ arc not yet seeded.
@@ -53,7 +53,7 @@ impl State {
             gal_page: 0,
             gal_settle: None,
             set_about: false,
-            set_bright: 0,
+            set_level: 0xFF,
             t_sec: 255,
             t_anchor: None,
             t_last_a: 0,
@@ -63,8 +63,22 @@ impl State {
     }
 }
 
-/// Brightness presets the Settings row cycles through (CO5300 reg 0x51).
-pub const BRIGHT_PRESETS: [u8; 3] = [0xFF, 0x96, 0x46];
+/// Brightness slider geometry (Settings row 0): a real drag control.
+pub const SLIDER_X0: i32 = CX - 90;
+pub const SLIDER_W: i32 = 180;
+const SLIDER_Y: i32 = CY - 64 + 26;
+/// Floor keeps the panel from going black under the finger.
+const SLIDER_MIN: i32 = 0x14;
+
+/// Map a (mirror-corrected) screen X onto a brightness level.
+pub fn slider_level_from_x(sx: i32) -> u8 {
+    (SLIDER_MIN + ((sx - SLIDER_X0).clamp(0, SLIDER_W) * (255 - SLIDER_MIN)) / SLIDER_W) as u8
+}
+
+/// Whether a press Y falls inside the slider row's touch band.
+pub fn slider_zone(y: i32) -> bool {
+    (CY - 64 - 34..=CY - 64 + 44).contains(&y)
+}
 
 /// Title baseline (§1) and content geometry.
 const TITLE_BASE_Y: i32 = 92;
@@ -554,47 +568,65 @@ fn draw_settings(fb: &mut [u8], st: &State, q: i32, rise: i32, batt: Option<u8>,
         }
         return;
     }
-    for (i, name) in SET_ROWS.iter().enumerate() {
+    // Row 0: label + the live brightness slider beneath it.
+    draw_bright_row(fb, st, q, rise);
+    for (i, name) in SET_ROWS.iter().enumerate().skip(1) {
         let y = SET_ROW_Y[i] + rise;
         let tw = wheel::text_width(name, &lock::TEXT_GLYPHS);
         wheel::draw_text_at(fb, name, CX - tw / 2, y + 11, (220 * q) >> 8, &lock::TEXT_GLYPHS);
     }
-    // Live brightness value arc beside its row (¾-turn scale).
-    let sweep = (st.set_bright as i32 + 1) * 768 / 3;
-    let (acx, acy) = (CX + 128, SET_ROW_Y[0] + rise - 2);
-    draw_ring_arc_at(fb, acx, acy, 12, 16, sweep, AZURE, (230 * q) >> 8);
 }
 
-/// A tap inside the Settings content zone. Returns Some(level) when the
-/// brightness preset cycled (the caller writes reg 0x51).
-pub fn settings_tap(
-    wfb: &mut WatchFb,
-    st: &mut State,
-    y: i32,
-    batt: Option<u8>,
-    elapsed_ms: u32,
-) -> Option<u8> {
-    if !(110..=430).contains(&y) && !st.set_about {
-        return None;
+/// The Brightness row: label above a real slider (track, azure fill,
+/// white knob at the live level).
+fn draw_bright_row(fb: &mut [u8], st: &State, q: i32, rise: i32) {
+    let name = SET_ROWS[0];
+    let tw = wheel::text_width(name, &lock::TEXT_GLYPHS);
+    wheel::draw_text_at(fb, name, CX - tw / 2, SET_ROW_Y[0] + rise - 4, (220 * q) >> 8, &lock::TEXT_GLYPHS);
+    let y = SLIDER_Y + rise;
+    let pos = SLIDER_X0
+        + ((st.set_level as i32 - SLIDER_MIN).clamp(0, 255 - SLIDER_MIN) * SLIDER_W)
+            / (255 - SLIDER_MIN);
+    // Track (ghost) + filled portion (azure) as 4 px rounded bars.
+    for x in SLIDER_X0..=SLIDER_X0 + SLIDER_W {
+        let (tint, v) = if x <= pos { (AZURE, 230) } else { (ICE, 70) };
+        for dy in -1..=2 {
+            blend_px(fb, x, y + dy, tint, (v * q) >> 8);
+        }
     }
-    let mut level = None;
+    cap_dot(fb, SLIDER_X0 - 1, y + 1, 2, ICE, (70 * q) >> 8);
+    cap_dot(fb, SLIDER_X0 + SLIDER_W + 1, y + 1, 2, ICE, (70 * q) >> 8);
+    // Knob: solid white disc.
+    cap_dot(fb, pos, y + 1, 8, TITLE_WHITE, (255 * q) >> 8);
+}
+
+/// Live slider update (drag session / tap): redraw only the row band.
+pub fn settings_set_level(wfb: &mut WatchFb, st: &mut State, level: u8) {
+    st.set_level = level;
+    {
+        let fb = wfb.buf_mut();
+        fill_rect_black(fb, 60, SET_ROW_Y[0] - 34, W - 60, SET_ROW_Y[0] + 44);
+        draw_bright_row(fb, st, 256, 0);
+    }
+    wfb.mark_rect(60, SET_ROW_Y[0] - 34, W - 60, SET_ROW_Y[0] + 44);
+}
+
+/// A tap inside the Settings content zone (the slider row is owned by the
+/// drag session; here only About toggles).
+pub fn settings_tap(wfb: &mut WatchFb, st: &mut State, y: i32, batt: Option<u8>, elapsed_ms: u32) {
     if st.set_about {
         st.set_about = false;
-    } else if y < CY - 32 {
-        st.set_bright = (st.set_bright + 1) % BRIGHT_PRESETS.len();
-        level = Some(BRIGHT_PRESETS[st.set_bright]);
-    } else if y >= CY + 32 {
+    } else if (110..=430).contains(&y) && y >= CY + 32 {
         st.set_about = true;
     } else {
-        return None; // Display row: informational, W3 static
+        return;
     }
     {
         let fb = wfb.buf_mut();
-        fill_rect_black(fb, 30, 118, W - 30, 340);
+        fill_rect_black(fb, 30, 110, W - 30, 360);
         draw_settings(fb, st, 256, 0, batt, elapsed_ms);
     }
-    wfb.mark_rect(30, 118, W - 30, 340);
-    level
+    wfb.mark_rect(30, 110, W - 30, 360);
 }
 
 // ---------------------------------------------------------------------
@@ -865,21 +897,36 @@ pub fn draw_gallery_frame(wfb: &mut WatchFb, s_px: i32, now: &WallTime, batt: Op
     wfb.mark_rect(0, 0, W - 1, H - 1);
 }
 
-/// Morph load/unload frame over the art: the page shows at once under the
-/// fading splash logo/title (full-frame per-pixel fades are out of the
-/// 25 ms budget); every frame re-blits the splash, title and status bands
-/// from the art before compositing (source-over must never self-stack).
+/// Morph load/unload frame over the art. Opening: the page shows at once
+/// under the fading splash logo/title (bands re-blit each frame —
+/// source-over must never self-stack). Closing (`art_a` < 256): the whole
+/// page fades out beneath the persistent status bar, blitted faded
+/// straight from flash (~full-frame cost, but the fade is only a few
+/// frames and reads beautifully).
+#[allow(clippy::too_many_arguments)]
 pub fn draw_gallery_load(
     wfb: &mut WatchFb,
     fx: &mut wheel::WheelFx,
     now: &WallTime,
     batt: Option<u8>,
     page: usize,
-    q_q8: i32,
+    icon_a: i32,
+    art_a: i32,
 ) {
-    let seed = fx.take_seed();
-    let ia = (256 - q_q8).clamp(0, 256);
     let n = GALLERY_PAGES as i32;
+    if art_a < 250 {
+        // Close fade: full-frame faded art + status; chrome fades with it.
+        fx.take_seed();
+        {
+            let fb = wfb.buf_mut();
+            fade_page(fb, page, art_a.max(0));
+            wheel::draw_status(fb, now, batt);
+        }
+        wfb.mark_rect(0, 0, W - 1, H - 1);
+        return;
+    }
+    let seed = fx.take_seed();
+    let ia = icon_a.clamp(0, 256);
     let ir = wheel::SPLASH_PX / 2 + 2;
     let (iy0, iy1) = (wheel::SPLASH_ICON_Y - ir, wheel::SPLASH_ICON_Y + ir);
     let tb = wheel::SPLASH_TITLE_BASE_Y;
@@ -970,6 +1017,22 @@ fn copy_page_row(fb: &mut [u8], dst: usize, pg: i32, y: i32, src_x: usize, w: us
     let src = GALLERY_ART[pg as usize];
     let s = ((y as usize) * W as usize + src_x) * 2;
     fb[dst..dst + w * 2].copy_from_slice(&src[s..s + w * 2]);
+}
+
+/// Full-frame faded blit of a page (RGB565 channel scale, source read
+/// from flash so PSRAM traffic stays write-only).
+fn fade_page(fb: &mut [u8], page: usize, a: i32) {
+    let src = GALLERY_ART[page.min(GALLERY_PAGES - 1)];
+    let n = fb.len().min(src.len());
+    for (d, s) in fb[..n].chunks_exact_mut(2).zip(src[..n].chunks_exact(2)) {
+        let px = ((s[0] as i32) << 8) | s[1] as i32;
+        let r = ((px >> 11) * a) >> 8;
+        let g = (((px >> 5) & 0x3F) * a) >> 8;
+        let b = ((px & 0x1F) * a) >> 8;
+        let o = ((r as u16) << 11) | ((g as u16) << 5) | b as u16;
+        d[0] = (o >> 8) as u8;
+        d[1] = o as u8;
+    }
 }
 
 /// Re-blit a rect of the resting page's art (rest-state band restore).
