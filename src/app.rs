@@ -1038,7 +1038,10 @@ impl<'a, 'd> App<'a, 'd> {
         let falling_edge = int_low && !tp.int_was_low;
         tp.int_was_low = int_low;
         let do_read = if self.swipe.finger_down() {
-            tp.last_read.elapsed() >= Duration::from_millis(10)
+            // 7 ms while tracking (was 10): ~3 ms lower worst-case input
+            // latency on the wheel/gallery/slider at ~1 extra read per
+            // frame of bus load.
+            tp.last_read.elapsed() >= Duration::from_millis(7)
         } else {
             (falling_edge && tp.last_read.elapsed() >= Duration::from_millis(2))
                 || (int_low && tp.last_read.elapsed() >= Duration::from_millis(20))

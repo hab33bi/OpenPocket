@@ -349,15 +349,26 @@ fn weekday(y: u16, m: u8, d: u8) -> usize {
 
 fn time_tick(wfb: &mut WatchFb, now: &WallTime, st: &mut State) {
     if st.t_anchor.is_none() {
-        // Fresh open: seed the whole arc in one clean frame.
+        // Fresh open: ONE deterministic seed frame — full black fill, then
+        // the complete face redrawn from scratch (title, big time, date,
+        // arc, tip). Nothing painted by the morph can survive as an
+        // artifact, and the hidden status clock stays hidden by
+        // construction.
         st.t_sec = now.second;
+        st.t_min = now.minute;
         st.t_anchor = Some(Instant::now());
         let a = ((now.second as i32) * 1024 / 60).max(4);
+        let (tbuf, dbuf, dlen) = time_strings(now);
+        let t_str = core::str::from_utf8(&tbuf).unwrap_or("00:00");
+        let d_str = core::str::from_utf8(&dbuf[..dlen]).unwrap_or("");
+        let tw = wheel::text_width(t_str, &lock::TIME_GLYPHS);
+        let dw = wheel::text_width(d_str, &lock::TEXT_GLYPHS);
         let fb = wfb.buf_mut();
-        // The Time app owns the whole face: the status clock is hidden
-        // here (the big digits ARE the time).
-        fill_rect_black(fb, CX - 110, 26, CX + 110, 66);
-        clear_annulus(fb, ARC_R_IN - 2, ARC_R_OUT + 2);
+        fb.fill(0);
+        let (tx0, _) = title_metrics(wheel::WHEEL_APPS[TIME].name);
+        draw_title(fb, wheel::WHEEL_APPS[TIME].name, tx0, TITLE_BASE_Y, 200, accent(TIME));
+        wheel::draw_text_at(fb, t_str, CX - tw / 2, TIME_BASE_Y, 256, &lock::TIME_GLYPHS);
+        wheel::draw_text_at(fb, d_str, CX - dw / 2, DATE_BASE_Y, 150, &lock::TEXT_GLYPHS);
         draw_ring_arc(fb, CX, CY, ARC_R_IN, ARC_R_OUT, a, AZURE, 230);
         let (vx, vy) = pseudo_dir(a);
         let tx = CX + (226 * vx >> 8);

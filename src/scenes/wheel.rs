@@ -372,7 +372,7 @@ pub fn draw_scroll(
                 (text_width(app.name, &lock::LABELF_GLYPHS) * (196 + ((60 * wl) >> 8))) >> 8
             };
             let x = (CX - tw / 2).max(min_left);
-            let (up, dn) = if wl >= 128 { (28, 26) } else { (20, 22) };
+            let (up, dn) = if wl >= 128 { (34, 27) } else { (26, 23) };
             fill_pill(fb, x - 16, y_d - up, x + tw + 16, y_d + dn);
             fx.push(x - 18, y_d - up - 1, x + tw + 18, y_d + dn + 1);
         }
