@@ -1038,10 +1038,10 @@ impl<'a, 'd> App<'a, 'd> {
         let falling_edge = int_low && !tp.int_was_low;
         tp.int_was_low = int_low;
         let do_read = if self.swipe.finger_down() {
-            // 7 ms while tracking (was 10): ~3 ms lower worst-case input
-            // latency on the wheel/gallery/slider at ~1 extra read per
-            // frame of bus load.
-            tp.last_read.elapsed() >= Duration::from_millis(7)
+            // 10 ms while tracking — the proven cadence. (A 7 ms
+            // experiment added bus pressure that audibly changed the
+            // velocity estimator's character; user-reverted.)
+            tp.last_read.elapsed() >= Duration::from_millis(10)
         } else {
             (falling_edge && tp.last_read.elapsed() >= Duration::from_millis(2))
                 || (int_low && tp.last_read.elapsed() >= Duration::from_millis(20))
@@ -1281,17 +1281,25 @@ impl<'a, 'd> App<'a, 'd> {
                 self.draw_wheel(now, batt, *s_q8, diff.abs() > FAST_LOD_Q8, pill);
                 self.flush_dirty();
             }
-            // Pill on: a still press past the settle beat. Pill off: the
-            // press turned into a drag.
+            // Pill on: a still press inside the TAP WINDOW (90..350 ms).
+            // Pill off: the press turned into a drag, or outlived the tap
+            // window (a long hold acts as nothing — chip silence makes
+            // true stillness unverifiable past that).
+            let held = t0.elapsed();
             if pill.is_none()
                 && !gate_open
                 && max_disp <= TAP_RADIUS_PX
-                && t0.elapsed() >= Duration::from_millis(90)
+                && held >= Duration::from_millis(90)
+                && held < Duration::from_millis(350)
             {
                 pill = Some(press_row);
                 self.draw_wheel(now, batt, *s_q8, false, pill);
                 self.flush_dirty();
-            } else if pill.is_some() && (gate_open || max_disp > TAP_RADIUS_PX) {
+            } else if pill.is_some()
+                && (gate_open
+                    || max_disp > TAP_RADIUS_PX
+                    || held >= Duration::from_millis(350))
+            {
                 pill = None;
                 self.draw_wheel(now, batt, *s_q8, false, None);
                 self.flush_dirty();
@@ -1301,10 +1309,13 @@ impl<'a, 'd> App<'a, 'd> {
         }
 
         let held_ms = t0.elapsed().as_millis() as u32;
-        // Retroactive tap: max displacement stayed inside the tap radius —
-        // ANY hold duration (a held-still press is the select/open gesture,
-        // pill shown; micro-scroll settles back).
-        if max_disp <= TAP_RADIUS_PX {
+        // Retroactive tap: max displacement stayed inside the tap radius
+        // AND the press was short. The 350 ms cap is load-bearing: the
+        // CST9217 goes SILENT during slow finger movement, so a slow
+        // scroll start is indistinguishable from a still hold — without
+        // the cap, slow drags classified as taps and OPENED apps
+        // (user-reported premature opens; reverted).
+        if max_disp <= TAP_RADIUS_PX && held_ms < 350 {
             return Direct::Tap { y: last_y };
         }
         if !gate_open {
