@@ -143,11 +143,11 @@ pub fn water_tick(wfb: &mut WatchFb, imu: Option<(i16, i16, i16)>, elapsed_ms: u
     st.wa.tick(wfb, imu, elapsed_ms);
 }
 
-/// Every app shows the shared status clock — the one fixed point (§1). The
-/// Time app used to hide it, which produced a disappear artifact on open;
-/// it now keeps the clock like everything else (user).
-pub fn shows_status(_idx: usize) -> bool {
-    true
+/// Every app shows the shared status clock EXCEPT Water — the liquid owns the
+/// whole round face (user). (The Time app keeps it — hiding it there caused a
+/// disappear artifact.)
+pub fn shows_status(idx: usize) -> bool {
+    idx != WATER
 }
 
 /// Time app layout: big digits + date optically centered as a group.

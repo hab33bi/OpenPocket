@@ -320,15 +320,17 @@ impl<'a, 'd> App<'a, 'd> {
                             &mut status_minute,
                         );
                     } else if idx == apps::WATER {
+                        // Water is an active tilt app: never dim/AOD/sleep and
+                        // never auto-relock while it's open (user — tilting
+                        // isn't touch activity, so keep it alive explicitly).
+                        tp.last_activity = Instant::now();
+                        unlocked_at = Instant::now();
                         // The run loop owns self.i2c: read gravity for the
                         // liquid this frame (~0.2 ms; None on a bus fault →
-                        // the sim reuses its last vector).
+                        // the sim reuses its last vector). No status clock in
+                        // Water — the liquid owns the whole face.
                         let imu = crate::drivers::qmi8658::read_accel(&mut self.i2c).ok();
                         apps::water_tick(&mut self.wfb, imu, elapsed, &mut app_state);
-                        if status_minute != now.minute {
-                            status_minute = now.minute;
-                            wheel::tick_status(&mut self.wfb, &now, wheel_batt);
-                        }
                     } else {
                         // The app's signature animation (partial redraw).
                         apps::tick(&mut self.wfb, idx, &now, elapsed, &mut app_state);
