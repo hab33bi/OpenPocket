@@ -871,12 +871,17 @@ impl<'a, 'd> App<'a, 'd> {
         loop {
             if let Some((d, ds)) = grab.take() {
                 let (rel, held_ms) = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp);
-                let flick = wheel_power(rel);
-                vel = if held_ms <= CHAIN_HOLD_MS && flick != 0 && flick.signum() == carry.signum()
-                {
-                    (carry + flick).clamp(-V_MAX_Q8, V_MAX_Q8)
+                // Carried momentum fades linearly over the hold — a quick
+                // catch-and-reflick keeps nearly all of it, a deliberate
+                // drag kills it. A real same-direction flick chains: carry
+                // + raw release feed the power curve TOGETHER, so
+                // consecutive flicks compound superlinearly.
+                let carry_eff =
+                    carry * CHAIN_HOLD_MS.saturating_sub(held_ms) as i32 / CHAIN_HOLD_MS as i32;
+                vel = if rel.abs() >= FLING_FLOOR_Q8 && rel.signum() == carry_eff.signum() {
+                    wheel_power(carry_eff + rel)
                 } else {
-                    flick
+                    wheel_power(rel)
                 };
             }
             match self.wheel_coast(s_q8, vel, now, batt, anim_start, tp) {
@@ -957,8 +962,6 @@ impl<'a, 'd> App<'a, 'd> {
         // a medium flick lands 2–4 rows away, considered, picker-like.
         const DECAY_NUM: i32 = 199;
         const K_MS: i32 = 112;
-        /// Fling floor: slower releases settle to the nearest row.
-        const FLING_FLOOR_Q8: i32 = 77;
 
         let s_max = wheel_s_max();
         let pitch_q8 = wheel::PITCH_PX << 8;
@@ -981,59 +984,49 @@ impl<'a, 'd> App<'a, 'd> {
         // becomes a smooth damped approach to the edge row.
         let mut v_q8 = (target - *s_q8) / K_MS;
         let mut dt_ms: i32 = 25;
-        // Momentum frozen by a catch — survives a quick touch, dies of age.
-        let mut carry: i32 = 0;
-        let mut carry_at: u32 = 0;
 
         loop {
             let fs = Instant::now();
             let now_ms = anim_start.elapsed().as_millis() as u32;
-            let live = |v: i32| -> i32 {
-                if v != 0 {
-                    v
-                } else if now_ms.wrapping_sub(carry_at) <= CHAIN_HOLD_MS {
-                    carry
-                } else {
-                    0
-                }
-            };
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragStart { dir, dist, .. } => {
-                    return Some((dir, dist, live(v_q8)));
+                    return Some((dir, dist, v_q8));
                 }
-                // Whole flick inside one poll gap while gliding: inject it
-                // additively without ever leaving the glide.
+                // Whole flick inside one poll gap while gliding: chain it
+                // without ever leaving the glide. Raw flick + live velocity
+                // feed the power curve TOGETHER, so consecutive flicks
+                // compound superlinearly. Opposite direction starts fresh
+                // (brake/reverse); a sub-floor release stops the wheel.
                 GestureEvent::DragEnd { dir, vel_q8: rel, .. } => {
                     let sign: i32 = match dir {
                         SwipeDir::Up => 1,
                         SwipeDir::Down => -1,
                     };
-                    let flick = wheel_power(sign * rel);
-                    let cur = live(v_q8);
-                    v_q8 = if flick != 0 && flick.signum() == cur.signum() {
-                        (cur + flick).clamp(-V_MAX_Q8, V_MAX_Q8)
+                    let raw = sign * rel;
+                    v_q8 = if rel >= FLING_FLOOR_Q8 && raw.signum() == v_q8.signum() {
+                        wheel_power(v_q8 + raw)
                     } else {
-                        flick
+                        wheel_power(raw)
                     };
-                    carry = 0;
                     target = project(*s_q8, v_q8);
                     println!("wheel: chain v={v_q8} -> row {}", target / pitch_q8);
                     v_q8 = (target - *s_q8) / K_MS;
                 }
+                // A resolved tap on a moving wheel stops it dead.
+                GestureEvent::Tap { .. } => {
+                    v_q8 = 0;
+                    target = nearest(*s_q8);
+                    println!("wheel: tap-stop");
+                }
                 _ => {}
             }
             if self.swipe.finger_down() {
-                // Caught: freeze under the finger; the momentum survives a
-                // short touch (quick re-flick) and a slow lift lands on the
-                // nearest row.
-                if v_q8 != 0 {
-                    carry = v_q8;
-                    carry_at = now_ms;
-                    v_q8 = 0;
-                }
-                target = nearest(*s_q8);
-                core::hint::spin_loop();
-                continue;
+                // Finger resting (pre-classification): friction brake, NOT
+                // a freeze — the wheel stays alive and drawing under the
+                // finger, so a quick chained flick keeps its momentum. A
+                // hold decays it to a stop; a resolved Tap kills it dead.
+                v_q8 = v_q8 * (256 - (256 - BRAKE_NUM) * dt_ms / 25) / 256;
+                target = project(*s_q8, v_q8);
             }
             let diff = target - *s_q8;
             // Glide until ~16 px out, then hand to the damped tail — at that
@@ -1137,9 +1130,17 @@ fn wheel_s_max() -> i32 {
 const V_REF_Q8: i32 = 700;
 /// Momentum ceiling — additive chaining can't run away past this.
 const V_MAX_Q8: i32 = 4000;
-/// A touch shorter than this keeps a prior glide's momentum alive; longer
-/// means a deliberate grab and the old momentum dies.
-const CHAIN_HOLD_MS: u32 = 300;
+/// Fling floor (Q8 px/ms): slower releases settle to the nearest row and
+/// never chain — catching a railing wheel and lifting gently must not
+/// re-launch it.
+const FLING_FLOOR_Q8: i32 = 77;
+/// Carried momentum fades linearly to zero over this hold duration — a
+/// quick catch-and-reflick keeps nearly all of it, a deliberate drag none.
+const CHAIN_HOLD_MS: u32 = 400;
+/// Friction while a finger rests on a gliding wheel (per 25 ms, /256):
+/// brakes it alive instead of freezing it — half-life ≈120 ms — so quick
+/// chained flicks keep their momentum through the touch.
+const BRAKE_NUM: i32 = 220;
 
 /// Continuous flick power curve: v_eff = v·(1 + |v|/V_REF). Reach grows
 /// superlinearly with flick speed — gentle ≈1–2 rows, a normal flick ≈3–5,

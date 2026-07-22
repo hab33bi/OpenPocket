@@ -265,7 +265,19 @@ impl SwipeTracker {
                     };
                     let v_b = (dpx_b << 8) / dt_b;
                     let v_a = (dpx_a << 8) / dt_a;
-                    let vel_q8 = if dt_b > 60 { v_b } else { (2 * v_b + v_a) / 3 };
+                    // An accelerating flick's last segment is its truest
+                    // speed — the weighted blend under-reports it by up to
+                    // a third. Take the hotter of the two when they agree
+                    // in direction; the stale check still lets a pause-
+                    // before-lift kill the fling.
+                    let v_w = (2 * v_b + v_a) / 3;
+                    let vel_q8 = if dt_b > 60 {
+                        v_b
+                    } else if (v_b >= 0) == (v_w >= 0) && v_b.abs() > v_w.abs() {
+                        v_b
+                    } else {
+                        v_w
+                    };
                     GestureEvent::DragEnd {
                         dir,
                         dist: dist_along(&tr, dir),
