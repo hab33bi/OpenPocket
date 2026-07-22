@@ -115,6 +115,16 @@ impl SwipeTracker {
         !matches!(self.phase, Phase::Idle)
     }
 
+    /// Touch-down origin Y of the current press, while a finger is down —
+    /// lets direct-manipulation surfaces anchor at the press point without
+    /// waiting for classification.
+    pub fn press_origin_y(&self) -> Option<u16> {
+        match self.phase {
+            Phase::Idle => None,
+            Phase::Pending(tr) | Phase::Dragging(tr, _) | Phase::Rejected(tr) => Some(tr.start_y),
+        }
+    }
+
     /// Feed a report (`Some` when INT fired and the read succeeded) or an idle
     /// tick (`None`). Returns at most one event per call.
     pub fn feed(&mut self, report: Option<TouchPoint>, now_ms: u32) -> GestureEvent {

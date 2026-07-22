@@ -105,6 +105,21 @@ struct TouchPoll {
     int_was_low: bool,
     /// Last touch report of any kind — drives M5 idle dimming.
     last_activity: Instant,
+    /// Latest raw report (incl. lift reports) + a sequence counter, for
+    /// direct-manipulation surfaces that track the finger pre-classification.
+    last_raw: Option<cst9217::TouchPoint>,
+    raw_seq: u32,
+}
+
+/// Outcome of a direct-manipulation wheel session (finger owns the wheel
+/// from the first raw report; verdict only at lift).
+enum Direct {
+    /// Real release velocity (signed, scroll space, Q8 px/ms) + hold time.
+    Fling { raw: i32, held_ms: u32 },
+    /// Slow/held release — the wheel stays where the finger left it.
+    Rest,
+    /// Never crossed the jitter gate: a tap at this Y.
+    Tap { y: i32 },
 }
 
 pub struct App<'a, 'd> {
@@ -139,6 +154,8 @@ impl<'a, 'd> App<'a, 'd> {
             consec_errors: 0,
             int_was_low: false,
             last_activity: Instant::now(),
+            last_raw: None,
+            raw_seq: 0,
         };
         let mut last_report = Instant::now();
         let mut ema_fps: f32 = 0.0;
@@ -175,6 +192,23 @@ impl<'a, 'd> App<'a, 'd> {
                 pre_ev = self.poll_touch_once(&mut tp, now_ms);
             }
             let preempted = !matches!(pre_ev, GestureEvent::None);
+
+            // Direct-manipulation takeover: any press on the wheel outside
+            // the relock zone owns it from the FIRST raw report — no
+            // classification wait, no slop distance lost (the CST9217 can
+            // sit silent for 200+ px of slow travel before classifying).
+            if scene == Scene::Wheel
+                && power == Power::Awake
+                && self.swipe.finger_down()
+                && self
+                    .swipe
+                    .press_origin_y()
+                    .is_some_and(|y| (y as i32) >= H * 12 / 100)
+            {
+                self.wheel_interact(true, 0, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
+                unlocked_at = Instant::now();
+                continue;
+            }
 
             let render_start = Instant::now();
             if scene == Scene::Locked && power != Power::Aod && power != Power::Sleep {
@@ -414,29 +448,16 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 continue;
             }
-            if let Some((dir, dist)) = wheel_drag {
-                self.wheel_interact(
-                    Some((dir, dist)),
-                    0,
-                    &mut wheel_s_q8,
-                    &now,
-                    wheel_batt,
-                    anim_start,
-                    &mut tp,
-                );
+            if wheel_drag.is_some() {
+                // Fallback entry (the pre-poll takeover normally wins the
+                // race): the finger is still down — the session anchors at
+                // its current position.
+                self.wheel_interact(true, 0, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
                 unlocked_at = Instant::now();
                 continue;
             }
             if let Some(v) = wheel_flick {
-                self.wheel_interact(
-                    None,
-                    v,
-                    &mut wheel_s_q8,
-                    &now,
-                    wheel_batt,
-                    anim_start,
-                    &mut tp,
-                );
+                self.wheel_interact(false, v, &mut wheel_s_q8, &now, wheel_batt, anim_start, &mut tp);
                 unlocked_at = Instant::now();
                 continue;
             }
@@ -874,6 +895,10 @@ impl<'a, 'd> App<'a, 'd> {
         };
         if let Some(t) = report {
             tp.last_activity = Instant::now();
+            // Raw-report stash for direct-manipulation surfaces (lift
+            // reports included — they carry the final coordinates).
+            tp.last_raw = Some(t);
+            tp.raw_seq = tp.raw_seq.wrapping_add(1);
             tp.log_ctr += 1;
             if tp.log_ctr % 32 == 0 {
                 println!(
@@ -885,15 +910,14 @@ impl<'a, 'd> App<'a, 'd> {
         self.swipe.feed(report, now_ms)
     }
 
-    /// Wheel interaction umbrella: track → coast → (regrab?) → track …
-    /// A touch during any phase catches the wheel instantly. Momentum is
-    /// ADDITIVE across quick successive flicks: a regrab-flick in the
-    /// glide's direction stacks onto the surviving momentum; an opposite
-    /// flick (or a long deliberate drag) starts fresh — the finger already
-    /// braked the wheel by tracking it 1:1.
+    /// Wheel interaction umbrella: direct session → coast → (retouch?) → …
+    /// A touch during any phase hands the wheel to the finger instantly.
+    /// Momentum is ADDITIVE across quick successive flicks: a re-flick in
+    /// the glide's direction stacks onto the surviving momentum; an
+    /// opposite flick (or a long deliberate drag) starts fresh.
     fn wheel_interact(
         &mut self,
-        mut grab: Option<(SwipeDir, u16)>,
+        mut grab: bool,
         vel_raw: i32,
         s_q8: &mut i32,
         now: &WallTime,
@@ -904,79 +928,186 @@ impl<'a, 'd> App<'a, 'd> {
         let mut vel = wheel_power(vel_raw);
         let mut carry: i32 = 0;
         loop {
-            if let Some((d, ds)) = grab.take() {
-                let (rel, held_ms) = self.wheel_track(d, ds, s_q8, now, batt, anim_start, tp);
-                // Carried momentum fades linearly over the hold — a quick
-                // catch-and-reflick keeps nearly all of it, a deliberate
-                // drag kills it. A real same-direction flick chains: carry
-                // + raw release feed the power curve TOGETHER, so
-                // consecutive flicks compound superlinearly.
-                let carry_eff =
-                    carry * CHAIN_HOLD_MS.saturating_sub(held_ms) as i32 / CHAIN_HOLD_MS as i32;
-                vel = if rel.abs() >= FLING_FLOOR_Q8 && rel.signum() == carry_eff.signum() {
-                    wheel_power(carry_eff + rel)
-                } else {
-                    wheel_power(rel)
-                };
+            if core::mem::replace(&mut grab, false) {
+                match self.wheel_direct(s_q8, now, batt, anim_start, tp) {
+                    // Carried momentum fades linearly over the hold — a
+                    // quick catch-and-reflick keeps nearly all of it, a
+                    // deliberate drag kills it. A real same-direction flick
+                    // chains: carry + raw release feed the power curve
+                    // TOGETHER, so consecutive flicks compound.
+                    Direct::Fling { raw, held_ms } => {
+                        let carry_eff = carry * CHAIN_HOLD_MS.saturating_sub(held_ms) as i32
+                            / CHAIN_HOLD_MS as i32;
+                        vel = if raw.abs() >= FLING_FLOOR_Q8 && raw.signum() == carry_eff.signum()
+                        {
+                            wheel_power(carry_eff + raw)
+                        } else {
+                            wheel_power(raw)
+                        };
+                    }
+                    Direct::Rest => vel = 0,
+                    Direct::Tap { y } => {
+                        if carry != 0 {
+                            // Tap caught a moving wheel: it's already
+                            // stopped under the finger — settle nearest.
+                            vel = 0;
+                        } else {
+                            let row = (y - H / 2 + (*s_q8 >> 8) + wheel::PITCH_PX / 2)
+                                .div_euclid(wheel::PITCH_PX)
+                                .clamp(0, wheel::rows() as i32 - 1)
+                                as usize;
+                            let cur = (((*s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
+                                .clamp(0, wheel::rows() as i32 - 1)
+                                as usize;
+                            if row != cur {
+                                println!("wheel: tap -> row {row}");
+                                self.wheel_settle(s_q8, row, now, batt);
+                            }
+                            return;
+                        }
+                    }
+                }
             }
             match self.wheel_coast(s_q8, vel, now, batt, anim_start, tp) {
                 None => break,
-                Some((dir, dist, c)) => {
-                    grab = Some((dir, dist));
+                Some(c) => {
+                    grab = true;
                     carry = c;
                 }
             }
         }
     }
 
-    /// Finger-tracked scroll: true 1:1 (rubber band past the ends). Returns
-    /// the release velocity (sign in scroll space) and how long the finger
-    /// held the wheel — a short hold keeps a prior glide's momentum alive.
-    fn wheel_track(
+    /// Direct-manipulation scroll session: the wheel is anchored to the
+    /// finger from the FIRST raw report — signed, bidirectional, 1:1 in
+    /// list pixels, anchored at TOUCH-DOWN rather than at gesture
+    /// classification. The CST9217 stops reporting during slow movement
+    /// and then bursts; anchoring at touch-down means a burst catches the
+    /// wheel up to the finger's true total travel (nothing is discarded —
+    /// the measured failure of classification-anchored tracking, where a
+    /// slow 300 px drag arrived with dist≈200-360 already consumed).
+    /// Bursts are eased in by the pursuit, never extrapolated. Tap vs drag
+    /// vs flick resolve only at lift.
+    fn wheel_direct(
         &mut self,
-        dir: SwipeDir,
-        start_dist: u16,
         s_q8: &mut i32,
         now: &WallTime,
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
-    ) -> (i32, u32) {
-        let sign: i32 = match dir {
-            SwipeDir::Up => 1,
-            SwipeDir::Down => -1,
-        };
+    ) -> Direct {
+        /// Jitter gate: movement below this never scrolls (tap protection);
+        /// crossing it re-anchors at the gate edge (AOSP slop-subtraction),
+        /// so content engages from zero.
+        const GATE_PX: i32 = 6;
+        /// A pause this long before lift zeroes the release velocity —
+        /// drag-and-hold means "stay here", not "fling".
+        const STALE_MS: u32 = 80;
+
         let t0 = Instant::now();
-        let s_start = *s_q8;
-        // Slop-remainder anchoring (AOSP ScrollView): the distance the
-        // finger traveled BEFORE classification is the baseline — the first
-        // tracked frame moves only the remainder, so content engages from
-        // zero instead of jumping to catch up.
-        let base = start_dist as i32;
-        let mut target = s_start;
+        let mut seq = tp.raw_seq;
+        // Anchor at the finger's current position (touch-down for fresh
+        // presses; the catch point when taking over a glide).
+        let mut anchor_y = match tp.last_raw {
+            Some(t) if t.pressed => t.y as i32,
+            _ => {
+                // Entered without a live pressed report (race): wait for one.
+                loop {
+                    let now_ms = anim_start.elapsed().as_millis() as u32;
+                    let _ = self.poll_touch_once(tp, now_ms);
+                    if !self.swipe.finger_down() {
+                        return Direct::Rest;
+                    }
+                    if let Some(t) = tp.last_raw {
+                        if t.pressed {
+                            break t.y as i32;
+                        }
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        };
+        let anchor_s = *s_q8;
+        let mut last_y = anchor_y;
+        let mut gate_open = false;
+        let mut target = anchor_s;
+        // Last three distinct-position samples (y, ms) for release velocity.
+        let start_ms = anim_start.elapsed().as_millis() as u32;
+        let mut ring = [(anchor_y, start_ms); 3];
+
         loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
-            match self.poll_touch_once(tp, now_ms) {
-                GestureEvent::DragMove { dist, .. } => {
-                    target = s_start + sign * ((dist as i32 - base) << 8);
+            // Feeds the recognizer (liveness, lift fallback); classified
+            // events are superseded by this session and dropped.
+            let _ = self.poll_touch_once(tp, now_ms);
+            if seq != tp.raw_seq {
+                seq = tp.raw_seq;
+                if let Some(t) = tp.last_raw {
+                    let y = t.y as i32;
+                    if y != last_y {
+                        ring[0] = ring[1];
+                        ring[1] = ring[2];
+                        ring[2] = (y, now_ms);
+                        last_y = y;
+                    }
+                    if !gate_open {
+                        let d = anchor_y - y;
+                        if d.abs() > GATE_PX {
+                            gate_open = true;
+                            anchor_y -= GATE_PX * d.signum();
+                        }
+                    }
+                    if gate_open && t.pressed {
+                        // Scroll space: finger up (y shrinking) = forward.
+                        target = anchor_s + ((anchor_y - y) << 8);
+                    }
                 }
-                GestureEvent::DragEnd { vel_q8, .. } => {
-                    return (sign * vel_q8, t0.elapsed().as_millis() as u32);
-                }
-                _ => {}
+            }
+            if !self.swipe.finger_down() {
+                break;
             }
             let t_eff = wheel_rubber(target, wheel_s_max());
             let diff = t_eff - *s_q8;
             if diff != 0 {
-                // 7/8 pursuit: near-1:1 with a whisper of weight.
-                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 7 / 8 };
-                let fast = diff.abs() > FAST_LOD_Q8;
-                self.draw_wheel(now, batt, *s_q8, fast);
+                // 3/4 pursuit: 1:1 feel on live tracking, and a report
+                // burst after a chip stall eases in over ~3 frames instead
+                // of teleporting.
+                *s_q8 += if diff.abs() <= 512 { diff } else { diff * 3 / 4 };
+                self.draw_wheel(now, batt, *s_q8, diff.abs() > FAST_LOD_Q8);
                 self.flush_dirty();
             }
             self.maybe_reinit_touch(tp);
             core::hint::spin_loop();
         }
+
+        let held_ms = t0.elapsed().as_millis() as u32;
+        if !gate_open {
+            return if held_ms < 400 {
+                Direct::Tap { y: last_y }
+            } else {
+                Direct::Rest
+            };
+        }
+        // Release velocity from the last two real movement segments
+        // (recency-weighted, hotter-of like the recognizer); a pause
+        // before lift means the drag ends where it stands.
+        let now_ms = anim_start.elapsed().as_millis() as u32;
+        if now_ms.wrapping_sub(ring[2].1) > STALE_MS {
+            return Direct::Rest;
+        }
+        let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(1) as i32;
+        let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(1) as i32;
+        let v_b = ((ring[1].0 - ring[2].0) << 8) / dt_b;
+        let v_a = ((ring[0].0 - ring[1].0) << 8) / dt_a;
+        let v_w = (2 * v_b + v_a) / 3;
+        let raw = if dt_b > 60 {
+            v_b
+        } else if (v_b >= 0) == (v_w >= 0) && v_b.abs() > v_w.abs() {
+            v_b
+        } else {
+            v_w
+        };
+        Direct::Fling { raw, held_ms }
     }
 
     /// Velocity-projected glide (WWDC-803 / SnapHelper model, per
@@ -985,10 +1116,10 @@ impl<'a, 'd> App<'a, 'd> {
     /// row, and decelerate STRAIGHT to that row as one continuous motion —
     /// no free coast, no boundary bounce (an overshooting fling dampens onto
     /// the first/last row, never reverses), no disjoint snap. Fully
-    /// interruptible: a new drag returns Some((grab, carry)) with the
-    /// momentum that survives into the regrab; a whole-flick that fits in
-    /// one poll gap (salvaged DragEnd) injects ADDITIVELY right here —
-    /// same direction stacks, opposite brakes/reverses.
+    /// interruptible: ANY touch returns Some(carry) — the live momentum —
+    /// and the direct session takes the wheel (iOS catch + AOSP flywheel);
+    /// a whole-flick that fits in one poll gap (salvaged DragEnd) injects
+    /// ADDITIVELY right here — same direction stacks, opposite reverses.
     fn wheel_coast(
         &mut self,
         s_q8: &mut i32,
@@ -997,7 +1128,7 @@ impl<'a, 'd> App<'a, 'd> {
         batt: Option<u8>,
         anim_start: Instant,
         tp: &mut TouchPoll,
-    ) -> Option<(SwipeDir, u16, i32)> {
+    ) -> Option<i32> {
         // iOS-FAST deceleration (the picker rate): f = 199/256 per 25 ms
         // (≈0.99/ms). Projection horizon K = dt/(1−f) = 25·256/57 ≈ 112 ms —
         // a medium flick lands 2–4 rows away, considered, picker-like.
@@ -1034,9 +1165,6 @@ impl<'a, 'd> App<'a, 'd> {
             let fs = Instant::now();
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
-                GestureEvent::DragStart { dir, dist, .. } => {
-                    return Some((dir, dist, v_q8));
-                }
                 // Whole flick inside one poll gap: chain it without ever
                 // leaving this loop. Raw flick + live velocity feed the
                 // power curve TOGETHER, so consecutive flicks compound
@@ -1082,6 +1210,11 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 _ => {}
             }
+            if self.swipe.finger_down() {
+                // Touch = the finger owns the wheel: hand off to the direct
+                // session instantly, passing the live momentum as carry.
+                return Some(v_q8);
+            }
             if let Some(t0) = landed_at {
                 // At rest: pure poll loop. Hand back after the linger.
                 if t0.elapsed() >= Duration::from_millis(WHEEL_LINGER_MS) {
@@ -1089,14 +1222,6 @@ impl<'a, 'd> App<'a, 'd> {
                 }
                 core::hint::spin_loop();
                 continue;
-            }
-            if self.swipe.finger_down() {
-                // Finger resting (pre-classification): friction brake, NOT
-                // a freeze — the wheel stays alive and drawing under the
-                // finger, so a quick chained flick keeps its momentum. A
-                // hold decays it to a stop; a resolved Tap kills it dead.
-                v_q8 = v_q8 * (256 - (256 - BRAKE_NUM) * dt_ms / 25) / 256;
-                target = project(*s_q8, v_q8);
             }
             let diff = target - *s_q8;
             // Glide until ~16 px out, then hand to the damped tail — at that
@@ -1220,10 +1345,6 @@ const FLING_FLOOR_Q8: i32 = 77;
 /// Carried momentum fades linearly to zero over this hold duration — a
 /// quick catch-and-reflick keeps nearly all of it, a deliberate drag none.
 const CHAIN_HOLD_MS: u32 = 400;
-/// Friction while a finger rests on a gliding wheel (per 25 ms, /256):
-/// brakes it alive instead of freezing it — half-life ≈120 ms — so quick
-/// chained flicks keep their momentum through the touch.
-const BRAKE_NUM: i32 = 220;
 /// Motion LOD threshold: per-frame travel (Q8) above which the glow halo
 /// is dropped and scaling goes nearest-neighbor (~50 px/frame — the eye
 /// can't track either at that speed). Restored in the slow landing frames.
