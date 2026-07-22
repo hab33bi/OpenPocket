@@ -421,6 +421,10 @@ impl<'a, 'd> App<'a, 'd> {
                     || wheel_drag.is_some()
                     || wheel_flick.is_some()
                     || wheel_tap.is_some()
+                    // A finger on the wheel ends the frame NOW — the next
+                    // frame-top takeover hands it to the direct session
+                    // within a few ms instead of waiting out the deadline.
+                    || (scene == Scene::Wheel && self.swipe.finger_down())
                     || Instant::now() >= deadline
                 {
                     break;
@@ -470,7 +474,7 @@ impl<'a, 'd> App<'a, 'd> {
                     .clamp(0, wheel::rows() as i32 - 1) as usize;
                 if row != cur {
                     println!("wheel: tap -> row {row}");
-                    self.wheel_settle(&mut wheel_s_q8, row, &now, wheel_batt);
+                    self.wheel_settle(&mut wheel_s_q8, row, &now, wheel_batt, anim_start, &mut tp);
                 }
                 unlocked_at = Instant::now();
                 continue;
@@ -964,7 +968,7 @@ impl<'a, 'd> App<'a, 'd> {
                             }
                             // Always settle: a micro-scrolled tap leaves a
                             // sub-row offset that must ease back.
-                            self.wheel_settle(s_q8, row, now, batt);
+                            self.wheel_settle(s_q8, row, now, batt, anim_start, tp);
                             return;
                         }
                     }
@@ -1253,7 +1257,7 @@ impl<'a, 'd> App<'a, 'd> {
                             as usize;
                         if row != cur {
                             println!("wheel: tap -> row {row}");
-                            self.wheel_settle(s_q8, row, now, batt);
+                            self.wheel_settle(s_q8, row, now, batt, anim_start, tp);
                         }
                         return None;
                     }
@@ -1312,10 +1316,26 @@ impl<'a, 'd> App<'a, 'd> {
 
     /// Ease the wheel to rest exactly on `row` — soft damped landing
     /// (5/16 per 25 ms frame, τ≈90 ms), matching the glide's tail.
-    fn wheel_settle(&mut self, s_q8: &mut i32, row: usize, now: &WallTime, batt: Option<u8>) {
+    /// Interruptible: a finger on the glass aborts the ease mid-flight —
+    /// the takeover owns the wheel from its next report, and whatever
+    /// interaction follows re-settles on release.
+    fn wheel_settle(
+        &mut self,
+        s_q8: &mut i32,
+        row: usize,
+        now: &WallTime,
+        batt: Option<u8>,
+        anim_start: Instant,
+        tp: &mut TouchPoll,
+    ) {
         let target = (row as i32 * wheel::PITCH_PX) << 8;
         while *s_q8 != target {
             let fs = Instant::now();
+            let now_ms = anim_start.elapsed().as_millis() as u32;
+            let _ = self.poll_touch_once(tp, now_ms);
+            if self.swipe.finger_down() {
+                return;
+            }
             let diff = target - *s_q8;
             *s_q8 += if diff.abs() <= 256 { diff } else { diff * 5 / 16 };
             self.draw_wheel(now, batt, *s_q8, false);
