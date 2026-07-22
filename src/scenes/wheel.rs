@@ -764,10 +764,16 @@ pub fn draw_text_scaled(
     let mut x_q8 = left_x << 8;
     for ch in text.chars() {
         if let Some(g) = lock::get_glyph(glyphs, ch) {
-            let dst_w = ((g.width as i32 * scale_q8) >> 8).max(1);
-            let dst_h = ((g.height as i32 * scale_q8) >> 8).max(1);
-            let glyph_y = base_y - (((g.height as i32 + g.ymin as i32) * scale_q8) >> 8);
-            draw_glyph_scaled(fb, x_q8 >> 8, glyph_y, g, alpha, dst_w, dst_h, fast);
+            // Zero-size glyphs (space) carry only an advance — the .max(1)
+            // destination clamp on an empty bitmap indexed out of bounds
+            // (sample x.min(-1) wrapped through usize; hardware panic via
+            // the Gallery caption's spaces).
+            if g.width > 0 && g.height > 0 {
+                let dst_w = ((g.width as i32 * scale_q8) >> 8).max(1);
+                let dst_h = ((g.height as i32 * scale_q8) >> 8).max(1);
+                let glyph_y = base_y - (((g.height as i32 + g.ymin as i32) * scale_q8) >> 8);
+                draw_glyph_scaled(fb, x_q8 >> 8, glyph_y, g, alpha, dst_w, dst_h, fast);
+            }
             x_q8 += (g.advance as i32) * scale_q8;
         }
     }
