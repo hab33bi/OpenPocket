@@ -190,6 +190,7 @@ fn main() -> ! {
         wall,
         clock,
         swipe: SwipeTracker::new(LCD_HEIGHT),
+        wheel_fx: openpocket::scenes::wheel::WheelFx::new(),
     }
     .run()
 }

@@ -116,6 +116,7 @@ pub struct App<'a, 'd> {
     pub wall: WallClock,
     pub clock: lock::Clock,
     pub swipe: SwipeTracker,
+    pub wheel_fx: wheel::WheelFx,
 }
 
 impl<'a, 'd> App<'a, 'd> {
@@ -164,14 +165,38 @@ impl<'a, 'd> App<'a, 'd> {
                 continue;
             }
 
+            // Late-latch (research Rx1): one poll BEFORE decoration — a
+            // gesture preempts the ring tick / intro frame render+flush and
+            // is consumed by this frame's event handling with zero delay.
+            self.swipe.set_free_scroll(scene == Scene::Wheel);
+            let mut pre_ev = GestureEvent::None;
+            if scene == Scene::Wheel && power == Power::Awake {
+                let now_ms = anim_start.elapsed().as_millis() as u32;
+                pre_ev = self.poll_touch_once(&mut tp, now_ms);
+            }
+            let preempted = !matches!(pre_ev, GestureEvent::None);
+
             let render_start = Instant::now();
             if scene == Scene::Locked && power != Power::Aod && power != Power::Sleep {
                 self.clock.render(&mut self.wfb, elapsed, &now);
-            } else if scene == Scene::Wheel && power == Power::Awake {
-                // Focus ring's animated gradient (partial redraw of its rect).
-                let focused = (((wheel_s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
-                    .clamp(0, wheel::rows() as i32 - 1) as usize;
-                wheel::tick_ring(&mut self.wfb, elapsed, focused);
+            } else if scene == Scene::Wheel && power == Power::Awake && !preempted {
+                if self.wheel_fx.intro_active() {
+                    // Entrance reveal frames (interruptible — any gesture
+                    // above preempts; rows keep rising during interaction).
+                    wheel::draw_scroll(
+                        &mut self.wfb,
+                        &now,
+                        wheel_batt,
+                        wheel_s_q8,
+                        &mut self.wheel_fx,
+                        false,
+                    );
+                } else {
+                    // Focus ring's animated gradient (partial redraw).
+                    let focused = (((wheel_s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
+                        .clamp(0, wheel::rows() as i32 - 1) as usize;
+                    wheel::tick_ring(&mut self.wfb, elapsed, focused);
+                }
             }
             let render_ms = render_start.elapsed().as_millis() as u32;
 
@@ -248,16 +273,12 @@ impl<'a, 'd> App<'a, 'd> {
                             println!("pwr: short press -> flourish");
                         }
                         Scene::Unlocked => {
-                            // Staggered bottom-up reveal, 25 ms frames.
-                            let batt = axp2101::battery_percent(&mut self.i2c);
-                            for f in 0..wheel::INTRO_FRAMES {
-                                let fs = Instant::now();
-                                wheel::draw(&mut self.wfb, &now, batt, 0, f);
-                                self.flush_dirty();
-                                wheel::pace(fs);
-                            }
+                            // Interruptible staggered reveal: the run loop
+                            // renders it frame-by-frame and ANY gesture works
+                            // immediately, scrolling under the rising rows.
+                            wheel_batt = axp2101::battery_percent(&mut self.i2c);
                             wheel_s_q8 = 0;
-                            wheel_batt = batt;
+                            self.wheel_fx.begin_intro();
                             scene = Scene::Wheel;
                             unlocked_at = Instant::now();
                             println!("pwr: short press -> wheel");
@@ -287,16 +308,22 @@ impl<'a, 'd> App<'a, 'd> {
             let mut wheel_drag: Option<(SwipeDir, u16)> = None;
             let mut wheel_flick: Option<i32> = None;
             let mut wheel_tap: Option<u16> = None;
-            self.swipe.set_free_scroll(scene == Scene::Wheel);
             let frame_us = match power {
                 Power::Aod | Power::Sleep => IDLE_FRAME_US,
                 _ if scene == Scene::Locked && self.clock.is_animating() => CLOCK_ANIM_FRAME_US,
+                // Entrance reveal animates at full cadence.
+                _ if scene == Scene::Wheel && self.wheel_fx.intro_active() => ANIM_FRAME_US,
                 _ => FRAME_US,
             };
             let deadline = frame_start + Duration::from_micros(frame_us);
             loop {
                 let now_ms = anim_start.elapsed().as_millis() as u32;
-                let ev = self.poll_touch_once(&mut tp, now_ms);
+                // The pre-render poll's event (if any) is consumed first.
+                let ev = if !matches!(pre_ev, GestureEvent::None) {
+                    core::mem::replace(&mut pre_ev, GestureEvent::None)
+                } else {
+                    self.poll_touch_once(&mut tp, now_ms)
+                };
                 match ev {
                     GestureEvent::DragStart { dir, x, y, dist } => {
                         let mut kind = "ignored";
@@ -378,6 +405,11 @@ impl<'a, 'd> App<'a, 'd> {
                 scene =
                     self.drag_session(dir, dist, start_y, &mut sheet_b, &now, anim_start, &mut tp);
                 if scene == Scene::Unlocked {
+                    unlocked_at = Instant::now();
+                }
+                if scene == Scene::Wheel {
+                    // The sheet painted over the wheel canvas — reseed.
+                    self.wheel_fx.invalidate();
                     unlocked_at = Instant::now();
                 }
                 continue;
@@ -780,7 +812,10 @@ impl<'a, 'd> App<'a, 'd> {
         let spans = self.wfb.dmi.spans();
         let span_count = spans.len();
         let dirty_bytes: usize = spans.iter().map(|s| (s.x1 - s.x0 + 1) as usize * 2).sum();
-        let partial = !self.wfb.dmi.overflowed() && dirty_bytes < byte_count / 3;
+        // 3/4 threshold: span flushes coalesce vertically into few window
+        // bursts (the wheel's union bbox is ONE), so partial wins right up
+        // until damage approaches the whole frame.
+        let partial = !self.wfb.dmi.overflowed() && dirty_bytes < byte_count * 3 / 4;
         let flush_start = Instant::now();
         if partial {
             self.bus
@@ -913,12 +948,17 @@ impl<'a, 'd> App<'a, 'd> {
         };
         let t0 = Instant::now();
         let s_start = *s_q8;
-        let mut target = s_start + sign * ((start_dist as i32) << 8);
+        // Slop-remainder anchoring (AOSP ScrollView): the distance the
+        // finger traveled BEFORE classification is the baseline — the first
+        // tracked frame moves only the remainder, so content engages from
+        // zero instead of jumping to catch up.
+        let base = start_dist as i32;
+        let mut target = s_start;
         loop {
             let now_ms = anim_start.elapsed().as_millis() as u32;
             match self.poll_touch_once(tp, now_ms) {
                 GestureEvent::DragMove { dist, .. } => {
-                    target = s_start + sign * ((dist as i32) << 8);
+                    target = s_start + sign * ((dist as i32 - base) << 8);
                 }
                 GestureEvent::DragEnd { vel_q8, .. } => {
                     return (sign * vel_q8, t0.elapsed().as_millis() as u32);
@@ -930,7 +970,8 @@ impl<'a, 'd> App<'a, 'd> {
             if diff != 0 {
                 // 7/8 pursuit: near-1:1 with a whisper of weight.
                 *s_q8 += if diff.abs() <= 512 { diff } else { diff * 7 / 8 };
-                wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+                let fast = diff.abs() > FAST_LOD_Q8;
+                self.draw_wheel(now, batt, *s_q8, fast);
                 self.flush_dirty();
             }
             self.maybe_reinit_touch(tp);
@@ -984,6 +1025,10 @@ impl<'a, 'd> App<'a, 'd> {
         // becomes a smooth damped approach to the edge row.
         let mut v_q8 = (target - *s_q8) / K_MS;
         let mut dt_ms: i32 = 25;
+        // Landed linger: after the wheel rests, keep polling here for a
+        // beat before handing back to the run loop — the next gesture
+        // starts with ZERO scene-machine overhead between actions.
+        let mut landed_at: Option<Instant> = None;
 
         loop {
             let fs = Instant::now();
@@ -992,11 +1037,11 @@ impl<'a, 'd> App<'a, 'd> {
                 GestureEvent::DragStart { dir, dist, .. } => {
                     return Some((dir, dist, v_q8));
                 }
-                // Whole flick inside one poll gap while gliding: chain it
-                // without ever leaving the glide. Raw flick + live velocity
-                // feed the power curve TOGETHER, so consecutive flicks
-                // compound superlinearly. Opposite direction starts fresh
-                // (brake/reverse); a sub-floor release stops the wheel.
+                // Whole flick inside one poll gap: chain it without ever
+                // leaving this loop. Raw flick + live velocity feed the
+                // power curve TOGETHER, so consecutive flicks compound
+                // superlinearly. Opposite direction starts fresh (brake/
+                // reverse); a sub-floor release stops the wheel.
                 GestureEvent::DragEnd { dir, vel_q8: rel, .. } => {
                     let sign: i32 = match dir {
                         SwipeDir::Up => 1,
@@ -1008,17 +1053,42 @@ impl<'a, 'd> App<'a, 'd> {
                     } else {
                         wheel_power(raw)
                     };
+                    landed_at = None;
                     target = project(*s_q8, v_q8);
                     println!("wheel: chain v={v_q8} -> row {}", target / pitch_q8);
                     v_q8 = (target - *s_q8) / K_MS;
                 }
-                // A resolved tap on a moving wheel stops it dead.
-                GestureEvent::Tap { .. } => {
+                GestureEvent::Tap { y, .. } => {
+                    if landed_at.is_some() {
+                        // Tap while resting (linger window) = row select,
+                        // same hit-test as the run loop's handler.
+                        let row = (y as i32 - H / 2 + (*s_q8 >> 8) + wheel::PITCH_PX / 2)
+                            .div_euclid(wheel::PITCH_PX)
+                            .clamp(0, wheel::rows() as i32 - 1)
+                            as usize;
+                        let cur = (((*s_q8 >> 8) + wheel::PITCH_PX / 2) / wheel::PITCH_PX)
+                            .clamp(0, wheel::rows() as i32 - 1)
+                            as usize;
+                        if row != cur {
+                            println!("wheel: tap -> row {row}");
+                            self.wheel_settle(s_q8, row, now, batt);
+                        }
+                        return None;
+                    }
+                    // A resolved tap on a MOVING wheel stops it dead.
                     v_q8 = 0;
                     target = nearest(*s_q8);
                     println!("wheel: tap-stop");
                 }
                 _ => {}
+            }
+            if let Some(t0) = landed_at {
+                // At rest: pure poll loop. Hand back after the linger.
+                if t0.elapsed() >= Duration::from_millis(WHEEL_LINGER_MS) {
+                    return None;
+                }
+                core::hint::spin_loop();
+                continue;
             }
             if self.swipe.finger_down() {
                 // Finger resting (pre-classification): friction brake, NOT
@@ -1036,15 +1106,18 @@ impl<'a, 'd> App<'a, 'd> {
                 v_q8 = v_q8 * (256 - (256 - DECAY_NUM) * dt_ms / 25) / 256;
             } else if diff.abs() <= 256 {
                 *s_q8 = target;
-                wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+                v_q8 = 0;
+                self.draw_wheel(now, batt, *s_q8, false);
                 self.flush_dirty();
-                return None;
+                landed_at = Some(Instant::now());
+                continue;
             } else {
                 // Soft damped landing (τ≈90 ms) — blends out of the glide
                 // with no velocity seam; also the caught/slow path.
                 *s_q8 += diff * 5 / 16;
             }
-            wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+            let fast = v_q8.abs() > FAST_LOD_Q8 / 25;
+            self.draw_wheel(now, batt, *s_q8, fast);
             self.flush_dirty();
             // Fixed 25 ms cadence: consistent frame intervals read premium.
             wheel::pace(fs);
@@ -1060,10 +1133,16 @@ impl<'a, 'd> App<'a, 'd> {
             let fs = Instant::now();
             let diff = target - *s_q8;
             *s_q8 += if diff.abs() <= 256 { diff } else { diff * 5 / 16 };
-            wheel::draw_scroll(&mut self.wfb, now, batt, *s_q8);
+            self.draw_wheel(now, batt, *s_q8, false);
             self.flush_dirty();
             wheel::pace(fs);
         }
+    }
+
+    /// One wheel frame through the damage-minimized renderer (targeted
+    /// clear + union-bbox partial flush; motion LOD when `fast`).
+    fn draw_wheel(&mut self, now: &WallTime, batt: Option<u8>, s_q8: i32, fast: bool) {
+        wheel::draw_scroll(&mut self.wfb, now, batt, s_q8, &mut self.wheel_fx, fast);
     }
 
     /// A gesture takes over mid-flourish: write the flourish's zero-glow
@@ -1126,10 +1205,14 @@ fn wheel_s_max() -> i32 {
 }
 
 /// Flick power reference (Q8 px/ms): at |v|=V_REF the curve doubles the
-/// velocity; well below it the response is near-linear.
-const V_REF_Q8: i32 = 700;
-/// Momentum ceiling — additive chaining can't run away past this.
-const V_MAX_Q8: i32 = 4000;
+/// velocity; well below it the response is near-linear. Raised so railing
+/// takes a genuinely violent flick (picker doctrine — NumberPicker caps
+/// wheel flings at 1/8 of a list's, docs/research/TOUCH-PIPELINE-RESEARCH).
+const V_REF_Q8: i32 = 1200;
+/// Momentum ceiling = exactly full-list travel under the K=112 ms
+/// projection (9 rows · 68 px): the hardest flick or chain rails end to
+/// end and nothing ever moves faster than that — every fling accountable.
+const V_MAX_Q8: i32 = 1400;
 /// Fling floor (Q8 px/ms): slower releases settle to the nearest row and
 /// never chain — catching a railing wheel and lifting gently must not
 /// re-launch it.
@@ -1141,6 +1224,13 @@ const CHAIN_HOLD_MS: u32 = 400;
 /// brakes it alive instead of freezing it — half-life ≈120 ms — so quick
 /// chained flicks keep their momentum through the touch.
 const BRAKE_NUM: i32 = 220;
+/// Motion LOD threshold: per-frame travel (Q8) above which the glow halo
+/// is dropped and scaling goes nearest-neighbor (~50 px/frame — the eye
+/// can't track either at that speed). Restored in the slow landing frames.
+const FAST_LOD_Q8: i32 = 50 << 8;
+/// After a glide lands, keep polling in-loop this long before returning
+/// to the run loop — consecutive actions start with zero scene overhead.
+const WHEEL_LINGER_MS: u64 = 150;
 
 /// Continuous flick power curve: v_eff = v·(1 + |v|/V_REF). Reach grows
 /// superlinearly with flick speed — gentle ≈1–2 rows, a normal flick ≈3–5,
@@ -1153,8 +1243,9 @@ fn wheel_power(v: i32) -> i32 {
 /// form): give = x·c·d / (d + c·x) with c=0.55 (141/256), d=96 px — stretchy
 /// at first pull, stiffening the harder you drag.
 fn wheel_rubber(t: i32, max: i32) -> i32 {
-    // d = 64 px: firm, "normal-feeling" stretch (user-tuned down from 96).
-    const D_Q8: i64 = 64 << 8;
+    // d = 128 px (~1.9 rows max stretch): easier overscroll (user), entry
+    // slope stays Apple's c=0.55 — d bounds travel, c sets softness.
+    const D_Q8: i64 = 128 << 8;
     let give = |x: i32| -> i32 {
         let x = x as i64;
         ((x * 141 * D_Q8) / (256 * D_Q8 + 141 * x)) as i32

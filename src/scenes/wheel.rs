@@ -43,62 +43,58 @@ const INTRO_RISE_F: i32 = 10;
 const INTRO_RISE_PX: i32 = 28;
 pub const INTRO_FRAMES: u32 = (INTRO_STAG_F as u32 * 9) + INTRO_RISE_F as u32 + 1;
 
-/// One frame of the staggered reveal (`frame` ≥ INTRO_FRAMES = final state).
-/// Full-canvas redraw.
-pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usize, frame: u32) {
-    let fb = wfb.buf_mut();
-    fb.fill(0);
-    let saber = saber_lut(0);
+/// Max content rects tracked per frame for targeted clearing.
+const FX_RECTS: usize = 40;
 
-    for (i, app) in WHEEL_APPS.iter().enumerate() {
-        let y_c = CY + (i as i32 - focused as i32) * PITCH;
-        if y_c < -PITCH || y_c > H + PITCH {
-            continue;
+/// Persistent scroll-renderer state: last frame's content rects (targeted
+/// clear instead of a 424 KiB full-canvas fill), the entrance-reveal clock
+/// (rows rise/fade in WHILE the wheel already scrolls — the intro never
+/// blocks input), and the status line's identity (redrawn only on change).
+pub struct WheelFx {
+    rects: [(i16, i16, i16, i16); FX_RECTS],
+    n: usize,
+    seeded: bool,
+    intro: Option<u32>,
+    status_key: (u8, u8, u8),
+}
+
+impl WheelFx {
+    pub const fn new() -> Self {
+        Self {
+            rects: [(0, 0, 0, 0); FX_RECTS],
+            n: 0,
+            seeded: false,
+            intro: None,
+            status_key: (255, 255, 255),
         }
-        // Reveal progress: linear stagger clock → cubic ease-out.
-        let p_lin =
-            (((frame as i32 - INTRO_STAG_F * i as i32) * 256) / INTRO_RISE_F).clamp(0, 256);
-        if p_lin == 0 {
-            continue;
-        }
-        let inv = 256 - p_lin;
-        let p = 256 - (((inv * inv) >> 8) * inv >> 8);
-        // Rise from below into place (the fade rides the same ease).
-        let y_d = y_c + ((256 - p) * INTRO_RISE_PX >> 8);
-
-        let (alpha, t) = row_alpha(y_c);
-        if alpha == 0 {
-            continue;
-        }
-        let alpha = (alpha * p) >> 8;
-
-        let (sprite, px) = if t > 128 {
-            (app.icon_l, ICON_L_PX)
-        } else {
-            (app.icon_s, ICON_S_PX)
-        };
-        let icon_cx = icon_center_x(y_d, px);
-
-        if t > 128 {
-            blit_glow(fb, &saber, icon_cx, y_d, ((t - 128) * 2 * p) >> 8);
-        }
-        blit_icon(fb, sprite, px, icon_cx, y_d, alpha);
-
-        let glyphs: &[Option<Glyph>; 128] = if t > 128 {
-            &lock::LABELF_GLYPHS
-        } else {
-            &lock::TEXT_GLYPHS
-        };
-        // Label centered on the screen, vertically in line with the icon,
-        // never overlapping it.
-        let tw = text_width(app.name, glyphs);
-        let min_left = icon_cx + px / 2 + 10;
-        let x = (CX - tw / 2).max(min_left);
-        draw_text_at(fb, app.name, x, y_d + 11, alpha, glyphs);
     }
+    /// Restart the entrance reveal; the next frame reseeds the full canvas.
+    pub fn begin_intro(&mut self) {
+        self.seeded = false;
+        self.intro = Some(0);
+    }
+    /// The canvas was painted over by another composer (sheet drag, wake
+    /// repaint) — the next wheel frame must reseed from a full clear.
+    pub fn invalidate(&mut self) {
+        self.seeded = false;
+    }
+    pub fn intro_active(&self) -> bool {
+        self.intro.is_some()
+    }
+    fn push(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        if self.n < FX_RECTS {
+            self.rects[self.n] = (x0 as i16, y0 as i16, x1 as i16, y1 as i16);
+            self.n += 1;
+        }
+    }
+}
 
-    draw_status(fb, now, battery);
-    wfb.mark_rect(0, 0, W - 1, H - 1);
+/// Grow an (x0,y0,x1,y1) union bbox.
+fn grow(d: &mut (i32, i32, i32, i32), x0: i32, y0: i32, x1: i32, y1: i32) {
+    d.0 = d.0.min(x0);
+    d.1 = d.1.min(y0);
+    d.2 = d.2.max(x1);
+    d.3 = d.3.max(y1);
 }
 
 /// Status line, top-center: HH:MM, plus battery when present.
@@ -139,35 +135,71 @@ fn draw_status(fb: &mut [u8], now: &WallTime, battery: Option<u8>) {
 
 /// Scroll-tracked frame: rows positioned by the continuous offset `s_q8`
 /// (Q8 px; row i rests centered when s = i·PITCH·256). Focus scale/alpha/
-/// glow all interpolate with the offset. Full-canvas redraw per frame.
-pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8: i32) {
-    let fb = wfb.buf_mut();
-    fb.fill(0);
-    let saber = saber_lut(0);
-    let s_px = s_q8 >> 8;
-
-    // Pass 1 — glow halos only. Glow is the BOTTOM layer everywhere: during
-    // a fast scroll the 96 px halo overlaps neighbor rows' icons (and two
-    // adjacent rows can both glow mid-transition), so every halo must be on
-    // canvas before any icon — the stacking is then correct by construction.
-    for i in 0..WHEEL_APPS.len() {
-        let y_c = CY + i as i32 * PITCH - s_px;
-        if y_c < -PITCH || y_c > H + PITCH {
-            continue;
-        }
-        let (alpha, t) = row_alpha(y_c);
-        if alpha == 0 || t <= 128 {
-            continue;
-        }
-        let wl = ((t - 160) * 4).clamp(0, 256);
-        let cx_s = icon_center_x(y_c, ICON_S_PX);
-        let cx_l = icon_center_x(y_c, ICON_L_PX);
-        let cx = cx_s + (((cx_l - cx_s) * wl) >> 8);
-        blit_glow(fb, &saber, cx, y_c, (t - 128) * 2);
+/// glow interpolate with the offset. Damage-minimized: clears only last
+/// frame's content rects (not the 424 KiB canvas), draws, and marks one
+/// union bbox — flush_spans folds it into a single window burst. Glow is
+/// drawn in a separate first pass (bottom layer by construction), icons and
+/// labels composite over it. `fast` = motion LOD: the glow halo is dropped
+/// and size scaling switches to nearest-neighbor — both restored
+/// automatically in the slow landing frames. While `fx.intro` runs, rows
+/// still rise/fade in as the wheel scrolls underneath them.
+pub fn draw_scroll(
+    wfb: &mut WatchFb,
+    now: &WallTime,
+    battery: Option<u8>,
+    s_q8: i32,
+    fx: &mut WheelFx,
+    fast: bool,
+) {
+    // Entrance-reveal clock: advances once per rendered frame.
+    let intro_f = fx.intro;
+    if let Some(f) = intro_f {
+        fx.intro = if f + 1 >= INTRO_FRAMES { None } else { Some(f + 1) };
     }
+    let s_px = s_q8 >> 8;
+    let mut d = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
 
-    // Pass 2 — icons + labels, composited OVER whatever glow lies beneath.
-    for (i, app) in WHEEL_APPS.iter().enumerate() {
+    let seed = !fx.seeded;
+    if seed {
+        // Seed frame (scene entry / unknown canvas): full clear + full mark.
+        fx.seeded = true;
+        fx.status_key = (255, 255, 255);
+        wfb.buf_mut().fill(0);
+    } else {
+        // Targeted clear: only where content actually was last frame.
+        let fb = wfb.buf_mut();
+        for k in 0..fx.n {
+            let (x0, y0, x1, y1) = fx.rects[k];
+            let (x0, y0) = ((x0 as i32).max(0), (y0 as i32).max(0));
+            let (x1, y1) = ((x1 as i32).min(W - 1), (y1 as i32).min(H - 1));
+            if x1 < x0 || y1 < y0 {
+                continue;
+            }
+            for y in y0..=y1 {
+                let a = ((y * W + x0) * 2) as usize;
+                let b = ((y * W + x1) * 2 + 2) as usize;
+                fb[a..b].fill(0);
+            }
+            grow(&mut d, x0, y0, x1, y1);
+        }
+    }
+    fx.n = 0;
+
+    let fb = wfb.buf_mut();
+    let saber = if fast { None } else { Some(saber_lut(0)) };
+
+    // Per-row layout, incl. the entrance rise/fade riding the live scroll:
+    // focus (alpha/t) follows the list position y_c; geometry draws at the
+    // risen y_d. A row whose reveal hasn't started is skipped entirely.
+    const MAX_ROWS: usize = 16;
+    let mut on = [false; MAX_ROWS];
+    let mut ly = [0i32; MAX_ROWS];
+    let mut la = [0i32; MAX_ROWS];
+    let mut lt = [0i32; MAX_ROWS];
+    let mut lw = [0i32; MAX_ROWS];
+    let mut lc = [0i32; MAX_ROWS];
+    let mut lp = [0i32; MAX_ROWS];
+    for i in 0..rows().min(MAX_ROWS) {
         let y_c = CY + i as i32 * PITCH - s_px;
         if y_c < -PITCH || y_c > H + PITCH {
             continue;
@@ -176,49 +208,126 @@ pub fn draw_scroll(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, s_q8:
         if alpha == 0 {
             continue;
         }
+        let (mut y_d, mut a, mut p) = (y_c, alpha, 256);
+        if let Some(f) = intro_f {
+            let p_lin =
+                (((f as i32 - INTRO_STAG_F * i as i32) * 256) / INTRO_RISE_F).clamp(0, 256);
+            if p_lin == 0 {
+                continue;
+            }
+            let inv = 256 - p_lin;
+            let pe = 256 - (((inv * inv) >> 8) * inv >> 8);
+            y_d = y_c + ((256 - pe) * INTRO_RISE_PX >> 8);
+            a = (alpha * pe) >> 8;
+            p = pe;
+        }
         // Continuous size interpolation through a NARROW focus band
-        // (t 160..224) that resting rows never occupy — the focused row
-        // (t=256) is purely large, resting neighbors (t=128) purely small;
-        // the transition only exists mid-scroll.
+        // (t 160..224) that resting rows never occupy.
         let wl = ((t - 160) * 4).clamp(0, 256);
-        let cx_s = icon_center_x(y_c, ICON_S_PX);
-        let cx_l = icon_center_x(y_c, ICON_L_PX);
-        let cx = cx_s + (((cx_l - cx_s) * wl) >> 8);
+        let cx_s = icon_center_x(y_d, ICON_S_PX);
+        let cx_l = icon_center_x(y_d, ICON_L_PX);
+        on[i] = true;
+        ly[i] = y_d;
+        la[i] = a;
+        lt[i] = t;
+        lw[i] = wl;
+        lc[i] = cx_s + (((cx_l - cx_s) * wl) >> 8);
+        lp[i] = p;
+    }
+
+    // Pass 1 — glow halos (bottom layer everywhere; skipped in fast LOD).
+    if let Some(sl) = &saber {
+        for i in 0..rows().min(MAX_ROWS) {
+            if !on[i] || lt[i] <= 128 {
+                continue;
+            }
+            blit_glow(fb, sl, lc[i], ly[i], ((lt[i] - 128) * 2 * lp[i]) >> 8);
+            let s = GLOW_RING_PX / 2;
+            fx.push(lc[i] - s, ly[i] - s, lc[i] + s, ly[i] + s);
+        }
+    }
+
+    // Pass 2 — icons + labels, composited OVER whatever glow lies beneath.
+    for (i, app) in WHEEL_APPS.iter().enumerate() {
+        if i >= MAX_ROWS || !on[i] {
+            continue;
+        }
+        let (y_d, alpha, wl, cx) = (ly[i], la[i], lw[i], lc[i]);
         // TRUE size interpolation: mid-transition, render the large sprite
-        // bilinearly scaled to the exact intermediate size. At rest (wl 0 or
-        // 256) the pixel-perfect pre-rendered sizes are used, so the crisp
-        // AA holds wherever the eye lingers.
+        // scaled to the exact intermediate size (bilinear at rest speeds,
+        // nearest-neighbor in fast LOD). At wl 0/256 the pixel-perfect
+        // pre-rendered sizes are used, so crisp AA holds where the eye
+        // lingers.
         let px_eff = ICON_S_PX + (((ICON_L_PX - ICON_S_PX) * wl) >> 8);
         if wl == 0 {
-            blit_icon(fb, app.icon_s, ICON_S_PX, cx, y_c, alpha);
+            blit_icon(fb, app.icon_s, ICON_S_PX, cx, y_d, alpha);
         } else if wl == 256 {
-            blit_icon(fb, app.icon_l, ICON_L_PX, cx, y_c, alpha);
+            blit_icon(fb, app.icon_l, ICON_L_PX, cx, y_d, alpha);
         } else {
-            blit_icon_scaled(fb, app.icon_l, ICON_L_PX, px_eff, cx, y_c, alpha);
+            blit_icon_scaled(fb, app.icon_l, ICON_L_PX, px_eff, cx, y_d, alpha, fast);
+        }
+        if fast || lt[i] <= 128 {
+            // No glow rect covers this icon — track it for the next clear.
+            let s = px_eff / 2 + 1;
+            fx.push(cx - s, y_d - s, cx + s, y_d + s);
         }
         let min_left = cx + px_eff / 2 + 10;
-        if wl == 0 {
+        let (x, twd) = if wl == 0 {
             let gs = &lock::TEXT_GLYPHS;
             let tw = text_width(app.name, gs);
             let x = (CX - tw / 2).max(min_left);
-            draw_text_at(fb, app.name, x, y_c + 11, alpha, gs);
+            draw_text_at(fb, app.name, x, y_d + 11, alpha, gs);
+            (x, tw)
         } else if wl == 256 {
             let gl = &lock::LABELF_GLYPHS;
             let tw = text_width(app.name, gl);
             let x = (CX - tw / 2).max(min_left);
-            draw_text_at(fb, app.name, x, y_c + 11, alpha, gl);
+            draw_text_at(fb, app.name, x, y_d + 11, alpha, gl);
+            (x, tw)
         } else {
             // Scale from small-size ratio (~196/256) up to full (256/256).
             let gl = &lock::LABELF_GLYPHS;
             let scale_q8 = 196 + ((60 * wl) >> 8);
             let tw = (text_width(app.name, gl) * scale_q8) >> 8;
             let x = (CX - tw / 2).max(min_left);
-            draw_text_scaled(fb, app.name, x, y_c + 11, alpha, gl, scale_q8);
-        }
+            draw_text_scaled(fb, app.name, x, y_d + 11, alpha, gl, scale_q8, fast);
+            (x, tw)
+        };
+        fx.push(x - 1, y_d - 36, x + twd + 1, y_d + 36);
     }
 
-    draw_status(fb, now, battery);
-    wfb.mark_rect(0, 0, W - 1, H - 1);
+    // Status line: fixed position, redrawn only when its content changes.
+    let key = (now.hour, now.minute, battery.unwrap_or(255));
+    let mut status_rect = None;
+    if seed || fx.status_key != key {
+        fx.status_key = key;
+        let (sx0, sy0, sx1, sy1) = (CX - 110, 26, CX + 110, 66);
+        if !seed {
+            for y in sy0..=sy1 {
+                let a = ((y * W + sx0) * 2) as usize;
+                let b = ((y * W + sx1) * 2 + 2) as usize;
+                fb[a..b].fill(0);
+            }
+        }
+        draw_status(fb, now, battery);
+        status_rect = Some((sx0, sy0, sx1, sy1));
+    }
+
+    // Damage: one union bbox (old content + new content + status). A single
+    // rect keeps the DMI at one equal span per row, which flush_spans folds
+    // into ONE window burst — the fast partial path.
+    for k in 0..fx.n {
+        let (x0, y0, x1, y1) = fx.rects[k];
+        grow(&mut d, x0 as i32, y0 as i32, x1 as i32, y1 as i32);
+    }
+    if let Some((x0, y0, x1, y1)) = status_rect {
+        grow(&mut d, x0, y0, x1, y1);
+    }
+    if seed {
+        wfb.mark_rect(0, 0, W - 1, H - 1);
+    } else if d.0 <= d.2 && d.1 <= d.3 {
+        wfb.mark_rect(d.0, d.1, d.2, d.3);
+    }
 }
 
 /// Per-frame focus-ring tick while the wheel is resting: redraw the glow
@@ -363,8 +472,9 @@ fn blit_icon(fb: &mut [u8], sprite: &[u8], px: i32, cx: i32, cy: i32, alpha: i32
     }
 }
 
-/// Bilinear-scaled icon blit (downscale from the large sprite to any
-/// intermediate size) — used only mid-transition.
+/// Scaled icon blit (downscale from the large sprite to any intermediate
+/// size) — used only mid-transition. `fast` swaps bilinear for
+/// nearest-neighbor sampling (~5x fewer ops/px; invisible at flick speed).
 fn blit_icon_scaled(
     fb: &mut [u8],
     sprite: &[u8],
@@ -373,6 +483,7 @@ fn blit_icon_scaled(
     cx: i32,
     cy: i32,
     alpha: i32,
+    fast: bool,
 ) {
     let step_q8 = (src_px << 8) / dst_px;
     let s = |x: i32, y: i32| -> i32 {
@@ -392,11 +503,15 @@ fn blit_icon_scaled(
             }
             let sx_q8 = dx * step_q8;
             let (sx, fx) = (sx_q8 >> 8, sx_q8 & 255);
-            let a = (s(sx, sy) * (256 - fx) * (256 - fy)
-                + s(sx + 1, sy) * fx * (256 - fy)
-                + s(sx, sy + 1) * (256 - fx) * fy
-                + s(sx + 1, sy + 1) * fx * fy)
-                >> 16;
+            let a = if fast {
+                s((sx_q8 + 128) >> 8, (sy_q8 + 128) >> 8)
+            } else {
+                (s(sx, sy) * (256 - fx) * (256 - fy)
+                    + s(sx + 1, sy) * fx * (256 - fy)
+                    + s(sx, sy + 1) * (256 - fx) * fy
+                    + s(sx + 1, sy + 1) * fx * fy)
+                    >> 16
+            };
             if a < 8 {
                 continue;
             }
@@ -405,8 +520,8 @@ fn blit_icon_scaled(
     }
 }
 
-/// Per-glyph bilinear-scaled text from the large atlas (scale_q8 ≤ 256) —
-/// used only mid-transition.
+/// Per-glyph scaled text from the large atlas (scale_q8 ≤ 256) — used only
+/// mid-transition. `fast` = nearest-neighbor sampling (motion LOD).
 fn draw_text_scaled(
     fb: &mut [u8],
     text: &str,
@@ -415,6 +530,7 @@ fn draw_text_scaled(
     alpha: i32,
     glyphs: &[Option<Glyph>; 128],
     scale_q8: i32,
+    fast: bool,
 ) {
     let mut x_q8 = left_x << 8;
     for ch in text.chars() {
@@ -422,13 +538,22 @@ fn draw_text_scaled(
             let dst_w = ((g.width as i32 * scale_q8) >> 8).max(1);
             let dst_h = ((g.height as i32 * scale_q8) >> 8).max(1);
             let glyph_y = base_y - (((g.height as i32 + g.ymin as i32) * scale_q8) >> 8);
-            draw_glyph_scaled(fb, x_q8 >> 8, glyph_y, g, alpha, dst_w, dst_h);
+            draw_glyph_scaled(fb, x_q8 >> 8, glyph_y, g, alpha, dst_w, dst_h, fast);
             x_q8 += (g.advance as i32) * scale_q8;
         }
     }
 }
 
-fn draw_glyph_scaled(fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, alpha: i32, dst_w: i32, dst_h: i32) {
+fn draw_glyph_scaled(
+    fb: &mut [u8],
+    ox: i32,
+    oy: i32,
+    g: &Glyph,
+    alpha: i32,
+    dst_w: i32,
+    dst_h: i32,
+    fast: bool,
+) {
     let src_w = g.width as i32;
     let src_h = g.height as i32;
     let stride = (g.width as usize + 1) / 2;
@@ -455,11 +580,15 @@ fn draw_glyph_scaled(fb: &mut [u8], ox: i32, oy: i32, g: &Glyph, alpha: i32, dst
             }
             let sx_q8 = dx * step_x_q8;
             let (sx, fx) = (sx_q8 >> 8, sx_q8 & 255);
-            let a = (sample(sx, sy) * (256 - fx) * (256 - fy)
-                + sample(sx + 1, sy) * fx * (256 - fy)
-                + sample(sx, sy + 1) * (256 - fx) * fy
-                + sample(sx + 1, sy + 1) * fx * fy)
-                >> 16;
+            let a = if fast {
+                sample((sx_q8 + 128) >> 8, (sy_q8 + 128) >> 8)
+            } else {
+                (sample(sx, sy) * (256 - fx) * (256 - fy)
+                    + sample(sx + 1, sy) * fx * (256 - fy)
+                    + sample(sx, sy + 1) * (256 - fx) * fy
+                    + sample(sx + 1, sy + 1) * fx * fy)
+                    >> 16
+            };
             if a < 8 {
                 continue;
             }
