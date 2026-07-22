@@ -961,8 +961,10 @@ impl<'a, 'd> App<'a, 'd> {
                                 as usize;
                             if row != cur {
                                 println!("wheel: tap -> row {row}");
-                                self.wheel_settle(s_q8, row, now, batt);
                             }
+                            // Always settle: a micro-scrolled tap leaves a
+                            // sub-row offset that must ease back.
+                            self.wheel_settle(s_q8, row, now, batt);
                             return;
                         }
                     }
@@ -996,13 +998,22 @@ impl<'a, 'd> App<'a, 'd> {
         anim_start: Instant,
         tp: &mut TouchPoll,
     ) -> Direct {
-        /// Jitter gate: movement below this never scrolls (tap protection);
+        /// Jitter gate (~0.6 mm): movement below this never scrolls;
         /// crossing it re-anchors at the gate edge (AOSP slop-subtraction),
         /// so content engages from zero.
         const GATE_PX: i32 = 6;
+        /// Retroactive tap radius (~1.2 mm ≈ Android's 8 dp touch slop):
+        /// a lift whose max displacement-from-anchor stayed inside this is
+        /// a tap even if it micro-scrolled — the bistable chip wanders.
+        const TAP_RADIUS_PX: i32 = 13;
         /// A pause this long before lift zeroes the release velocity —
-        /// drag-and-hold means "stay here", not "fling".
-        const STALE_MS: u32 = 80;
+        /// drag-and-hold means "stay here", not "fling" (AOSP
+        /// ASSUME_POINTER_STOPPED 40 ms, stretched for 10 ms polls).
+        const STALE_MS: u32 = 50;
+        /// Velocity pair dt floor: the chip's FIFO can dump several queued
+        /// positions into one poll — dividing by ~1 ms explodes velocity
+        /// (AOSP VelocityTracker min-dt rule).
+        const DT_FLOOR_MS: i32 = 5;
 
         let t0 = Instant::now();
         let mut seq = tp.raw_seq;
@@ -1028,6 +1039,8 @@ impl<'a, 'd> App<'a, 'd> {
             }
         };
         let anchor_s = *s_q8;
+        let origin_y = anchor_y;
+        let mut max_disp: i32 = 0;
         let mut last_y = anchor_y;
         let mut gate_open = false;
         let mut target = anchor_s;
@@ -1050,6 +1063,7 @@ impl<'a, 'd> App<'a, 'd> {
                         ring[2] = (y, now_ms);
                         last_y = y;
                     }
+                    max_disp = max_disp.max((origin_y - y).abs());
                     if !gate_open {
                         let d = anchor_y - y;
                         if d.abs() > GATE_PX {
@@ -1081,12 +1095,14 @@ impl<'a, 'd> App<'a, 'd> {
         }
 
         let held_ms = t0.elapsed().as_millis() as u32;
+        // Retroactive tap: max displacement stayed inside the tap radius
+        // and the press was short — even if it micro-scrolled a few px
+        // (the settle pulls the sub-row offset back).
+        if max_disp <= TAP_RADIUS_PX && held_ms < 350 {
+            return Direct::Tap { y: last_y };
+        }
         if !gate_open {
-            return if held_ms < 400 {
-                Direct::Tap { y: last_y }
-            } else {
-                Direct::Rest
-            };
+            return Direct::Rest;
         }
         // Release velocity from the last two real movement segments
         // (recency-weighted, hotter-of like the recognizer); a pause
@@ -1095,8 +1111,8 @@ impl<'a, 'd> App<'a, 'd> {
         if now_ms.wrapping_sub(ring[2].1) > STALE_MS {
             return Direct::Rest;
         }
-        let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(1) as i32;
-        let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(1) as i32;
+        let dt_b = ring[2].1.wrapping_sub(ring[1].1).max(DT_FLOOR_MS as u32) as i32;
+        let dt_a = ring[1].1.wrapping_sub(ring[0].1).max(DT_FLOOR_MS as u32) as i32;
         let v_b = ((ring[1].0 - ring[2].0) << 8) / dt_b;
         let v_a = ((ring[0].0 - ring[1].0) << 8) / dt_a;
         let v_w = (2 * v_b + v_a) / 3;
