@@ -26,9 +26,13 @@ include!(concat!(env!("OUT_DIR"), "/gallery_assets.rs"));
 /// Wheel row indices (the wheel row IS the app).
 pub const TIME: usize = 0;
 pub const GALLERY: usize = 1;
+pub const PHONE: usize = 2;
+pub const MESSAGES: usize = 3;
 pub const ACTIVITY: usize = 4;
 pub const SETTINGS: usize = 5;
+pub const MUSIC: usize = 6;
 pub const PHOTOS: usize = 7;
+pub const WEATHER: usize = 8;
 
 /// Cross-frame app state owned by the run loop (one instance).
 pub struct State {
@@ -45,6 +49,12 @@ pub struct State {
     pub t_last_a: i32,
     pub t_tip: (i32, i32, i32, i32),
     pub t_min: u8,
+    /// Music vinyl highlight angle last drawn (q10; -1 = unseeded).
+    pub mu_theta: i32,
+    /// Weather orbit-arc angle last drawn (q10; -1 = unseeded).
+    pub we_arc: i32,
+    /// Phone dial drift offset last drawn (pseudo units).
+    pub ph_drift: i32,
 }
 
 impl State {
@@ -59,6 +69,9 @@ impl State {
             t_last_a: 0,
             t_tip: (0, 0, -1, -1),
             t_min: 255,
+            mu_theta: -1,
+            we_arc: -1,
+            ph_drift: 0,
         }
     }
 }
@@ -104,7 +117,8 @@ pub fn accent(idx: usize) -> (i32, i32, i32) {
 /// REST on the splash (big centered logo + title below — the honest
 /// placeholder until their W3.3–3.5 passes).
 pub fn has_content(idx: usize) -> bool {
-    matches!(idx, TIME | GALLERY | ACTIVITY | SETTINGS | PHOTOS)
+    // Everything but Timer (its template ships in W3.6).
+    idx != 9
 }
 
 /// Whether the app shows the shared status clock. The Time app hides it
@@ -258,6 +272,38 @@ pub fn draw_reveal(
         let r = (40, 118 + rise, W - 40, 340 + rise);
         fx.push(r.0, r.1, r.2, r.3);
         wfb.mark_rect(r.0, r.1, r.2, r.3);
+    } else if idx == MUSIC {
+        {
+            let fb = wfb.buf_mut();
+            draw_music(fb, st, q_q8, rise, elapsed_ms);
+        }
+        let r = (CX - 130, 110 + rise, CX + 130, 450);
+        fx.push(r.0, r.1, r.2, r.3);
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
+    } else if idx == WEATHER {
+        {
+            let fb = wfb.buf_mut();
+            draw_weather(fb, st, q_q8, rise, elapsed_ms);
+        }
+        let r = (50, 96 + rise, W - 50, 344 + rise);
+        fx.push(r.0, r.1, r.2, r.3);
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
+    } else if idx == PHONE {
+        {
+            let fb = wfb.buf_mut();
+            draw_phone(fb, st, q_q8, rise, elapsed_ms);
+        }
+        let r = (CX - 145, 80 + rise, CX + 145, 404 + rise);
+        fx.push(r.0, r.1, r.2, r.3);
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
+    } else if idx == MESSAGES {
+        {
+            let fb = wfb.buf_mut();
+            draw_messages(fb, q_q8, rise, elapsed_ms);
+        }
+        let r = (56, 104 + rise, W - 56, 352 + rise);
+        fx.push(r.0, r.1, r.2, r.3);
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
     }
     // Template apps: the flown icon (wheel-side) IS the hero; nothing more.
 }
@@ -269,6 +315,10 @@ pub fn tick(wfb: &mut WatchFb, idx: usize, now: &WallTime, elapsed_ms: u32, st: 
         PHOTOS => photos_tick(wfb, elapsed_ms),
         TIME => time_tick(wfb, now, st),
         ACTIVITY => activity_tick(wfb, elapsed_ms),
+        MUSIC => music_tick(wfb, st, elapsed_ms),
+        WEATHER => weather_tick(wfb, st, elapsed_ms),
+        PHONE => phone_tick(wfb, st, elapsed_ms),
+        MESSAGES => messages_tick(wfb, elapsed_ms),
         _ => {} // template apps (and Settings) rest perfectly still
     }
 }
@@ -641,8 +691,445 @@ pub fn settings_tap(wfb: &mut WatchFb, st: &mut State, y: i32, batt: Option<u8>,
 }
 
 // ---------------------------------------------------------------------
+// Music (W3 §4.7) — now-playing: procedural vinyl with a slowly rotating
+// sheen, BLUE IN GREEN / MILES DAVIS, progress hairline, ghosted
+// transport. Every disc pixel is a pure function of (r, angle, θ), so any
+// region repaints idempotently at any time.
+// ---------------------------------------------------------------------
+
+const MU_C: (i32, i32) = (CX, 222);
+const MU_R: i32 = 105;
+const MU_LABEL_R: i32 = 30;
+const WARM: (i32, i32, i32) = (255, 236, 210);
+const VINYL_AMBER: (i32, i32, i32) = (196, 116, 48);
+
+/// Vinyl rotation angle (q10) — ~4 rpm (one rev / 15 s).
+fn mu_theta(elapsed_ms: u32) -> i32 {
+    ((elapsed_ms as i64 * 1024 / 15_000) % 1024) as i32
+}
+
+/// One disc pixel: label / grooves / rotating sheen. SET write. `cy` is
+/// the disc center's live Y (rise-shifted during the reveal).
+fn music_px(fb: &mut [u8], x: i32, y: i32, cy: i32, theta: i32, q: i32) {
+    let (dx, dy) = (x - MU_C.0, y - cy);
+    let d2 = dx * dx + dy * dy;
+    if d2 > MU_R * MU_R {
+        return;
+    }
+    let r = isqrt(d2 as u32) as i32;
+    if r < 3 {
+        return; // spindle hole stays black
+    }
+    if r <= MU_LABEL_R {
+        let v = if r >= MU_LABEL_R - 2 { 150 } else { 235 };
+        set_px(fb, x, y, VINYL_AMBER, (v * q) >> 8);
+        return;
+    }
+    let mut v = if r % 4 == 0 { 30 } else { 11 };
+    let a = pseudo_angle(dx, dy);
+    let da = adist(a, theta).min(adist(a, theta + 512));
+    if da < 36 {
+        v += (36 - da) * 15 / 36;
+    }
+    if r >= MU_R - 1 {
+        v = v * (MU_R + 1 - r).clamp(0, 2) / 2; // soft rim
+    }
+    set_px(fb, x, y, ICE, (v * q) >> 8);
+}
+
+fn draw_music(fb: &mut [u8], st: &mut State, q: i32, rise: i32, elapsed_ms: u32) {
+    let theta = mu_theta(elapsed_ms);
+    let cy = MU_C.1 + rise;
+    for y in (cy - MU_R).max(0)..=(cy + MU_R).min(H - 1) {
+        for x in (MU_C.0 - MU_R).max(0)..=(MU_C.0 + MU_R).min(W - 1) {
+            music_px(fb, x, y, cy, theta, q);
+        }
+    }
+    st.mu_theta = theta;
+    let t1 = "BLUE IN GREEN";
+    let t2 = "MILES DAVIS";
+    let w1 = wheel::text_width(t1, &lock::TEXT_GLYPHS);
+    let w2 = wheel::text_width(t2, &lock::TEXT_GLYPHS);
+    wheel::draw_text_at(fb, t1, CX - w1 / 2, 360 + rise, (235 * q) >> 8, &lock::TEXT_GLYPHS);
+    wheel::draw_text_at(fb, t2, CX - w2 / 2, 388 + rise, (150 * q) >> 8, &lock::TEXT_GLYPHS);
+    // Progress hairline, 40% played.
+    let y = 404 + rise;
+    for x in CX - 100..=CX + 100 {
+        let played = x <= CX - 100 + 80;
+        let (tint, v) = if played { (WARM, 170) } else { (ICE, 60) };
+        blend_px(fb, x, y, tint, (v * q) >> 8);
+    }
+    // Ghosted transport.
+    for (sprite, px, cx) in [
+        (wheel::TR_PREV, wheel::TR_PREV_PX, CX - 64),
+        (wheel::TR_PLAY, wheel::TR_PLAY_PX, CX),
+        (wheel::TR_NEXT, wheel::TR_NEXT_PX, CX + 64),
+    ] {
+        blit_icon_tint(fb, sprite, px, cx, 430, ICE, (80 * q) >> 8);
+    }
+}
+
+/// Rest tick: repaint only the sheen sectors (old + new, both mirrors).
+fn music_tick(wfb: &mut WatchFb, st: &mut State, elapsed_ms: u32) {
+    let theta = mu_theta(elapsed_ms);
+    if theta == st.mu_theta {
+        return;
+    }
+    let old = if st.mu_theta < 0 { theta } else { st.mu_theta };
+    st.mu_theta = theta;
+    let mut rects = [(0i32, 0i32, -1i32, -1i32); 4];
+    {
+        let fb = wfb.buf_mut();
+        for (k, base) in [theta, theta + 512, old, old + 512].into_iter().enumerate() {
+            let r = sector_bbox(MU_C.0, MU_C.1, MU_LABEL_R, MU_R, base, 40);
+            for y in r.1.max(0)..=r.3.min(H - 1) {
+                for x in r.0.max(0)..=r.2.min(W - 1) {
+                    music_px(fb, x, y, MU_C.1, theta, 256);
+                }
+            }
+            rects[k] = r;
+        }
+    }
+    for r in rects {
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Weather (W3 §4.9) — 22° with a glowing sun, CLEAR SKIES, hi/lo, and a
+// faint highlight arc orbiting the sun over 20 s. The sun's glow is a
+// deterministic radial function, so the orbit band repaints exactly.
+// ---------------------------------------------------------------------
+
+const SUN_C: (i32, i32) = (CX - 92, 158);
+const AMBER_HOT: (i32, i32, i32) = (255, 190, 110);
+
+/// Deterministic layered sun glow at distance d (0..=52).
+fn sun_glow_v(d: i32) -> i32 {
+    let l = |a: i32, reach: i32| {
+        if d >= reach {
+            0
+        } else {
+            a * (reach - d) * (reach - d) / (reach * reach)
+        }
+    };
+    (l(95, 52) + l(150, 26)).min(210)
+}
+
+fn weather_orbit(elapsed_ms: u32) -> i32 {
+    ((elapsed_ms as i64 * 1024 / 20_000) % 1024) as i32
+}
+
+/// One orbit-band pixel (r 42..=46 around the sun): glow base + arc
+/// boost. `sy` = the sun center's live Y (rise-shifted during reveal).
+fn orbit_px(fb: &mut [u8], x: i32, y: i32, sy: i32, phi: i32, q: i32) {
+    let (dx, dy) = (x - SUN_C.0, y - sy);
+    let d2 = dx * dx + dy * dy;
+    if !(42 * 42..=46 * 46).contains(&d2) {
+        return;
+    }
+    let d = isqrt(d2 as u32) as i32;
+    let mut v = sun_glow_v(d);
+    let da = adist(pseudo_angle(dx, dy), phi);
+    if da < 30 {
+        v += (30 - da) * 130 / 30;
+    }
+    set_px(fb, x, y, AMBER, (v.min(255) * q) >> 8);
+}
+
+fn draw_weather(fb: &mut [u8], st: &mut State, q: i32, rise: i32, elapsed_ms: u32) {
+    let (sx, sy) = (SUN_C.0, SUN_C.1 + rise);
+    // Glow disc (deterministic radial), then the sun glyph.
+    for y in (sy - 52).max(0)..=(sy + 52).min(H - 1) {
+        for x in (sx - 52).max(0)..=(sx + 52).min(W - 1) {
+            let d2 = (x - sx) * (x - sx) + (y - sy) * (y - sy);
+            if d2 > 52 * 52 {
+                continue;
+            }
+            let v = sun_glow_v(isqrt(d2 as u32) as i32);
+            if v > 4 {
+                set_px(fb, x, y, AMBER, (v * q) >> 8);
+            }
+        }
+    }
+    blit_icon_tint(fb, wheel::SUN, wheel::SUN_PX, sx, sy, AMBER_HOT, (240 * q) >> 8);
+    let phi = weather_orbit(elapsed_ms);
+    for y in (sy - 47).max(0)..=(sy + 47).min(H - 1) {
+        for x in (sx - 47).max(0)..=(sx + 47).min(W - 1) {
+            orbit_px(fb, x, y, sy, phi, q);
+        }
+    }
+    st.we_arc = phi;
+    // 22° — TIME digits at 86% for the big reading; hand-drawn degree ring.
+    let t = "22";
+    let tw = (wheel::text_width(t, &lock::TIME_GLYPHS) * 220) >> 8;
+    let tx = CX + 26 - tw / 2;
+    wheel::draw_text_scaled(fb, t, tx, 236 + rise, q, &lock::TIME_GLYPHS, 220, false);
+    draw_ring_arc_at(fb, tx + tw + 14, 236 + rise - 56, 5, 8, 1024, ICE, (220 * q) >> 8);
+    let cs = "CLEAR SKIES";
+    let cw = wheel::text_width(cs, &lock::TEXT_GLYPHS);
+    wheel::draw_text_at(fb, cs, CX - cw / 2, 292 + rise, (128 * q) >> 8, &lock::TEXT_GLYPHS);
+    let hl = "26 / 14";
+    let hw = wheel::text_width(hl, &lock::TEXT_GLYPHS);
+    let hx = CX - hw / 2;
+    wheel::draw_text_at(fb, hl, hx, 330 + rise, (77 * q) >> 8, &lock::TEXT_GLYPHS);
+    let w26 = wheel::text_width("26", &lock::TEXT_GLYPHS);
+    draw_ring_arc_at(fb, hx + w26 + 6, 330 + rise - 20, 2, 4, 1024, ICE, (77 * q) >> 8);
+    draw_ring_arc_at(fb, hx + hw + 6, 330 + rise - 20, 2, 4, 1024, ICE, (77 * q) >> 8);
+}
+
+/// Rest tick: repaint the orbit band only.
+fn weather_tick(wfb: &mut WatchFb, st: &mut State, elapsed_ms: u32) {
+    let phi = weather_orbit(elapsed_ms);
+    if phi == st.we_arc {
+        return;
+    }
+    st.we_arc = phi;
+    let fb = wfb.buf_mut();
+    for y in (SUN_C.1 - 47).max(0)..=(SUN_C.1 + 47).min(H - 1) {
+        for x in (SUN_C.0 - 47).max(0)..=(SUN_C.0 + 47).min(W - 1) {
+            orbit_px(fb, x, y, SUN_C.1, phi, 256);
+        }
+    }
+    wfb.mark_rect(SUN_C.0 - 47, SUN_C.1 - 47, SUN_C.0 + 47, SUN_C.1 + 47);
+}
+
+// ---------------------------------------------------------------------
+// Phone (W3 §4.3) — the rotary-dial object: digits on a ring around a
+// teal contact circle (Amina), recents ghosted. The dial drifts ±6
+// pseudo-units over 8 s.
+// ---------------------------------------------------------------------
+
+const PH_C: (i32, i32) = (CX, 205);
+const TEAL: (i32, i32, i32) = (70, 220, 200);
+const TEAL_DARK: (i32, i32, i32) = (16, 46, 42);
+
+fn phone_digit_pos(i: usize, drift: i32) -> (i32, i32, char) {
+    let a = 140 + i as i32 * 82 + drift;
+    let (vx, vy) = pseudo_dir(a);
+    let ch = if i < 9 { (b'1' + i as u8) as char } else { '0' };
+    (PH_C.0 + (118 * vx >> 8), PH_C.1 + (118 * vy >> 8), ch)
+}
+
+fn draw_phone_digit(fb: &mut [u8], x: i32, y: i32, ch: char, alpha: i32) {
+    let mut b = [0u8; 4];
+    let s = ch.encode_utf8(&mut b);
+    let w = wheel::text_width(s, &lock::TEXT_GLYPHS);
+    wheel::draw_text_at(fb, s, x - w / 2, y + 9, alpha, &lock::TEXT_GLYPHS);
+}
+
+fn draw_phone(fb: &mut [u8], st: &mut State, q: i32, rise: i32, elapsed_ms: u32) {
+    let (cx, cy) = (PH_C.0, PH_C.1 + rise);
+    fill_disc(fb, cx, cy, 52, TEAL_DARK, q);
+    draw_ring_arc_at(fb, cx, cy, 50, 53, 1024, TEAL, (200 * q) >> 8);
+    let am = "AM";
+    let aw = wheel::text_width(am, &lock::LABELF_GLYPHS);
+    wheel::draw_text_at(fb, am, cx - aw / 2, cy + 16, (240 * q) >> 8, &lock::LABELF_GLYPHS);
+    let drift = phone_drift(elapsed_ms);
+    for i in 0..10 {
+        let (x, y, ch) = phone_digit_pos(i, drift);
+        draw_phone_digit(fb, x, y + rise, ch, (200 * q) >> 8);
+    }
+    st.ph_drift = drift;
+    let (rx, _) = title_metrics("Recents");
+    draw_title(fb, "Recents", rx, 366 + rise, (100 * q) >> 8, TEAL);
+    let names = "Amina   Jim   Ross";
+    let nw = wheel::text_width(names, &lock::TEXT_GLYPHS);
+    let nx = CX - nw / 2;
+    wheel::draw_text_at(fb, names, nx, 400 + rise, (110 * q) >> 8, &lock::TEXT_GLYPHS);
+    let wa = wheel::text_width("Amina", &lock::TEXT_GLYPHS);
+    let wg = wheel::text_width("   ", &lock::TEXT_GLYPHS);
+    let wj = wheel::text_width("Jim", &lock::TEXT_GLYPHS);
+    cap_dot(fb, nx + wa + wg / 2, 392 + rise, 2, ICE, (120 * q) >> 8);
+    cap_dot(fb, nx + wa + wg + wj + wg / 2, 392 + rise, 2, ICE, (120 * q) >> 8);
+}
+
+/// Dial drift: ±6 pseudo-units, slow triangle over 8 s.
+fn phone_drift(elapsed_ms: u32) -> i32 {
+    let ph = ((elapsed_ms / 16) % 1024) as i32;
+    let tri = if ph < 512 { ph } else { 1023 - ph };
+    (tri - 256) * 6 / 256
+}
+
+fn phone_tick(wfb: &mut WatchFb, st: &mut State, elapsed_ms: u32) {
+    let drift = phone_drift(elapsed_ms);
+    if drift == st.ph_drift {
+        return;
+    }
+    let old = st.ph_drift;
+    st.ph_drift = drift;
+    let mut rects = [(0i32, 0i32, -1i32, -1i32); 10];
+    {
+        let fb = wfb.buf_mut();
+        for (i, r_out) in rects.iter_mut().enumerate() {
+            let (ox, oy, _) = phone_digit_pos(i, old);
+            let (nx, ny, ch) = phone_digit_pos(i, drift);
+            let r = (ox.min(nx) - 16, oy.min(ny) - 20, ox.max(nx) + 16, oy.max(ny) + 14);
+            fill_rect_black(fb, r.0, r.1, r.2, r.3);
+            draw_phone_digit(fb, nx, ny, ch, 200);
+            *r_out = r;
+        }
+    }
+    for r in rects {
+        wfb.mark_rect(r.0, r.1, r.2, r.3);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Messages (W3 §4.4) — three chord-fitted bubbles, professional tone;
+// the typing indicator forever almost-continuing.
+// ---------------------------------------------------------------------
+
+const VIOLET: (i32, i32, i32) = (170, 120, 255);
+const BUBBLE_GREY: (i32, i32, i32) = (32, 32, 40);
+const BUBBLE_ICE: (i32, i32, i32) = (42, 46, 56);
+
+fn draw_messages(fb: &mut [u8], q: i32, rise: i32, elapsed_ms: u32) {
+    // AMINA: "slides look great ✨"
+    draw_title(fb, "Amina", 96, 126 + rise, (90 * q) >> 8, VIOLET);
+    let ts = "09:12";
+    let tsw = (wheel::text_width(ts, &lock::TEXT_GLYPHS) * 150) >> 8;
+    wheel::draw_text_scaled(fb, ts, CX + 160 - tsw, 126 + rise, (60 * q) >> 8, &lock::TEXT_GLYPHS, 150, false);
+    let m1 = "slides look great";
+    let w1 = wheel::text_width(m1, &lock::TEXT_GLYPHS);
+    fill_round_rect(fb, 88, 134 + rise, 88 + w1 + 58, 178 + rise, 14, BUBBLE_GREY, q);
+    wheel::draw_text_at(fb, m1, 104, 164 + rise, (225 * q) >> 8, &lock::TEXT_GLYPHS);
+    blit_icon_tint(
+        fb,
+        wheel::SPARKLES,
+        wheel::SPARKLES_PX,
+        104 + w1 + 18,
+        156 + rise,
+        (255, 214, 120),
+        (235 * q) >> 8,
+    );
+    // Habeeb (right, ice fill): "shipping tonight"
+    let m2 = "shipping tonight";
+    let w2 = wheel::text_width(m2, &lock::TEXT_GLYPHS);
+    let r2 = CX + 168;
+    fill_round_rect(fb, r2 - w2 - 34, 192 + rise, r2, 236 + rise, 14, BUBBLE_ICE, q);
+    wheel::draw_text_at(fb, m2, r2 - w2 - 17, 222 + rise, (235 * q) >> 8, &lock::TEXT_GLYPHS);
+    // JIM: "call when you're free"
+    draw_title(fb, "Jim", 96, 262 + rise, (90 * q) >> 8, VIOLET);
+    let ts3 = "09:15";
+    let ts3w = (wheel::text_width(ts3, &lock::TEXT_GLYPHS) * 150) >> 8;
+    wheel::draw_text_scaled(fb, ts3, CX + 160 - ts3w, 262 + rise, (60 * q) >> 8, &lock::TEXT_GLYPHS, 150, false);
+    let m3 = "call when you're free";
+    let w3 = wheel::text_width(m3, &lock::TEXT_GLYPHS);
+    fill_round_rect(fb, 88, 270 + rise, 88 + w3 + 34, 314 + rise, 14, BUBBLE_GREY, q);
+    wheel::draw_text_at(fb, m3, 104, 300 + rise, (225 * q) >> 8, &lock::TEXT_GLYPHS);
+    draw_typing_dots(fb, rise, elapsed_ms, q);
+}
+
+/// Typing indicator: three dots, staggered 300 ms pulse.
+fn draw_typing_dots(fb: &mut [u8], rise: i32, elapsed_ms: u32, q: i32) {
+    for i in 0..3u32 {
+        let p = ((elapsed_ms + 1200 - i * 300) % 1200) as i32;
+        let a = if p < 600 { 70 + (300 - (p - 300).abs()) * 150 / 300 } else { 70 };
+        cap_dot(fb, 104 + i as i32 * 16, 338 + rise, 3, VIOLET, (a * q) >> 8);
+    }
+}
+
+fn messages_tick(wfb: &mut WatchFb, elapsed_ms: u32) {
+    let fb = wfb.buf_mut();
+    fill_rect_black(fb, 94, 328, 160, 348);
+    draw_typing_dots(fb, 0, elapsed_ms, 256);
+    wfb.mark_rect(94, 328, 160, 348);
+}
+
+// ---------------------------------------------------------------------
 // Shared procedural-drawing helpers (idempotent writes only).
 // ---------------------------------------------------------------------
+
+/// Cyclic pseudo-angle distance (q10 space).
+fn adist(a: i32, b: i32) -> i32 {
+    let d = (a - b).rem_euclid(1024);
+    d.min(1024 - d)
+}
+
+/// Axis-aligned bbox of an annular sector (angle ± half, radii lo..hi).
+fn sector_bbox(cx: i32, cy: i32, r_lo: i32, r_hi: i32, a: i32, half: i32) -> (i32, i32, i32, i32) {
+    let mut d = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for aa in [a - half, a, a + half] {
+        let (vx, vy) = pseudo_dir(aa);
+        for r in [r_lo, r_hi] {
+            let x = cx + (r * vx >> 8);
+            let y = cy + (r * vy >> 8);
+            d = (d.0.min(x), d.1.min(y), d.2.max(x), d.3.max(y));
+        }
+    }
+    (d.0 - 4, d.1 - 4, d.2 + 4, d.3 + 4)
+}
+
+/// Filled disc with a soft edge (source-over blend).
+fn fill_disc(fb: &mut [u8], cx: i32, cy: i32, r: i32, tint: (i32, i32, i32), q: i32) {
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = dx * dx + dy * dy;
+            if d2 > r * r {
+                continue;
+            }
+            let v = if d2 <= (r - 1) * (r - 1) { 255 } else { 128 };
+            blend_px(fb, cx + dx, cy + dy, tint, (v * q) >> 8);
+        }
+    }
+}
+
+/// Rounded rect fill (corner radius < h/2), source-over.
+fn fill_round_rect(
+    fb: &mut [u8],
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rad: i32,
+    tint: (i32, i32, i32),
+    q: i32,
+) {
+    for y in y0.max(0)..=y1.min(H - 1) {
+        let dyc = if y < y0 + rad {
+            y0 + rad - y
+        } else if y > y1 - rad {
+            y - (y1 - rad)
+        } else {
+            0
+        };
+        let ins = if dyc > 0 {
+            rad - isqrt(((rad * rad - dyc * dyc).max(0)) as u32) as i32
+        } else {
+            0
+        };
+        for x in (x0 + ins).max(0)..=(x1 - ins).min(W - 1) {
+            blend_px(fb, x, y, tint, q.min(255));
+        }
+    }
+}
+
+/// Icon alpha sprite through a custom tint (the accent twin of
+/// wheel::blit_icon's fixed ice).
+fn blit_icon_tint(
+    fb: &mut [u8],
+    sprite: &[u8],
+    px: i32,
+    cx: i32,
+    cy: i32,
+    tint: (i32, i32, i32),
+    alpha: i32,
+) {
+    for iy in 0..px {
+        let y = cy - px / 2 + iy;
+        if y < 0 || y >= H {
+            continue;
+        }
+        for ix in 0..px {
+            let a = sprite[(iy * px + ix) as usize] as i32;
+            if a < 8 {
+                continue;
+            }
+            blend_px(fb, cx - px / 2 + ix, y, tint, (a * alpha) >> 8);
+        }
+    }
+}
 
 /// Diamond pseudo-angle: 0..1024 clockwise from 12 o'clock. Monotonic and
 /// cheap; mildly non-uniform (±4°) — invisible for sweeps, and thresholds

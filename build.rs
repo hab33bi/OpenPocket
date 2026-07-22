@@ -430,8 +430,9 @@ fn generate_inter_font() {
     }
     needed.extend("|%".chars());
     // W3 app screens: spaced-caps titles + mock content need the full
-    // uppercase alphabet, and the Gallery caption its ellipsis dots.
-    needed.extend("ABCDEFGHIJKLMNOPQRSTUVWXYZ.".chars());
+    // uppercase alphabet, the Gallery caption its ellipsis dots, and the
+    // Messages mock its apostrophe.
+    needed.extend("ABCDEFGHIJKLMNOPQRSTUVWXYZ.'".chars());
     needed.sort_unstable();
     needed.dedup();
 
@@ -517,14 +518,22 @@ fn generate_wheel_assets() {
     );
     body.push_str(&table);
 
-    // W3 app-screen sprites: Lucide aperture (Photos hero glyph)…
-    {
-        let path = "assets/icons/aperture.svg";
-        let data = std::fs::read(path).unwrap_or_else(|_| panic!("read {path}"));
+    // W3 app-screen sprites: standalone Lucide rasterizations at their
+    // design sizes (aperture = Photos hero, sun = Weather, transport
+    // glyphs = Music footer, sparkles = the ✨ stand-in for Messages).
+    for (name, file, px) in [
+        ("APERTURE", "aperture", 96u32),
+        ("SUN", "sun", 72),
+        ("SPARKLES", "sparkles", 18),
+        ("TR_PREV", "skip-back", 36),
+        ("TR_PLAY", "play", 36),
+        ("TR_NEXT", "skip-forward", 36),
+    ] {
+        let path = format!("assets/icons/{file}.svg");
+        let data = std::fs::read(&path).unwrap_or_else(|_| panic!("read {path}"));
         let opt = resvg::usvg::Options::default();
         let tree = resvg::usvg::Tree::from_data(&data, &opt)
             .unwrap_or_else(|e| panic!("parse {path}: {e}"));
-        let px = ICON_H;
         let scale = px as f32 / tree.size().width();
         let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px).expect("pixmap");
         resvg::render(
@@ -532,8 +541,8 @@ fn generate_wheel_assets() {
             resvg::tiny_skia::Transform::from_scale(scale, scale),
             &mut pixmap.as_mut(),
         );
-        body.push_str(&format!("pub const APERTURE_PX: i32 = {px};\n"));
-        body.push_str("pub static APERTURE: &[u8] = &[");
+        body.push_str(&format!("pub const {name}_PX: i32 = {px};\n"));
+        body.push_str(&format!("pub static {name}: &[u8] = &["));
         for (i, p) in pixmap.pixels().iter().enumerate() {
             if i > 0 {
                 body.push(',');
