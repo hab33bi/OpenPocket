@@ -65,28 +65,31 @@ selectable rings) builds on this screen; W3 ships this as the elegant base.
 
 ### 4.2 Gallery — accent: sunset amber (Bebop lives here)
 Full-bleed art. Page 1: the existing Spike artwork (moved from the old Unlocked
-scene). Pages 2..N: additional Bebop stills (see §6 asset note). Horizontal
-swipe pages with the wheel's physics vocabulary (1:1 direct drag, velocity
-verdict, detent snap per page, rubber at ends). Footer: page dots (8 px, lit
-dot glows amber). Final page holds the caption, small italic-feel spaced text,
-bottom-center: **"SEE YOU SPACE COWBOY..."** — quiet, no fanfare; it's simply
-the last thing in the gallery. Captions fade in 300 ms after the page settles.
+scene). Pages 2..N: **user-provided stills** — build.rs auto-ingests
+assets/gallery/* (any resolution: center-crop, scale to 466, RGB565 + dither);
+dropping a file in is all it takes. Horizontal swipe pages with the wheel's
+physics vocabulary (1:1 direct drag, velocity verdict, detent snap per page,
+rubber at ends). Footer: page dots (8 px, lit dot glows amber). The final page
+holds the caption, small spaced text, bottom-center: **"SEE YOU SPACE
+COWBOY..."** — quiet, no fanfare; simply the last thing in the gallery.
+Captions fade in 300 ms after the page settles.
 
 ### 4.3 Phone — accent: teal
 Placeholder as *object*, not fake app: a centered rotary-dial motif — 10 digit
 glyphs (TEXT) arranged on a r=120 ring around a teal contact circle with
-initials "JB" (chord-fitted). The dial ring is ghosted at 40%; pressing a digit
-pulses it (press-pulse from W4 vocabulary, no sound, no promise of calling).
-Sub-line under title: "no line out here" (in-world honesty, ghosted 30%).
-**Signature motion**: the dial ring drifts ±2° (slow triangle, 8 s).
+initials "AM" (Amina — chord-fitted). "RECENTS" ghosted 30% beneath: "Amina ·
+Jim · Ross" (TEXT 40%). Pressing a digit pulses it (press-pulse from W4
+vocabulary — no sound, no promise of calling). **Signature motion**: the dial
+ring drifts ±2° (slow triangle, 8 s).
 
 ### 4.4 Messages — accent: violet
 Three static conversation bubbles, chord-fitted rounded rects (AA corners,
-r=14): left bubble "JET: where are you" / right bubble (ice-blue fill 20%,
-right-aligned) "chasing a bounty" / left "ED: found it! found it!". Names in
-30% caps above bubbles. Timestamps ghosted right. **Signature motion**: a
-typing indicator (three 4 px dots, staggered 300 ms pulse) under the last
-bubble — the conversation forever almost-continuing.
+r=14), professional tone: left bubble "AMINA: slides look great ✨" (sparkles
+= Lucide sprite inline, 16 px) / right bubble (ice-blue fill 20%,
+right-aligned, that's Habeeb) "shipping tonight" / left "JIM: call when you're
+free". Names in 30% caps above bubbles, timestamps ghosted right. **Signature
+motion**: a typing indicator (three 4 px dots, staggered 300 ms pulse) under
+the last bubble — the conversation forever almost-continuing.
 
 ### 4.5 Activity — accent: trio (azure / violet / teal)
 Apple-style triple ring, saber-family colors — reuses ring AA + glow tech
@@ -105,13 +108,13 @@ About row content (opens inline, replacing list): FW git-hash, chip "ESP32-S3",
 "466×466 CO5300", battery %, uptime. Real data only.
 
 ### 4.7 Music — accent: warm white
-Now-playing for a record that isn't spinning anywhere else: procedural vinyl
-disc (r=110, center CX,y=225) — concentric groove rings (1 px, 8-12% ice),
-amber label circle r=30 with "TANK!" (TEXT). Below: "SEATBELTS" (TEXT 60%) /
-progress hairline 40% played. Ghosted transport glyphs (prev/play/next, Lucide,
-30%) in footer. **Signature motion**: the disc rotates ~4 rpm (procedural
-groove shimmer via phase-shifted arc highlights — partial ring redraw, the
-tick_ring pattern exactly).
+Now-playing: procedural vinyl disc (r=110, center CX,y=225) — concentric
+groove rings (1 px, 8-12% ice), amber label circle r=30. Track: "BLUE IN
+GREEN" (TEXT) / "MILES DAVIS" (TEXT 60%) — a jazz nod, professional and
+timeless. Progress hairline 40% played. Ghosted transport glyphs
+(prev/play/next, Lucide, 30%) in footer. **Signature motion**: the disc
+rotates ~4 rpm (procedural groove shimmer via phase-shifted arc highlights —
+partial ring redraw, the tick_ring pattern exactly).
 
 ### 4.8 Photos — accent: azure
 The elegant empty state (premium apps make emptiness beautiful): centered
@@ -124,18 +127,17 @@ honest emptiness awaiting a camera that doesn't exist.
 
 ### 4.9 Weather — accent: amber
 Mock presented as scene, not forecast: large "22°" (LABELF at 1.4x via scaled
-draw) at y≈200, Lucide `sun` at 72 px to its upper-left with layered amber glow,
-"MARS — CLEAR SKIES" (TEXT 50%) beneath — in-world flavor makes the mock
-honest and charming. Hi/lo "26° / 14°" ghosted. **Signature motion**: sun rays
-rotate imperceptibly (one 1 px highlight arc orbiting the sun disc, 20 s).
+draw) at y≈200, Lucide `sun` at 72 px to its upper-left with layered amber
+glow, "CLEAR SKIES" (TEXT 50%) beneath. Hi/lo "26° / 14°" ghosted.
+**Signature motion**: sun rays rotate imperceptibly (one 1 px highlight arc
+orbiting the sun disc, 20 s).
 
-### 4.10 Timer — accent: azure→red gradient
+### 4.10 Timer — accent: azure
 Ring-first design: full-rim ring (r=200, stroke 10) at 100%, center "05:00"
-(LABELF). W3 ships it **functional-minimal**: tap starts/pauses; ring depletes
-in real time (RTC-driven, partial arc redraws — lock-arc tech in reverse);
-color lerps azure→violet→red over the final 10%; at zero, three 300 ms
-full-ring pulses then reset. Long-press (600 ms hold) resets. It's ~a day of
-work on proven tech and makes one more app REAL.
+(LABELF), ghosted start glyph beneath. **W3 ships the template only** (user
+decision) — the ring is static and beautiful; the real countdown (tap
+start/pause, ring depleting azure→red, triple pulse at zero) is specced and
+deferred to W4.
 
 ## 5. Scene machine & integration
 
@@ -153,22 +155,23 @@ work on proven tech and makes one more app REAL.
 ## 6. Assets & budget
 
 - New Lucide rasterizations (build.rs, existing pipeline): aperture 96, sun 72,
-  transport glyphs 40, phone digits use TEXT_GLYPHS. ~40 KB flash total.
+  transport glyphs 40, **sparkles 16** (the ✨ stand-in — no emoji font
+  needed), phone digits use TEXT_GLYPHS. ~40 KB flash total.
 - Gallery stills: full-screen RGB565 = 434 KB each. Firmware ~1 MB, partition
-  16 MB → room for many. **OPEN QUESTION (user)**: supply 2–4 Bebop stills to
-  assets/gallery/ (any resolution; build.rs will center-crop/scale/dither), or
-  W3 ships Spike + 2 procedural duotone treatments of it (azure night / amber
-  sunset) until stills are provided.
+  16 MB → room for many. **User provides stills** → assets/gallery/ (any
+  resolution; build.rs center-crops/scales/dithers automatically). Until they
+  land, the Gallery ships with Spike as page 1 + the caption page.
 - Vinyl, rings, bubbles, dial: all procedural — zero flash cost.
 
-## 7. Open questions (answers shape implementation, defaults ready)
+## 7. Resolved decisions (user, 2026-07-22)
 
-1. **Gallery stills**: provide images, or start with Spike + duotone treatments?
-   (Default: Spike + treatments, swap-in later.)
-2. **Bebop flavor in mock content** (Jet/Ed messages, TANK!/Seatbelts, MARS
-   weather): keep as drafted, or neutral placeholders? (Default: keep — it makes
-   the templates feel curated instead of lorem-ipsum.)
-3. **Timer functional in W3** as designed, or template-only? (Default: functional.)
+1. **Gallery stills**: user-provided via assets/gallery/ (auto-ingest pipeline
+   built in W3.3; Spike-only until files land).
+2. **Mock content**: mostly professional; names Habeeb, Amina, Jim, Alex, Ross
+   where appropriate; ✨ (as Lucide sparkles sprite) where it fits;
+   "see you space cowboy" ONLY where it fits — reserved for the Gallery's
+   final page. No other Bebop references.
+3. **Timer**: template only in W3; functional countdown deferred to W4.
 
 ## 8. Build order (each step flashed + user-validated)
 
