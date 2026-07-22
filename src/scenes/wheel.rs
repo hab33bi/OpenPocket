@@ -29,8 +29,12 @@ const EDGE_PAD: i32 = 10;
 const TINT: (i32, i32, i32) = (200, 215, 255);
 
 /// Staggered reveal: per-row start offset and rise time, in 25 ms frames.
+/// Rows rise from below with a cubic ease-out (fast lift, feather-soft
+/// landing) while fading in.
 const INTRO_STAG_F: i32 = 2;
-const INTRO_RISE_F: i32 = 8;
+const INTRO_RISE_F: i32 = 10;
+/// How far below its resting place a row starts (px).
+const INTRO_RISE_PX: i32 = 28;
 pub const INTRO_FRAMES: u32 = (INTRO_STAG_F as u32 * 9) + INTRO_RISE_F as u32 + 1;
 
 /// One frame of the staggered reveal (`frame` ≥ INTRO_FRAMES = final state).
@@ -45,12 +49,16 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
         if y_c < -PITCH || y_c > H + PITCH {
             continue;
         }
-        // Reveal progress for this row (slide in from the left + fade).
-        let p = (((frame as i32 - INTRO_STAG_F * i as i32) * 256) / INTRO_RISE_F).clamp(0, 256);
-        if p == 0 {
+        // Reveal progress: linear stagger clock → cubic ease-out.
+        let p_lin =
+            (((frame as i32 - INTRO_STAG_F * i as i32) * 256) / INTRO_RISE_F).clamp(0, 256);
+        if p_lin == 0 {
             continue;
         }
-        let slide = -((256 - p) * 48) >> 8;
+        let inv = 256 - p_lin;
+        let p = 256 - (((inv * inv) >> 8) * inv >> 8);
+        // Rise from below into place (the fade rides the same ease).
+        let y_d = y_c + ((256 - p) * INTRO_RISE_PX >> 8);
 
         let (alpha, t) = row_alpha(y_c);
         if alpha == 0 {
@@ -63,12 +71,12 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
         } else {
             (app.icon_s, ICON_S_PX)
         };
-        let icon_cx = icon_center_x(y_c, px) + slide;
+        let icon_cx = icon_center_x(y_d, px);
 
         if t > 128 {
-            blit_glow(fb, &saber, icon_cx, y_c, ((t - 128) * 2 * p) >> 8);
+            blit_glow(fb, &saber, icon_cx, y_d, ((t - 128) * 2 * p) >> 8);
         }
-        blit_icon(fb, sprite, px, icon_cx, y_c, alpha);
+        blit_icon(fb, sprite, px, icon_cx, y_d, alpha);
 
         let glyphs: &[Option<Glyph>; 128] = if t > 128 {
             &lock::LABELF_GLYPHS
@@ -79,8 +87,8 @@ pub fn draw(wfb: &mut WatchFb, now: &WallTime, battery: Option<u8>, focused: usi
         // never overlapping it.
         let tw = text_width(app.name, glyphs);
         let min_left = icon_cx + px / 2 + 10;
-        let x = (CX - tw / 2).max(min_left) + slide / 2;
-        draw_text_at(fb, app.name, x, y_c + 11, alpha, glyphs);
+        let x = (CX - tw / 2).max(min_left);
+        draw_text_at(fb, app.name, x, y_d + 11, alpha, glyphs);
     }
 
     // Status line, top-center: HH:MM, plus battery when present.
